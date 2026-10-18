@@ -45,6 +45,10 @@ const CONTENT_EXIT: Transition = { duration: 0.12 };
 
 export default function App() {
   const [open, setOpen] = useState(false);
+  // True while a foreground window covers the collapsed notch (native monitors
+  // it, see the autohide module in lib.rs). Autohide never applies to the open
+  // panel, so hidden and open are mutually exclusive in practice.
+  const [hidden, setHidden] = useState(false);
   // `wanted` is the user's intent; `open` is the rendered state. They differ
   // only while a native call is in flight, which is what lets a fast reverse
   // cancel an open that has not started animating yet.
@@ -125,6 +129,31 @@ export default function App() {
     void setHitArea("collapsed");
   }, [setHitArea]);
 
+  // Autohide: native polls the foreground window and tells us when the notch is
+  // covered, and when the cursor is bumped back against the top edge.
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let disposed = false;
+    void listen<boolean>("notch-autohide", (event) =>
+      setHidden(event.payload),
+    ).then((unlisten) => {
+      if (disposed) unlisten();
+      else stop = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, []);
+
+  // Hiding never changes the click-through state - autohide only ever applies
+  // while the notch is collapsed, and collapsed is already click-through. What
+  // native does need to know is that there is no notch to click any more, or
+  // the hook would go on swallowing presses aimed at the window on top.
+  useEffect(() => {
+    void invoke("set_notch_hidden", { hidden }).catch(() => {});
+  }, [hidden]);
+
   // Outside clicks come from the native low-level mouse hook.
   useEffect(() => {
     let stop: (() => void) | undefined;
@@ -181,10 +210,13 @@ export default function App() {
         tabIndex={0}
         aria-label="Notch"
         aria-expanded={open}
+        aria-hidden={hidden}
         initial={false}
         animate={{
           width: open ? EXPANDED.width : COLLAPSED.width,
-          height: open ? EXPANDED.height : COLLAPSED.height,
+          // Hidden slides the bar up out of sight; the width stays put, as in
+          // the WPF original, so only the height is animated.
+          height: open ? EXPANDED.height : hidden ? 0 : COLLAPSED.height,
           borderBottomLeftRadius: open ? EXPANDED.radius : COLLAPSED.radius,
           borderBottomRightRadius: open ? EXPANDED.radius : COLLAPSED.radius,
         }}

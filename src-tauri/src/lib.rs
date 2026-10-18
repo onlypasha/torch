@@ -23,6 +23,12 @@
 //! collapsed window is therefore fully click-through, and the low-level mouse
 //! hook is what notices a click on the notch - and *swallows* it, so the click
 //! does not leak into whatever application is underneath.
+//!
+//! 4. A foreground window that covers the collapsed notch makes it slide away
+//!    (autohide), and it only comes back when the cursor is bumped against the
+//!    top edge. That is a separate concern from click-through: while hidden
+//!    there is nothing to click, so the hook stops swallowing and the press
+//!    falls through to the covering application.
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::{Manager, WebviewWindow};
@@ -255,7 +261,15 @@ mod mouse_hook {
         MENU_OPEN.store(open, Ordering::Relaxed);
     }
 
-    fn window_rect() -> Option<RECT> {
+    pub(crate) fn is_open() -> bool {
+        OPEN.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn target_hwnd() -> HWND {
+        HWND(TARGET_HWND.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn window_rect() -> Option<RECT> {
         let raw = TARGET_HWND.load(Ordering::Relaxed);
         if raw == 0 {
             return None;
@@ -295,13 +309,21 @@ mod mouse_hook {
                             if !inside {
                                 notify(Signal::Outside);
                             }
-                        } else if super::notch_geometry::is_collapsed() && inside {
+                        } else if super::notch_geometry::is_collapsed()
+                            && !super::autohide::is_hidden()
+                            && inside
+                        {
                             // The collapsed window is click-through, so this
                             // click never reaches the webview: swallow it so it
                             // does not reach the window below either. A right
                             // press only arms the release; the menu is opened
                             // there, because a menu shown while the button is
                             // still down can dismiss itself immediately.
+                            //
+                            // While the notch is auto-hidden there is no notch
+                            // to click: the press must fall through to whatever
+                            // application is on top, exactly like the WPF
+                            // original did.
                             if message == WM_RBUTTONDOWN {
                                 PENDING_R_UP.store(true, Ordering::Relaxed);
                             } else {
@@ -367,6 +389,132 @@ mod mouse_hook {
     }
 }
 
+/// Autohide, ported from the WPF original (`MainWindow.CheckCollision`): while
+/// the foreground window covers the collapsed notch, the notch slides away, and
+/// it comes back when the cursor is bumped against the very top edge inside the
+/// notch's width. Any foreground window counts, not just maximised ones.
+///
+/// Two deliberate differences from the WPF version:
+///
+/// * The WPF window was focusable, so clicking the notch made it the foreground
+///   window and its `fg == myHwnd` early return is what kept an open panel from
+///   hiding. This window is `WS_EX_NOACTIVATE` and is *never* foreground, so
+///   the equivalent rule is stated directly: an open panel does not autohide.
+/// * The state lives here as a flag rather than being applied by the monitor,
+///   because the webview owns the animation. The monitor only reports what it
+///   sees; the webview applies it, animates, and calls back with the result.
+#[cfg(target_os = "windows")]
+mod autohide {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tauri::Emitter;
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowRect,
+    };
+
+    pub const HIDDEN_EVENT: &str = "notch-autohide";
+
+    static HIDDEN: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the webview is currently showing the notch.
+    pub fn is_hidden() -> bool {
+        HIDDEN.load(Ordering::Relaxed)
+    }
+
+    /// Called once the webview has actually applied (and animated to) the state.
+    pub fn set_hidden(hidden: bool) {
+        HIDDEN.store(hidden, Ordering::Relaxed);
+    }
+
+    /// Desktop, taskbar and the shell's own overlay windows are not "an
+    /// application covering the notch" - same list as the WPF original.
+    const EXCLUDED_CLASSES: [&str; 5] = [
+        "WorkerW",
+        "Progman",
+        "Shell_TrayWnd",
+        "Windows.UI.Core.CoreWindow",
+        "XamlExplorerHostIslandWindow",
+    ];
+
+    fn class_of(hwnd: HWND) -> String {
+        let mut buf = [0u16; 256];
+        let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+        if len <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..len as usize])
+    }
+
+    /// True when the notch should be out of the way.
+    fn should_hide() -> bool {
+        // No autohide while the panel is open - see the note above.
+        if super::mouse_hook::is_open() {
+            return false;
+        }
+
+        let Some(my) = super::mouse_hook::window_rect() else {
+            return false;
+        };
+
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.0 == 0 || fg == super::mouse_hook::target_hwnd() {
+            return false;
+        }
+        if EXCLUDED_CLASSES.contains(&class_of(fg).as_str()) {
+            return false;
+        }
+
+        let mut fg_rect = RECT::default();
+        if unsafe { GetWindowRect(fg, &mut fg_rect) }.is_err() {
+            return false;
+        }
+
+        let (left, top, right, bottom) = super::notch_geometry::rect(&my);
+        // 2px of slack, as in the original: a window that only just touches the
+        // notch should not count.
+        let overlaps = fg_rect.left < right + 2
+            && fg_rect.right > left - 2
+            && fg_rect.top < bottom + 2
+            && fg_rect.bottom > top - 2;
+        if !overlaps {
+            return false;
+        }
+
+        let mut cursor = POINT::default();
+        if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+            return false;
+        }
+
+        // Bumping the absolute top edge is the only way back once hidden;
+        // while visible, merely being inside the notch also keeps it out.
+        let bumping = cursor.y <= my.top && cursor.x >= left && cursor.x <= right;
+        let inside = cursor.y >= my.top
+            && cursor.y <= my.top + (bottom - top) + 5
+            && cursor.x >= left
+            && cursor.x <= right;
+        let wants_show = if is_hidden() { bumping } else { bumping || inside };
+
+        !wants_show
+    }
+
+    pub fn install(app: &tauri::AppHandle) {
+        let emitter = app.clone();
+        std::thread::spawn(move || {
+            let mut reported = false;
+            loop {
+                std::thread::sleep(Duration::from_millis(200));
+                let hide = should_hide();
+                if hide != reported {
+                    reported = hide;
+                    let _ = emitter.emit(HIDDEN_EVENT, hide);
+                }
+            }
+        });
+    }
+}
+
 /// Kept as a plain function so `setup` and the commands share one code path.
 #[tauri::command]
 fn set_panel_open(open: bool) {
@@ -374,6 +522,16 @@ fn set_panel_open(open: bool) {
     mouse_hook::set_panel_open(open);
     #[cfg(not(target_os = "windows"))]
     let _ = open;
+}
+
+/// The webview reporting that it has applied the autohide state. Only needed so
+/// the mouse hook knows whether there is a notch to click.
+#[tauri::command]
+fn set_notch_hidden(hidden: bool) {
+    #[cfg(target_os = "windows")]
+    autohide::set_hidden(hidden);
+    #[cfg(not(target_os = "windows"))]
+    let _ = hidden;
 }
 
 /// Menu id for the exit entry, matched in the menu event handler below.
@@ -416,6 +574,7 @@ pub fn run() {
             {
                 win::apply_styles(&window);
                 mouse_hook::install(app.handle());
+                autohide::install(app.handle());
             }
 
             // Place it top-centre immediately so the first frames are already
@@ -437,6 +596,7 @@ pub fn run() {
             set_notch_size,
             set_notch_hit,
             set_panel_open,
+            set_notch_hidden,
             show_notch_menu
         ])
         .run(tauri::generate_context!())
