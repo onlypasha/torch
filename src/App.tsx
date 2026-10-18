@@ -400,14 +400,17 @@ function useCountUp(value: number) {
  * percentage is simply shown and the bar along the bottom is already that wide -
  * it only has to change colour, to grey, or to amber if the level is low.
  *
+ * A machine that will not report a level - a desktop, where Windows leaves the
+ * field at 255 - gets the notice without one, because the alternative is "0%",
+ * which is a number and a wrong one.
+ *
  * Reduced motion is ignored, exactly as it is for the arrival.
  */
 function UnpluggedContent({ detail }: { detail: string }) {
   const percent = Number.parseInt(detail, 10);
-  const level = Number.isFinite(percent)
-    ? Math.max(0, Math.min(100, percent))
-    : 0;
-  const low = level <= LOW_BATTERY;
+  const known = Number.isFinite(percent);
+  const level = known ? Math.max(0, Math.min(100, percent)) : 0;
+  const low = known && level <= LOW_BATTERY;
 
   return (
     <>
@@ -440,24 +443,27 @@ function UnpluggedContent({ detail }: { detail: string }) {
         </span>
         <span className="notch-unplugged-title">
           Charger dilepas
-          <span
-            className="notch-unplugged-level"
-            data-low={low || undefined}
-          >{` · ${level}%`}</span>
+          {known && (
+            <span className="notch-unplugged-level" data-low={low || undefined}>
+              {` · ${level}%`}
+            </span>
+          )}
         </span>
       </div>
-      <div className="notch-unplugged-track">
-        <motion.div
-          className="notch-unplugged-fill"
-          style={{ width: `${level}%` }}
-          initial={{ opacity: 0, backgroundColor: "#34d399" }}
-          animate={{
-            opacity: 1,
-            backgroundColor: low ? "#f59e0b" : "#6b7280",
-          }}
-          transition={{ opacity: LEVEL_SHOW, backgroundColor: LEVEL_TINT }}
-        />
-      </div>
+      {known && (
+        <div className="notch-unplugged-track">
+          <motion.div
+            className="notch-unplugged-fill"
+            style={{ width: `${level}%` }}
+            initial={{ opacity: 0, backgroundColor: "#34d399" }}
+            animate={{
+              opacity: 1,
+              backgroundColor: low ? "#f59e0b" : "#6b7280",
+            }}
+            transition={{ opacity: LEVEL_SHOW, backgroundColor: LEVEL_TINT }}
+          />
+        </div>
+      )}
     </>
   );
 }
