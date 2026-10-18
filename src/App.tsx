@@ -58,10 +58,16 @@ export default function App() {
     setOpen(false);
   }, []);
 
-  const toggle = useCallback(() => {
-    if (wanted.current) closePanel();
-    else void openPanel();
-  }, [closePanel, openPanel]);
+  /**
+   * A press on the notch may only ever *open* it. Once the panel is open the
+   * whole area is the panel, so a click there belongs to the panel (and to
+   * whatever control ends up inside it); closing is the job of the outside
+   * click, not of a click on the panel itself.
+   */
+  const pressNotch = useCallback(() => {
+    if (wanted.current) return;
+    void openPanel();
+  }, [openPanel]);
 
   /**
    * The notch menu is native (Windows draws it and it can extend past the
@@ -155,7 +161,7 @@ export default function App() {
         onMouseDown={(event) => {
           if (event.button !== 0) return;
           event.preventDefault();
-          toggle();
+          pressNotch();
         }}
         onContextMenu={(event) => {
           // Suppress the webview's own menu and show the notch menu instead.
@@ -165,7 +171,7 @@ export default function App() {
         onKeyDown={(event) => {
           if (event.key !== "Enter" && event.key !== " ") return;
           event.preventDefault();
-          toggle();
+          pressNotch();
         }}
         className="absolute top-0 left-1/2 -translate-x-1/2 rounded-b-[22px] bg-[#1c1c1c] outline-none focus-visible:ring-1 focus-visible:ring-white/40"
       />
