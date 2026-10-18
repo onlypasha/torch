@@ -89,8 +89,9 @@ body,
   color: #ffffff;
 }
 
-/* ChargeRow from the WPF original: a 30x14 outline, a 2.5px inset fill that is
-   green while charging and grey once it is not, and a nub on the right. */
+/* ChargeRow from the WPF original: a 30x14 outline with a nub on the right. The
+   cable is out by the time this shows - the arrival has a shape of its own - so
+   the fill is the grey one. */
 .notch-battery {
   position: relative;
   display: inline-block;
@@ -107,10 +108,6 @@ body,
   bottom: 2.5px;
   left: 2.5px;
   border-radius: 1.5px;
-  background: #7ed957;
-}
-
-.notch-battery-fill[data-charging="false"] {
   background: #808080;
 }
 
@@ -125,15 +122,132 @@ body,
   background: rgb(255 255 255 / 0.9);
 }
 
-.notch-battery-bolt {
+/* ---------------------------------------------------------------------------
+   The charger's arrival.
+
+   Plugging in is the one activity with a shape of its own: the bar grows to
+   300x52 and rounds off, a green glow appears under it, and the bolt draws
+   itself while the level counts up over a progress bar.
+   --------------------------------------------------------------------------- */
+
+/* The glow needs a layer of its own: the shell clips itself (that is what keeps
+   the ears tidy and slides the bar out of sight on autohide), and a clip-path
+   would cut the shadow off along with everything else. */
+.notch-glow {
+  box-shadow: 0 8px 28px rgb(52 211 153 / 0.35);
+}
+
+.notch-charging {
   position: absolute;
   inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-family: "Segoe UI Emoji", "Segoe UI Symbol";
-  font-size: 8px;
-  line-height: 1;
+  /* Leave the progress bar its three pixels. */
+  padding-bottom: 3px;
+}
+
+.notch-charging-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Room for the ring that pulses out from behind the bolt. */
+.notch-charging-bolt {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+}
+
+.notch-charging-bolt-svg {
+  display: block;
+  width: 20px;
+  height: 20px;
+}
+
+.notch-charging-ring {
+  position: absolute;
+  inset: 0;
+  border: 1.5px solid #34d399;
+  border-radius: 9999px;
+}
+
+.notch-charging-text {
+  font-size: 14px;
   color: #ffffff;
-  text-shadow: 0 0 2px #000000;
+  /* The level counts up, and a proportional figure would drag the text about
+     while it does. */
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.notch-charging-level {
+  color: #34d399;
+  font-weight: 600;
+}
+
+.notch-charging-track {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+}
+
+/* Clipped by the body's rounded corners, so the bar follows the outline at the
+   two bottom corners instead of poking past them. */
+.notch-charging-fill {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+  background: #34d399;
+}
+
+/* A highlight travelling the fill, so the bar reads as busy rather than as a
+   static width. */
+.notch-charging-shimmer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 40%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgb(255 255 255 / 0.85),
+    transparent
+  );
+  animation: notch-shimmer 1.6s linear infinite;
+}
+
+@keyframes notch-shimmer {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+
+/* The charger's state, on the bar itself: a dot beside the clock for as long as
+   the cable is in, whether or not anything was just announced. */
+.notch-charging-dot {
+  width: 7px;
+  height: 7px;
+  margin-left: 6px;
+  flex: none;
+  border-radius: 9999px;
+  background: #34d399;
+}
+
+/* The shimmer is the one piece of the arrival that moves on its own in CSS; the
+   rest of the reduced-motion handling sits where those parts are rendered. */
+@media (prefers-reduced-motion: reduce) {
+  .notch-charging-shimmer {
+    display: none;
+  }
 }
