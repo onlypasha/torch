@@ -63,6 +63,20 @@ export default function App() {
     else void openPanel();
   }, [closePanel, openPanel]);
 
+  /**
+   * The notch menu is native (Windows draws it and it can extend past the
+   * window), so it is a Rust command either way - reached from the DOM when the
+   * panel is interactive, and from the low-level hook when the collapsed window
+   * is click-through and the DOM sees nothing at all.
+   */
+  const showMenu = useCallback(async () => {
+    try {
+      await invoke("show_notch_menu");
+    } catch (err) {
+      console.error("show_notch_menu failed:", err);
+    }
+  }, []);
+
   const handleSettled = useCallback(() => {
     // Only once the closing animation is done is the notch small enough to
     // shrink the hit area; doing it earlier would make the shrinking panel
@@ -104,6 +118,20 @@ export default function App() {
     };
   }, [openPanel]);
 
+  // Same story for a right-click on the collapsed notch.
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let disposed = false;
+    void listen("notch-context", () => void showMenu()).then((unlisten) => {
+      if (disposed) unlisten();
+      else stop = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, [showMenu]);
+
   // Keep the native click-outside hook aware of whether the panel is open.
   useEffect(() => {
     void invoke("set_panel_open", { open }).catch(() => {});
@@ -128,6 +156,11 @@ export default function App() {
           if (event.button !== 0) return;
           event.preventDefault();
           toggle();
+        }}
+        onContextMenu={(event) => {
+          // Suppress the webview's own menu and show the notch menu instead.
+          event.preventDefault();
+          void showMenu();
         }}
         onKeyDown={(event) => {
           if (event.key !== "Enter" && event.key !== " ") return;

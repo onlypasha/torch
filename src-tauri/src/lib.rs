@@ -24,6 +24,7 @@
 //! hook is what notices a click on the notch - and *swallows* it, so the click
 //! does not leak into whatever application is underneath.
 
+use tauri::menu::{Menu, MenuItem};
 use tauri::{Manager, WebviewWindow};
 
 /// Sizes are given in logical pixels; the physical conversion happens here so
@@ -210,31 +211,44 @@ mod mouse_hook {
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, GetWindowRect, HHOOK, MSG, MSLLHOOKSTRUCT,
         SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_MOUSE_LL, WM_LBUTTONDOWN,
-        WM_LBUTTONUP,
+        WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
     /// Fired when the panel is open and the user clicks anywhere outside it.
     pub const OUTSIDE_EVENT: &str = "notch-click-outside";
     /// Fired when the user clicks the collapsed notch (the click is swallowed).
     pub const PRESS_EVENT: &str = "notch-press";
+    /// Fired when the user right-clicks the collapsed notch (also swallowed).
+    pub const CONTEXT_EVENT: &str = "notch-context";
 
     enum Signal {
         Outside,
         Press,
+        Context,
     }
 
     static NOTIFY: OnceLock<Sender<Signal>> = OnceLock::new();
     static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
     static OPEN: AtomicBool = AtomicBool::new(false);
+    /// Set while the notch context menu is up. That menu is modal and its clicks
+    /// come through this same hook, so the hook has to stand down completely or
+    /// it would read a click on a menu item as a click on the notch.
+    static MENU_OPEN: AtomicBool = AtomicBool::new(false);
     /// Set while we swallow a notch click, so the matching button-up is
     /// swallowed too and the application underneath never sees half a click.
-    static SWALLOW_UP: AtomicBool = AtomicBool::new(false);
+    static SWALLOW_L_UP: AtomicBool = AtomicBool::new(false);
+    /// A right-press on the collapsed notch, waiting for its release.
+    static PENDING_R_UP: AtomicBool = AtomicBool::new(false);
 
     pub fn set_panel_open(open: bool) {
         OPEN.store(open, Ordering::Relaxed);
         if !open {
-            SWALLOW_UP.store(false, Ordering::Relaxed);
+            SWALLOW_L_UP.store(false, Ordering::Relaxed);
         }
+    }
+
+    pub fn set_menu_open(open: bool) {
+        MENU_OPEN.store(open, Ordering::Relaxed);
     }
 
     fn window_rect() -> Option<RECT> {
@@ -247,40 +261,63 @@ mod mouse_hook {
         Some(rect)
     }
 
-    /// Runs on the hook thread, so it must stay allocation- and IPC-free.
+    /// The hook thread must stay allocation- and IPC-free, so a signal is just
+    /// handed to the emitter thread and forgotten.
+    fn notify(signal: Signal) {
+        if let Some(tx) = NOTIFY.get() {
+            let _ = tx.send(signal);
+        }
+    }
+
+    /// True when the point is inside the collapsed notch silhouette.
+    fn inside_collapsed_notch(rect: &RECT, x: i32, y: i32) -> bool {
+        if !super::notch_geometry::is_collapsed() {
+            return false;
+        }
+        let (nl, nt, nr, nb) = super::notch_geometry::rect(rect);
+        x >= nl && x < nr && y >= nt && y < nb
+    }
+
+    /// Runs on the hook thread.
     unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        if code >= 0 {
+        if code >= 0 && !MENU_OPEN.load(Ordering::Relaxed) {
             let message = wparam.0 as u32;
 
-            if message == WM_LBUTTONDOWN {
+            if message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN {
                 if let Some(info) = unsafe { (lparam.0 as *const MSLLHOOKSTRUCT).as_ref() } {
                     let POINT { x, y } = info.pt;
                     if let Some(rect) = window_rect() {
                         if OPEN.load(Ordering::Relaxed) {
+                            // The panel is interactive, so only a click outside
+                            // it matters - and that one is never swallowed.
                             let inside = x >= rect.left
                                 && x < rect.right
                                 && y >= rect.top
                                 && y < rect.bottom;
                             if !inside {
-                                if let Some(tx) = NOTIFY.get() {
-                                    let _ = tx.send(Signal::Outside);
-                                }
+                                notify(Signal::Outside);
                             }
-                        } else if super::notch_geometry::is_collapsed() {
-                            let (nl, nt, nr, nb) = super::notch_geometry::rect(&rect);
-                            if x >= nl && x < nr && y >= nt && y < nb {
-                                // Give the click to the notch: notify, then block
-                                // it so it never reaches the window underneath.
-                                if let Some(tx) = NOTIFY.get() {
-                                    let _ = tx.send(Signal::Press);
-                                }
-                                SWALLOW_UP.store(true, Ordering::Relaxed);
-                                return LRESULT(1);
+                        } else if inside_collapsed_notch(&rect, x, y) {
+                            // The collapsed window is click-through, so this
+                            // click never reaches the webview: swallow it so it
+                            // does not reach the window below either. A right
+                            // press only arms the release; the menu is opened
+                            // there, because a menu shown while the button is
+                            // still down can dismiss itself immediately.
+                            if message == WM_RBUTTONDOWN {
+                                PENDING_R_UP.store(true, Ordering::Relaxed);
+                            } else {
+                                notify(Signal::Press);
+                                SWALLOW_L_UP.store(true, Ordering::Relaxed);
                             }
+                            return LRESULT(1);
                         }
                     }
                 }
-            } else if message == WM_LBUTTONUP && SWALLOW_UP.swap(false, Ordering::Relaxed) {
+            } else if message == WM_LBUTTONUP && SWALLOW_L_UP.swap(false, Ordering::Relaxed) {
+                return LRESULT(1);
+            } else if message == WM_RBUTTONUP && PENDING_R_UP.swap(false, Ordering::Relaxed) {
+                notify(Signal::Context);
                 return LRESULT(1);
             }
         }
@@ -303,6 +340,7 @@ mod mouse_hook {
                 let event = match signal {
                     Signal::Outside => OUTSIDE_EVENT,
                     Signal::Press => PRESS_EVENT,
+                    Signal::Context => CONTEXT_EVENT,
                 };
                 let _ = emitter.emit(event, ());
             }
@@ -340,9 +378,37 @@ fn set_panel_open(open: bool) {
     let _ = open;
 }
 
+/// Menu id for the exit entry, matched in the menu event handler below.
+const EXIT_MENU_ID: &str = "exit";
+
+/// Show the notch context menu at the cursor. Deliberately synchronous so it
+/// runs on the main thread - `TrackPopupMenu` needs the thread that owns the
+/// window - and deliberately only one entry wide for now.
+#[tauri::command]
+fn show_notch_menu(window: WebviewWindow) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    mouse_hook::set_menu_open(true);
+
+    let shown = (|| -> tauri::Result<()> {
+        let exit = MenuItem::with_id(window.app_handle(), EXIT_MENU_ID, "Exit", true, None::<&str>)?;
+        let menu = Menu::with_items(window.app_handle(), &[&exit])?;
+        window.popup_menu(&menu)
+    })();
+
+    #[cfg(target_os = "windows")]
+    mouse_hook::set_menu_open(false);
+
+    shown.map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == EXIT_MENU_ID {
+                app.exit(0);
+            }
+        })
         .setup(|app| {
             let window = app
                 .get_webview_window("main")
@@ -376,7 +442,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             set_notch_size,
             set_notch_hit,
-            set_panel_open
+            set_panel_open,
+            show_notch_menu
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
