@@ -43,8 +43,17 @@ const SPRING_CLOSE: Transition = { type: "spring", stiffness: 500, damping: 40 }
 const CONTENT_ENTER: Transition = { duration: 0.25, delay: 0.08, ease: "easeOut" };
 const CONTENT_EXIT: Transition = { duration: 0.12 };
 
+/**
+ * The idle clock: `HH:mm`, 24-hour local time, exactly as the WPF original
+ * formatted it. Built by hand rather than through Intl so the two-digit shape
+ * survives a machine whose locale formats hours its own way.
+ */
+const formatClock = (date: Date) =>
+  `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+
 export default function App() {
   const [open, setOpen] = useState(false);
+  const [time, setTime] = useState(() => formatClock(new Date()));
   // True while a foreground window covers the collapsed notch (native monitors
   // it, see the autohide module in lib.rs). Autohide never applies to the open
   // panel, so hidden and open are mutually exclusive in practice.
@@ -128,6 +137,36 @@ export default function App() {
   useEffect(() => {
     void setHitArea("collapsed");
   }, [setHitArea]);
+
+  /**
+   * Idle clock. Every tick re-reads the system time instead of counting up, so
+   * a machine that slept with the notch on screen shows the right time on the
+   * first tick after waking. The timeout is aligned to the next wall-clock
+   * second, which keeps it from drifting the way a bare 1000ms would.
+   */
+  useEffect(() => {
+    let timer = 0;
+    const schedule = () => {
+      timer = window.setTimeout(
+        () => {
+          setTime(formatClock(new Date()));
+          schedule();
+        },
+        1000 - (Date.now() % 1000) + 20,
+      );
+    };
+    schedule();
+    // Belt and braces for the resume case: the webview may not run timers
+    // while the window is occluded.
+    const resync = () => setTime(formatClock(new Date()));
+    document.addEventListener("visibilitychange", resync);
+    window.addEventListener("focus", resync);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", resync);
+      window.removeEventListener("focus", resync);
+    };
+  }, []);
 
   // Autohide: native polls the foreground window and tells us when the notch is
   // covered, and when the cursor is bumped back against the top edge.
@@ -241,6 +280,23 @@ export default function App() {
         className="notch-shell absolute top-0 left-1/2 -translate-x-1/2 outline-none focus-visible:ring-1 focus-visible:ring-white/40"
       >
         <div className="notch-body">
+          {/* The clock and the content are separate layers: neither can push the
+              other around while one fades in and the other out, and the clock
+              sits at the same 8px/20px row the WPF original used. It fades into
+              the panel as it opens rather than overlapping it. */}
+          <motion.div
+            aria-hidden={open}
+            initial={false}
+            animate={{
+              opacity: open ? 0 : 1,
+              filter: open ? "blur(6px)" : "blur(0px)",
+              scale: open ? 0.95 : 1,
+            }}
+            transition={open ? CONTENT_EXIT : CONTENT_ENTER}
+            className="notch-clock pointer-events-none absolute inset-x-0 top-2 flex h-5 items-center justify-center text-sm text-white"
+          >
+            {time}
+          </motion.div>
           {/* Placeholder only: the tabs replace this next. */}
           <AnimatePresence>
             {open && (

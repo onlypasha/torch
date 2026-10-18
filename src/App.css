@@ -56,3 +56,14 @@ body,
   border-radius: inherit;
   background: var(--notch-color);
 }
+
+/* Same stack the WPF original asked for, falling back through the optical
+   sizes that Windows 11 exposes to the browser, then plain Segoe UI. */
+.notch-clock {
+  font-family:
+    "Segoe UI Variable Text", "Segoe UI Variable Display", "Segoe UI Variable",
+    "Segoe UI", system-ui, sans-serif;
+  /* Digits and the colon keep one width, so the clock does not shuffle sideways
+     as the minutes tick over. */
+  font-variant-numeric: tabular-nums;
+}
