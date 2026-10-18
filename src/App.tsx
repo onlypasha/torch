@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import type { Transition } from "motion/react";
 import { invoke } from "@tauri-apps/api/core";
@@ -13,22 +14,22 @@ import { listen } from "@tauri-apps/api/event";
  */
 const COLLAPSED = { width: 200, height: 34, radius: 14, ear: 6 };
 /**
- * Plugging in is the one activity that gets a shape of its own: wider and taller
- * than the clock's bar, and rounder to match. The main panel is not involved.
+ * The indicators that take the whole bar - the charger's arrival and a network
+ * coming up - share this shape: wider and taller than the clock's bar, and
+ * rounder to match. The main panel is not involved.
  */
-const CHARGING = { width: 300, height: 52, radius: 24, ear: 14 };
+const TALL = { width: 300, height: 52, radius: 24, ear: 14 };
 const EXPANDED = { width: 420, height: 160, radius: 28, ear: 14 };
 
 /**
  * The three shapes the bar can be in. The destination is what picks the spring -
- * growing into the panel or into the charger's bar springs open, shrinking back
- * to the clock's bar springs shut - so the shape is named separately from its
- * size.
+ * growing into the panel or into the tall bar springs open, shrinking back to
+ * the clock's bar springs shut - so the shape is named separately from its size.
  */
-type Bar = "bar" | "charging" | "panel";
+type Bar = "bar" | "tall" | "panel";
 const BAR_SIZES: Record<Bar, typeof COLLAPSED> = {
   bar: COLLAPSED,
-  charging: CHARGING,
+  tall: TALL,
   panel: EXPANDED,
 };
 
@@ -77,14 +78,61 @@ const formatClock = (date: Date) =>
 type ActivityKind =
   | "power-connected"
   | "power-disconnected"
-  | "wifi-connected"
-  | "ethernet-connected"
+  | "wifi"
+  | "ethernet"
   | "bluetooth-connected"
   | "usb-connected"
   | "usb-disconnected";
 
-type ActivityEvent = { kind: ActivityKind; detail: string };
-type Activity = ActivityEvent & { id: number };
+/**
+ * What native actually sends. The networks arrive as a short sequence - an
+ * attempt starting, then answering or giving up - which `enqueue` folds into the
+ * one activity it is really about.
+ */
+type WireKind =
+  | Exclude<ActivityKind, "wifi" | "ethernet">
+  | "wifi-connecting"
+  | "wifi-connected"
+  | "wifi-lost"
+  | "ethernet-detected"
+  | "ethernet-connected"
+  | "ethernet-lost";
+
+/** The plain row: everything that does not take the whole bar. */
+type RowKind =
+  | "power-disconnected"
+  | "bluetooth-connected"
+  | "usb-connected"
+  | "usb-disconnected";
+
+type WireEvent = { kind: WireKind; detail: string };
+
+/** Which network an activity is about. */
+type NetKind = "wifi" | "ethernet";
+
+/**
+ * What a network indicator is showing. `failed` and `lost` are the same notice
+ * with different wording: the first for a link that never came up, the second
+ * for one that did and then went away.
+ */
+type NetPhase = "connecting" | "connected" | "failed" | "lost";
+
+type Network = {
+  phase: NetPhase;
+  /**
+   * Native has confirmed the link. The intro phase still holds the indicator
+   * until its minimum has had its time on screen, which is what keeps these two
+   * apart.
+   */
+  up: boolean;
+};
+
+type Activity = {
+  id: number;
+  kind: ActivityKind;
+  detail: string;
+  net?: Network;
+};
 
 const ACTIVITY_MS = 3000;
 /**
@@ -94,13 +142,50 @@ const ACTIVITY_MS = 3000;
  */
 const POWER_MS = 3500;
 /**
- * A beat between the charger's bar shrinking and the next indicator appearing:
- * the bar goes back to the clock's size first, with nothing on it, rather than
- * the next activity showing up inside a bar that is still collapsing.
+ * A beat between a tall indicator's bar shrinking and the next one appearing: the
+ * bar goes back to the clock's size first, with nothing on it, rather than the
+ * next activity showing up inside a bar that is still collapsing.
  */
-const CHARGING_SETTLE_MS = 460;
+const SETTLE_MS = 460;
 /** Guard against a device flapping faster than the queue can drain. */
 const ACTIVITY_QUEUE_MAX = 8;
+
+/**
+ * Network timings, in milliseconds.
+ *
+ * The intro phase has a minimum rather than a dwell: the indicator stays on the
+ * bar until the network actually answers, and the minimum is only there so a
+ * connection that is over in a blink still reads as an arrival. Wi-Fi gets the
+ * longer one because associating and authenticating take a moment; a cable
+ * either has a link or it does not.
+ */
+const NET_INTRO_MS: Record<NetKind, number> = { wifi: 1500, ethernet: 800 };
+/** How long the link itself stays up on the bar before it collapses. */
+const NET_LINK_MS = 2600;
+/** The failure and disconnect notices. */
+const NET_NOTICE_MS = 1600;
+/**
+ * A backstop for a machine that never answers at all - a wireless service that
+ * dies mid-attempt says nothing, and the indicator would otherwise sit there
+ * holding the clock's place.
+ */
+const NET_GIVE_UP_MS = 12000;
+
+/**
+ * The wire events, grouped by the activity they belong to. Which of the two
+ * phases a `lost` event ends up in is decided when it arrives, from how far the
+ * indicator had got (see `enqueue`).
+ */
+const NETWORK_WIRE: Partial<
+  Record<WireKind, { kind: NetKind; event: "connecting" | "connected" | "lost" }>
+> = {
+  "wifi-connecting": { kind: "wifi", event: "connecting" },
+  "wifi-connected": { kind: "wifi", event: "connected" },
+  "wifi-lost": { kind: "wifi", event: "lost" },
+  "ethernet-detected": { kind: "ethernet", event: "connecting" },
+  "ethernet-connected": { kind: "ethernet", event: "connected" },
+  "ethernet-lost": { kind: "ethernet", event: "lost" },
+};
 
 /** Charger arrival timings, in seconds, straight from the spec. */
 const COUNT_UP_MS = 900;
@@ -117,32 +202,19 @@ const PULSE_RING: Transition = { duration: 1.4, ease: "easeOut", repeat: Infinit
 const BOLT_PATH = "M12.6 2.4 5.2 13.4h5.9l-.5 8.2 8.6-11.3h-6.3z";
 
 /**
- * How each event presents itself. The wording is the part that does not come
- * from the machine; `detail` is the SSID, the device name, the percentage.
+ * How each plain event presents itself. The wording is the part that does not
+ * come from the machine; `detail` is the device name or the percentage.
  *
  * The two power events are the ones without a glyph, and they no longer look
  * alike: plugging in gets the drawn bolt and the progress bar (see
  * `ChargingContent`), while unplugging stays on the small bar with the battery
- * the WPF original drew by hand.
+ * the WPF original drew by hand. The networks are not here either: they have a
+ * layer of their own, with two phases to show (see `NetworkContent`).
  */
-const ACTIVITY: Record<
-  ActivityKind,
-  { text: (detail: string) => string; glyph?: string }
-> = {
-  "power-connected": {
-    text: (detail) => (detail ? `Mengisi daya · ${detail}` : "Mengisi daya"),
-  },
+const ROW: Record<RowKind, { text: (detail: string) => string; glyph?: string }> = {
   "power-disconnected": {
     text: (detail) =>
       detail ? `Charger dicabut · ${detail}` : "Charger dicabut",
-  },
-  "wifi-connected": {
-    glyph: "\uE701",
-    text: (detail) => (detail ? `Wi-Fi · ${detail}` : "Wi-Fi terhubung"),
-  },
-  "ethernet-connected": {
-    glyph: "\uE839",
-    text: () => "Ethernet terhubung",
   },
   "bluetooth-connected": {
     glyph: "\uE702",
@@ -158,6 +230,127 @@ const ACTIVITY: Record<
     text: (detail) => (detail ? `${detail} dilepas` : "USB dilepas"),
   },
 };
+
+/** Whether the clock's row is what this activity is drawn in. */
+const isRow = (kind: ActivityKind): kind is RowKind =>
+  kind === "power-disconnected" ||
+  kind === "bluetooth-connected" ||
+  kind === "usb-connected" ||
+  kind === "usb-disconnected";
+
+/**
+ * The network an activity is about, if it is one. Narrowing the kind here is what
+ * tells the rest of the file which of the two tall indicators it is looking at.
+ */
+function networkOf(
+  activity: Activity,
+): (Network & { kind: NetKind; detail: string }) | undefined {
+  if (activity.kind !== "wifi" && activity.kind !== "ethernet") return undefined;
+  if (activity.net === undefined) return undefined;
+  return { ...activity.net, kind: activity.kind, detail: activity.detail };
+}
+
+/** One activity in the queue, replaced where it stands. */
+function replace(
+  queue: Activity[],
+  at: number,
+  change: { detail: string; net: Network },
+): Activity[] {
+  return queue.map((item, index) =>
+    index === at ? { ...item, ...change } : item,
+  );
+}
+
+/**
+ * The queue. Everything queues one activity per event, except the networks: a
+ * connection arrives as two or three events, and they are all one indicator that
+ * changes phase rather than several that show up one after another.
+ *
+ * `open` decides whether a link that is already up counts as old news. If the
+ * notch was busy - the panel open, another indicator ahead - then the connection
+ * finished while nobody was looking, and showing its latest state beats replaying
+ * an arrival that has already happened. A fresh one on an idle bar still gets its
+ * opening act.
+ */
+function enqueue(
+  queue: Activity[],
+  event: WireEvent,
+  open: boolean,
+  nextId: number,
+): Activity[] {
+  const wire = NETWORK_WIRE[event.kind];
+  if (wire === undefined) {
+    return [
+      ...queue,
+      { id: nextId, kind: event.kind as ActivityKind, detail: event.detail },
+    ];
+  }
+
+  const at = queue.map((item) => item.kind).lastIndexOf(wire.kind);
+  const before = at === -1 ? undefined : queue[at];
+  // The head of the queue is the one on the bar, unless the panel is over it.
+  const onScreen = at === 0 && !open;
+
+  if (wire.event === "lost") {
+    // A link going away is only worth the bar if that network was just on it.
+    if (before === undefined) return queue;
+    return replace(queue, at, {
+      detail: before.detail,
+      net: {
+        // A link that had come up says it was cut; one that never got there
+        // says it failed.
+        phase: before.net?.up ? "lost" : "failed",
+        up: false,
+      },
+    });
+  }
+
+  if (wire.event === "connecting") {
+    // Already sitting on the attempt: there is nothing to change, and replacing
+    // the activity anyway would restart the intro's minimum.
+    if (
+      before?.net?.phase === "connecting" &&
+      !before.net.up &&
+      before.detail === event.detail
+    ) {
+      return queue;
+    }
+
+    // A fresh attempt replays the arrival, whether or not this network was
+    // already on the bar.
+    const attempt = { detail: event.detail, net: { phase: "connecting" as const, up: false } };
+    return before === undefined
+      ? [...queue, { id: nextId, kind: wire.kind, ...attempt }]
+      : replace(queue, at, attempt);
+  }
+
+  // The link is up. It plays as an opener when nothing is on the bar and the
+  // panel is not over it, or while the welcome it started is still playing - the
+  // gate in App moves that one on when its minimum is up. Otherwise the link is
+  // shown as it stands, which includes a connection that finished while the panel
+  // was open or another indicator was ahead.
+  const opening =
+    before === undefined
+      ? queue.length === 0 && !open
+      : onScreen && before.net?.phase === "connecting";
+  const link = {
+    detail: event.detail,
+    net: { phase: (opening ? "connecting" : "connected") as NetPhase, up: true },
+  };
+  // The link reported twice is the same news: leave the activity, and its clock,
+  // exactly as they are.
+  if (
+    before !== undefined &&
+    before.net?.phase === link.net.phase &&
+    before.net.up &&
+    before.detail === event.detail
+  ) {
+    return queue;
+  }
+  return before === undefined
+    ? [...queue, { id: nextId, kind: wire.kind, ...link }]
+    : replace(queue, at, link);
+}
 
 /**
  * The WPF charge row, in DOM: a 30x14 outline with a 2.5px inset grey fill whose
@@ -268,6 +461,258 @@ function ChargingContent({ detail }: { detail: string }) {
   );
 }
 
+/**
+ * Wi-Fi and the cable. Both phases fill the charger's bar on the charger's
+ * timings; what changes between them is the caption, the icon and the strip
+ * along the bottom.
+ *
+ * The wording is Indonesian, like the rest of the notch. A Wi-Fi link names the
+ * network it is on; the cable has nothing to name, so it says what the port
+ * negotiated instead (native reads it from Windows, see `link_speed`).
+ */
+const NET_CAPTION: Record<
+  NetKind,
+  Record<NetPhase, (detail: string) => string>
+> = {
+  wifi: {
+    connecting: () => "Menghubungkan…",
+    connected: (ssid) => ssid || "Wi-Fi",
+    failed: () => "Koneksi gagal",
+    lost: () => "Koneksi terputus",
+  },
+  ethernet: {
+    connecting: () => "Kabel terdeteksi",
+    connected: () => "Ethernet",
+    failed: () => "Koneksi gagal",
+    lost: () => "Koneksi terputus",
+  },
+};
+
+/**
+ * The three arcs of a wireless glyph: paths of concentric circles centred below
+ * the viewBox, each cut off 50 degrees either side of vertical.
+ */
+const WIFI_ARCS = [
+  "M2.04 10.64 A13 13 0 0 1 21.96 10.64",
+  "M5.11 13.21 A9 9 0 0 1 18.89 13.21",
+  "M8.17 15.79 A5 5 0 0 1 15.83 15.79",
+];
+
+/** While the attempt is in flight, each arc blinks on its own beat. */
+const ARC_BLINK: Transition = { duration: 1.1, ease: "easeInOut", repeat: Infinity };
+const ARC_STEP = 0.18;
+
+/** Four bars of increasing height, the way a signal meter reads. */
+const SIGNAL_BARS = [5, 8, 11, 14];
+
+/** The ethernet plug's slide into its port. */
+const PLUG: Transition = {
+  type: "spring",
+  stiffness: 420,
+  damping: 17,
+  delay: 0.1,
+};
+/** The icon's bounce when the link comes up. */
+const ICON_POP: Transition = { type: "spring", stiffness: 420, damping: 16 };
+/** Each signal bar rising into place, one after another. */
+const BAR_SPRING: Transition = { type: "spring", stiffness: 500, damping: 22 };
+const BAR_STEP = 0.07;
+/** The ring that clicks out of the port once the cable lands. */
+const CLICK_RING: Transition = { duration: 0.5, ease: "easeOut" };
+/** The travelling segment that stands in for progress while connecting. */
+const RUNNER: Transition = { duration: 1, ease: "easeInOut", repeat: Infinity };
+/**
+ * The link speed, which waits for the caption's own swap to finish (160ms out,
+ * 160ms in) rather than shoving it sideways while it slides.
+ */
+const SPEED_IN: Transition = { duration: 0.25, delay: 0.3, ease: "easeOut" };
+/** The caption swap: the old one up and out, the new one in from below. */
+const CAPTION_SWAP: Transition = { duration: 0.16 };
+
+/**
+ * The icon's single bounce. Motion springs between two values only, so the
+ * spec's 1 -> 1.18 -> 1 plays as two springs with the stiffness and damping it
+ * names - out on the way up, and back with one visible bounce of its own.
+ */
+function Pop({ active, children }: { active: boolean; children: ReactNode }) {
+  const [back, setBack] = useState(false);
+  useEffect(() => {
+    if (!active) setBack(false);
+  }, [active]);
+
+  return (
+    <motion.span
+      className="notch-network-glyph"
+      initial={{ scale: 1 }}
+      animate={{ scale: active && !back ? 1.18 : 1 }}
+      transition={ICON_POP}
+      onAnimationComplete={() => {
+        if (active) setBack(true);
+      }}
+    >
+      {children}
+    </motion.span>
+  );
+}
+
+function WifiIcon({ phase }: { phase: NetPhase }) {
+  const live = phase === "connected";
+  // A notice is not a link: the arcs stop blinking and the meter goes, so the
+  // icon reads as finished rather than as still trying.
+  const quiet = phase === "failed" || phase === "lost";
+
+  return (
+    <span
+      className="notch-network-icon"
+      data-quiet={quiet || undefined}
+      aria-hidden="true"
+    >
+      <Pop active={live}>
+        <svg viewBox="0 0 24 24" className="notch-network-arcs">
+          {WIFI_ARCS.map((d, index) => (
+            <motion.path
+              key={d}
+              d={d}
+              fill="none"
+              stroke="#60a5fa"
+              strokeWidth={2}
+              strokeLinecap="round"
+              initial={{ opacity: 0.15 }}
+              animate={
+                live
+                  ? { opacity: 1 }
+                  : quiet
+                    ? { opacity: 0.5 }
+                    : { opacity: [0.15, 1, 0.15] }
+              }
+              transition={
+                live || quiet
+                  ? { duration: 0.2 }
+                  : { ...ARC_BLINK, delay: index * ARC_STEP }
+              }
+            />
+          ))}
+        </svg>
+      </Pop>
+      {/* The bars are the one part of the glyph the attempt does not have: a
+          signal meter only means something once there is a signal. The space is
+          held for them either way, so nothing shifts when they arrive. */}
+      <span className="notch-network-bars">
+        {live &&
+          SIGNAL_BARS.map((height, index) => (
+            <motion.span
+              key={height}
+              className="notch-network-bar"
+              style={{ height }}
+              initial={{ scaleY: 0.25, opacity: 0.3 }}
+              animate={{ scaleY: 1, opacity: 1 }}
+              transition={{ ...BAR_SPRING, delay: index * BAR_STEP }}
+            />
+          ))}
+      </span>
+    </span>
+  );
+}
+
+function EthernetIcon({ phase }: { phase: NetPhase }) {
+  const quiet = phase === "failed" || phase === "lost";
+
+  return (
+    <span
+      className="notch-network-icon"
+      data-quiet={quiet || undefined}
+      aria-hidden="true"
+    >
+      {/* The plug slides in from the left; the ring clicks out of the port the
+          moment the cable lands in it. */}
+      <motion.span
+        className="notch-network-plug"
+        initial={{ x: -14 }}
+        animate={{ x: 0 }}
+        transition={PLUG}
+      />
+      <span className="notch-network-port">
+        {phase === "connected" && (
+          <motion.span
+            className="notch-network-click"
+            initial={{ scale: 1, opacity: 0.9 }}
+            animate={{ scale: 1.5, opacity: 0 }}
+            transition={CLICK_RING}
+          />
+        )}
+      </span>
+    </span>
+  );
+}
+
+function NetworkContent({
+  kind,
+  phase,
+  detail,
+}: {
+  kind: NetKind;
+  phase: NetPhase;
+  detail: string;
+}) {
+  const caption = NET_CAPTION[kind][phase](detail);
+  // The cable's one thing to read is how fast the port negotiated, and native
+  // leaves it empty when Windows will not say.
+  const speed = kind === "ethernet" && phase === "connected" && detail;
+
+  return (
+    <>
+      <div className="notch-network-row">
+        {kind === "wifi" ? (
+          <WifiIcon phase={phase} />
+        ) : (
+          <EthernetIcon phase={phase} />
+        )}
+        <span className="notch-network-title">
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.span
+              key={caption}
+              className="notch-network-caption"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={CAPTION_SWAP}
+            >
+              {caption}
+            </motion.span>
+          </AnimatePresence>
+          {speed && (
+            <motion.span
+              className="notch-network-level"
+              initial={{ opacity: 0, x: 6 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={SPEED_IN}
+            >
+              · {detail}
+            </motion.span>
+          )}
+        </span>
+      </div>
+      {/* Nothing to measure while connecting, so the strip travels instead; once
+          the link is up it fades out and leaves the bar clean. */}
+      <AnimatePresence>
+        {phase === "connecting" && (
+          <motion.div
+            key="attempt"
+            className="notch-network-track"
+            exit={{ opacity: 0, transition: { duration: 0.15 } }}
+          >
+            <motion.div
+              className="notch-network-runner"
+              animate={{ x: ["-40%", "260%"] }}
+              transition={RUNNER}
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </>
+  );
+}
+
 export default function App() {
   const [open, setOpen] = useState(false);
   const [time, setTime] = useState(() => formatClock(new Date()));
@@ -284,19 +729,29 @@ export default function App() {
   // only while a native call is in flight, which is what lets a fast reverse
   // cancel an open that has not started animating yet.
   const wanted = useRef(false);
+  // The activity listener is mounted once and never re-subscribed, so it reads
+  // the panel's state through a ref rather than closing over a stale value.
+  const openRef = useRef(open);
+  openRef.current = open;
 
   const activity = activities[0];
   // While the panel is open the indicator waits rather than interrupting: it
   // lives on the collapsed bar, so showing it would mean closing what the user
   // just opened. The queue is held, not dropped.
   const showingActivity = activity !== undefined && !open;
-  // The arrival is the one activity with a silhouette of its own; the "unplugged"
-  // notice stays on the small bar with everything else.
+  // The two tall indicators: the charger's arrival and a network coming up. The
+  // "unplugged" notice and the rest stay on the clock's small bar.
   const charging = showingActivity && activity.kind === "power-connected";
-  // What the clock's row shows. The arrival is not part of it - it has its own
-  // layer - and while the bar is settling after one, nothing is.
+  const network =
+    showingActivity && activity !== undefined ? networkOf(activity) : undefined;
+  const tall = charging || network !== undefined;
+  // What the clock's row shows. The tall indicators are not part of it - they
+  // have layers of their own - and while the bar is settling after one, nothing
+  // is.
   const rowActivity =
-    showingActivity && !settling && !charging ? activity : undefined;
+    showingActivity && !settling && !tall && activity !== undefined && isRow(activity.kind)
+      ? activity
+      : undefined;
   // An indicator is worth showing even when autohide would have hidden the
   // notch; once it has had its turn the autohide state takes over again.
   // Reporting it as *visible* to native matters: the hook then treats it as a
@@ -304,7 +759,7 @@ export default function App() {
   const hidden = autohide && !showingActivity;
 
   // Which shape the bar is in.
-  const bar: Bar = open ? "panel" : charging ? "charging" : "bar";
+  const bar: Bar = open ? "panel" : tall ? "tall" : "bar";
 
   /**
    * The native window keeps one size for its whole life - a resize makes
@@ -329,43 +784,36 @@ export default function App() {
    * reduced motion and had been getting a bar that simply jumped.
    */
   const sizeTransition: Transition = bar === "bar" ? SPRING_CLOSE : SPRING_OPEN;
-  // Content Blur Fade-In / Fade-Out for the arrival: 8px of blur and a 0.95 scale
-  // behind a 250ms fade that starts 80ms after the bar begins to grow.
-  const chargerEnter: Transition = {
+  // Content Blur Fade-In / Fade-Out for the tall indicators: 8px of blur and a
+  // 0.95 scale behind a 250ms fade that starts 80ms after the bar begins to grow.
+  // The same timings the panel's own content uses.
+  const arrivalEnter: Transition = {
     duration: 0.25,
     delay: 0.08,
     ease: "easeOut",
   };
-  const chargerExit: Transition = { duration: 0.12 };
+  const arrivalExit: Transition = { duration: 0.12 };
 
-  const setHitArea = useCallback(
-    async (state: "collapsed" | "charging" | "expanded") => {
-      const size =
-        state === "expanded"
-          ? EXPANDED
-          : state === "charging"
-            ? CHARGING
-            : COLLAPSED;
-      try {
-        await invoke("set_notch_hit", {
-          width: size.width,
-          height: size.height,
-          // The arrival is still a bar to click open, not a panel: only the
-          // expanded panel wants the window itself interactive.
-          clickThrough: state !== "expanded",
-        });
-      } catch (err) {
-        console.error("set_notch_hit failed:", err);
-      }
-    },
-    [],
-  );
+  const setHitArea = useCallback(async (state: Bar) => {
+    const size = BAR_SIZES[state];
+    try {
+      await invoke("set_notch_hit", {
+        width: size.width,
+        height: size.height,
+        // The tall bar is still a bar to click open, not a panel: only the
+        // expanded panel wants the window itself interactive.
+        clickThrough: state !== "panel",
+      });
+    } catch (err) {
+      console.error("set_notch_hit failed:", err);
+    }
+  }, []);
 
   const openPanel = useCallback(async () => {
     wanted.current = true;
     // Stop passing clicks through before the notch starts growing, otherwise
     // the panel would be click-through while it animates in.
-    await setHitArea("expanded");
+    await setHitArea("panel");
     if (!wanted.current) return; // reversed while the call was in flight
     setOpen(true);
   }, [setHitArea]);
@@ -404,21 +852,21 @@ export default function App() {
     // Only once the closing spring has come to rest is the notch small enough
     // to hand the mouse back to the desktop; doing it earlier would make the
     // shrinking panel click-through mid-flight. Which silhouette just settled
-    // depends on what is on the bar: the charger's is wider than the clock's.
-    if (!wanted.current) void setHitArea(charging ? "charging" : "collapsed");
-  }, [setHitArea, charging]);
+    // depends on what is on the bar: a tall one is wider than the clock's.
+    if (!wanted.current) void setHitArea(bar);
+  }, [setHitArea, bar]);
 
   // Re-assert the collapsed state as soon as the webview is alive.
   useEffect(() => {
-    void setHitArea("collapsed");
+    void setHitArea("bar");
   }, [setHitArea]);
 
-  // Native has to guard the charger's own rect *before* the bar starts growing,
-  // or the hook would still be watching the smaller one while the bar is already
+  // Native has to guard the tall bar's own rect *before* it starts growing, or
+  // the hook would still be watching the smaller one while the bar is already
   // wider than it and clicks near its corners would fall through.
   useEffect(() => {
-    if (charging) void setHitArea("charging");
-  }, [charging, setHitArea]);
+    if (tall) void setHitArea("tall");
+  }, [tall, setHitArea]);
 
   /**
    * Idle clock. Every tick re-reads the system time instead of counting up, so
@@ -467,16 +915,18 @@ export default function App() {
     };
   }, []);
 
-  // Charger, network, Bluetooth and USB, detected natively.
+  // Charger, networks, Bluetooth and USB, detected natively.
   useEffect(() => {
     let stop: (() => void) | undefined;
     let disposed = false;
-    void listen<ActivityEvent>("notch-activity", (event) =>
-      setActivities((queue) => {
-        if (queue.length >= ACTIVITY_QUEUE_MAX) return queue;
-        return [...queue, { ...event.payload, id: nextActivityId.current++ }];
-      }),
-    ).then((unlisten) => {
+    void listen<WireEvent>("notch-activity", (event) => {
+      const id = nextActivityId.current++;
+      setActivities((queue) =>
+        queue.length >= ACTIVITY_QUEUE_MAX
+          ? queue
+          : enqueue(queue, event.payload, openRef.current, id),
+      );
+    }).then((unlisten) => {
       if (disposed) unlisten();
       else stop = unlisten;
     });
@@ -486,28 +936,95 @@ export default function App() {
     };
   }, []);
 
+  /** Drops the activity at the head of the queue. */
+  const popActivity = useCallback(() => {
+    setActivities((queue) => queue.slice(1));
+  }, []);
+
   /**
-   * One activity at a time, then the next. The timer only runs while the
-   * activity is actually on screen: opening the panel pauses it, so an indicator
-   * cannot burn its time behind an open panel, and closing the panel gives the
-   * one still showing a fresh turn.
+   * The same, for the indicators that took the tall bar: the bar is left to
+   * shrink back to the clock's size on its own before the next activity takes
+   * its place, so nothing appears inside a bar that is still collapsing.
+   */
+  const popTall = useCallback(() => {
+    popActivity();
+    setSettling(true);
+    window.setTimeout(() => setSettling(false), SETTLE_MS);
+  }, [popActivity]);
+
+  /** Moves the indicator on the bar from one of its phases to the next. */
+  const advanceNetwork = useCallback((phase: NetPhase, up: boolean) => {
+    setActivities((queue) =>
+      queue.map((item, index) =>
+        index === 0 && item.net !== undefined
+          ? { ...item, net: { phase, up } }
+          : item,
+      ),
+    );
+  }, []);
+
+  /**
+   * When the network's intro phase went on screen. Its minimum is measured from
+   * there, and closing the panel starts it over, the same way the charger's dwell
+   * does.
+   */
+  const introAt = useRef(0);
+  useEffect(() => {
+    introAt.current = performance.now();
+  }, [activity?.id, activity?.net?.phase, open]);
+
+  /**
+   * One activity at a time, then the next. The timers only run while the activity
+   * is actually on screen: opening the panel pauses them, so an indicator cannot
+   * burn its time behind an open panel, and closing the panel gives the one still
+   * showing a fresh turn.
    *
-   * Two things are specific to the charger: it gets longer on the bar, counted
-   * from the moment its animation starts, and once it is over the bar is left to
-   * shrink back to the clock's size on its own before the next indicator takes
-   * its place - so nothing appears inside a bar that is still collapsing.
+   * The charger gets longer than the rest because it has an animation to play,
+   * and once it is over the bar is left to shrink back on its own.
+   *
+   * The networks are not a plain dwell. Their intro phase is a minimum rather
+   * than a length: the indicator stays on the bar until the network answers, and
+   * only then - once the minimum has had its time - moves to the link. A machine
+   * that never answers at all is what the give-up guard is for.
    */
   useEffect(() => {
     if (activity === undefined || open || settling) return;
-    const dwell = charging ? POWER_MS : ACTIVITY_MS;
-    const timer = window.setTimeout(() => {
-      setActivities((queue) => queue.slice(1));
-      if (!charging) return;
-      setSettling(true);
-      window.setTimeout(() => setSettling(false), CHARGING_SETTLE_MS);
-    }, dwell);
+
+    const net = networkOf(activity);
+    if (net === undefined) {
+      const timer = window.setTimeout(
+        charging ? popTall : popActivity,
+        charging ? POWER_MS : ACTIVITY_MS,
+      );
+      return () => window.clearTimeout(timer);
+    }
+
+    if (net.phase === "connecting") {
+      if (!net.up) {
+        const timer = window.setTimeout(
+          () => advanceNetwork("failed", false),
+          NET_GIVE_UP_MS,
+        );
+        return () => window.clearTimeout(timer);
+      }
+      // The link is up: wait out whatever is left of the intro's minimum.
+      const left = Math.max(
+        0,
+        introAt.current + NET_INTRO_MS[net.kind] - performance.now(),
+      );
+      const timer = window.setTimeout(
+        () => advanceNetwork("connected", true),
+        left,
+      );
+      return () => window.clearTimeout(timer);
+    }
+
+    const timer = window.setTimeout(
+      popTall,
+      net.phase === "connected" ? NET_LINK_MS : NET_NOTICE_MS,
+    );
     return () => window.clearTimeout(timer);
-  }, [activity, open, settling, charging]);
+  }, [activity, open, settling, charging, popActivity, popTall, advanceNetwork]);
 
   // Hiding never changes the click-through state - autohide only ever applies
   // while the notch is collapsed, and collapsed is already click-through. What
@@ -567,9 +1084,11 @@ export default function App() {
 
   return (
     <div className="h-full w-full select-none bg-transparent">
-      {/* The charger's glow is cast from a layer of its own: the shell clips
+      {/* The tall indicators cast a glow from a layer of its own: the shell clips
           itself - which is what keeps the ears tidy and slides the bar out of
-          sight on autohide - and a clip-path would cut the shadow off with it. */}
+          sight on autohide - and a clip-path would cut the shadow off with it.
+          The charger glows green from the moment it arrives; the network glows
+          blue, but only once it is actually up. */}
       <motion.div
         aria-hidden="true"
         initial={false}
@@ -578,12 +1097,13 @@ export default function App() {
           height: silhouette.height,
           borderBottomLeftRadius: silhouette.radius,
           borderBottomRightRadius: silhouette.radius,
-          opacity: charging ? 1 : 0,
+          opacity: charging || network?.phase === "connected" ? 1 : 0,
         }}
         transition={{
           ...sizeTransition,
           opacity: { duration: 0.2 },
         }}
+        data-tone={network ? "network" : "power"}
         className="notch-glow pointer-events-none absolute top-0 left-1/2 -translate-x-1/2"
       />
       <motion.div
@@ -657,8 +1177,9 @@ export default function App() {
                   className="notch-activity flex min-w-0 items-center gap-1"
                 >
                   {(() => {
-                    const look = ACTIVITY[rowActivity.kind];
-                    const power = rowActivity.kind.startsWith("power-");
+                    if (!isRow(rowActivity.kind)) return null;
+                    const look = ROW[rowActivity.kind];
+                    const power = rowActivity.kind === "power-disconnected";
                     return (
                       <>
                         {power ? (
@@ -678,7 +1199,7 @@ export default function App() {
                     );
                   })()}
                 </motion.div>
-              ) : charging || settling ? null : (
+              ) : tall || settling ? null : (
                 <motion.div
                   key="clock"
                   initial={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
@@ -700,11 +1221,33 @@ export default function App() {
                 key={activity.id}
                 initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
                 animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
-                exit={{ opacity: 0, filter: "blur(6px)", transition: chargerExit }}
-                transition={chargerEnter}
+                exit={{ opacity: 0, filter: "blur(6px)", transition: arrivalExit }}
+                transition={arrivalEnter}
                 className="notch-charging"
               >
                 <ChargingContent detail={activity.detail} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+          {/* A network takes the same bar. One activity covers both its phases,
+              so the layer stays mounted from the attempt to the link and only
+              what it holds changes - see `NetworkContent`. */}
+          <AnimatePresence>
+            {network && activity !== undefined && (
+              <motion.div
+                key={activity.id}
+                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
+                animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                exit={{ opacity: 0, filter: "blur(6px)", transition: arrivalExit }}
+                transition={arrivalEnter}
+                data-phase={network.phase}
+                className="notch-network"
+              >
+                <NetworkContent
+                  kind={network.kind}
+                  phase={network.phase}
+                  detail={network.detail}
+                />
               </motion.div>
             )}
           </AnimatePresence>

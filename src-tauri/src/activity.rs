@@ -4,13 +4,17 @@
 //! Four watchers run on their own threads and each polls one Windows API. The
 //! period is set by how quickly that change is worth showing, not by what the
 //! call costs - all four together measure well under a millisecond per second
-//! of runtime - so the charger is checked every second, the networks and the USB
-//! tree every two, and Bluetooth every four.
+//! of runtime - so the charger and the networks are checked every second, the
+//! USB tree every one and a half, and Bluetooth every four.
+//!
+//! The networks are the reason one second is not generous: associating to a
+//! wireless network is often over inside two seconds, and the indicator has a
+//! phase to show while the attempt is still in flight.
 //!
 //! The watchers only *notice* and emit. Everything the user sees - the queue,
-//! the three-second dwell, the cross-fade with the clock - lives in the webview,
-//! which is also the only side that knows whether the panel happens to be open
-//! and the indicator therefore has to wait.
+//! the dwell, the cross-fade with the clock, the phase a network indicator is
+//! in - lives in the webview, which is also the only side that knows whether
+//! the panel happens to be open and the indicator therefore has to wait.
 //!
 //! Two rules are baked into every watcher:
 //!
@@ -18,8 +22,10 @@
 //!   the charger in, a network up and three USB devices attached must not queue
 //!   half a dozen indicators the moment the app starts.
 //! * Nothing is emitted for a state that merely *ends*, except where the user
-//!   asked for it (the charger and USB). Wi-Fi, Ethernet and Bluetooth only
-//!   report coming up.
+//!   asked for it: the charger and USB report both directions, and so do the
+//!   networks - an attempt that gives up is worth a notice, but only if the
+//!   notch was already showing that network, which is the webview's call.
+//!   Bluetooth only ever reports coming up.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -37,23 +43,24 @@ use windows::Win32::Devices::Properties::{
     DEVPROP_TYPE_STRING, DEVPROPKEY, DEVPROPTYPE,
 };
 use windows::Win32::Foundation::{HANDLE, HWND};
-use windows::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
-};
-use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+use windows::Win32::NetworkManagement::Ndis::{IfOperStatusUp, MediaConnectStateConnected};
 use windows::Win32::NetworkManagement::WiFi::{
     WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST, WlanCloseHandle, WlanEnumInterfaces,
-    WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, wlan_interface_state_connected,
-    wlan_intf_opcode_current_connection,
+    WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, wlan_interface_state_associating,
+    wlan_interface_state_authenticating, wlan_interface_state_connected,
+    wlan_interface_state_discovering, wlan_intf_opcode_current_connection,
 };
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
-use windows::core::PCWSTR;
+use windows::core::{GUID, PCWSTR};
 
 /// Event the webview listens on. The payload is `{ kind, detail }`.
 pub const ACTIVITY_EVENT: &str = "notch-activity";
 
 const POWER_PERIOD: Duration = Duration::from_millis(1000);
-const NETWORK_PERIOD: Duration = Duration::from_millis(2000);
+/// Short on purpose: an association can be over inside two seconds, and the
+/// indicator shows a phase of its own while one is in flight.
+const NETWORK_PERIOD: Duration = Duration::from_millis(1000);
 const USB_PERIOD: Duration = Duration::from_millis(1500);
 const BLUETOOTH_PERIOD: Duration = Duration::from_millis(4000);
 
@@ -184,42 +191,134 @@ fn power_status() -> Option<PowerStatus> {
 // Network
 // ---------------------------------------------------------------------------
 
+/// What the WLAN service says, collapsed into the three states an indicator can
+/// show. An attempt is a state of its own because a connection that is still in
+/// flight is what the indicator's first phase is about.
+#[derive(Clone, PartialEq, Eq)]
+enum Wifi {
+    /// The service answered and no interface is associated.
+    Idle,
+    /// An attempt is in flight: associating, discovering or authenticating.
+    Connecting,
+    /// Associated, on this SSID.
+    Connected(String),
+}
+
+/// The cable, as the interface table reports it.
+///
+/// `Detected` is the media state on its own - something is plugged in at the far
+/// end - which arrives a moment before Windows brings the interface up on it.
+/// That gap is real, if short, and it is what the "cable detected" phase shows;
+/// a driver that goes straight to up simply never reports it.
+#[derive(Clone, PartialEq, Eq)]
+enum Ethernet {
+    Gone,
+    Detected,
+    /// Up, at this link speed in bits per second.
+    Up(u64),
+}
+
 fn watch_network(app: AppHandle) {
-    let mut wifi = Tracker::new();
-    let mut ethernet = Tracker::new();
+    // The first answer of each kind only seeds the baseline, the rule every
+    // watcher here follows: a machine that is already on Wi-Fi when the app
+    // starts has nothing to announce. An unauthorised-for question leaves the
+    // baseline alone rather than resetting it.
+    let mut wifi: Option<Wifi> = None;
+    let mut ethernet: Option<Ethernet> = None;
 
     loop {
-        match wifi_ssid() {
-            Ok(Some(ssid)) => {
-                if wifi.changed(Some(ssid.clone())) {
-                    emit(&app, "wifi-connected", ssid);
-                }
+        if let Ok(now) = wifi_state() {
+            if let Some(was) = wifi.take()
+                && let Some((kind, detail)) = wifi_event(&was, &now)
+            {
+                emit(&app, kind, detail);
             }
-            // The service answered and nothing is associated.
-            Ok(None) => {
-                wifi.changed(None);
-            }
-            // No wireless service or no adapter: not a state change, just an
-            // unanswerable question. Leave the baseline alone.
-            Err(()) => {}
+            wifi = Some(now);
         }
 
-        if let Ok(up) = ethernet_up()
-            && ethernet.changed(up)
-            && up
-        {
-            emit(&app, "ethernet-connected", "");
+        if let Ok(now) = ethernet_state() {
+            if let Some(was) = ethernet.take()
+                && let Some((kind, detail)) = ethernet_event(&was, &now)
+            {
+                emit(&app, kind, detail);
+            }
+            ethernet = Some(now);
         }
 
         std::thread::sleep(NETWORK_PERIOD);
     }
 }
 
-/// The SSID of the connected WLAN interface.
+/// What a Wi-Fi change is worth announcing, if anything.
 ///
-/// `Ok(None)` means the WLAN service answered and no interface is associated;
-/// `Err` means the question could not be asked at all.
-fn wifi_ssid() -> Result<Option<String>, ()> {
+/// Both ends of an attempt are reported - it started, and it gave up - because a
+/// connection the user just asked for is worth watching; the webview drops the
+/// ending if the notch was not already showing that network.
+fn wifi_event(was: &Wifi, now: &Wifi) -> Option<(&'static str, String)> {
+    // The poll runs every second and usually finds nothing new. Reporting the
+    // same state again would restart the indicator's own clock every second.
+    if was == now {
+        return None;
+    }
+
+    match now {
+        Wifi::Connecting => Some(("wifi-connecting", String::new())),
+        // Any arrival counts, including moving to a different network.
+        Wifi::Connected(ssid) => Some(("wifi-connected", ssid.clone())),
+        // What is left is a connection that just ended, whether it had got
+        // anywhere or not.
+        Wifi::Idle => Some(("wifi-lost", String::new())),
+    }
+}
+
+/// The same for the cable. There is no "connecting" here: a wired interface
+/// either has the link or it does not, and the speed comes with it.
+fn ethernet_event(was: &Ethernet, now: &Ethernet) -> Option<(&'static str, String)> {
+    if was == now {
+        return None;
+    }
+
+    match (was, now) {
+        (_, Ethernet::Up(speed)) => Some(("ethernet-connected", link_speed(*speed))),
+        (Ethernet::Gone, Ethernet::Detected) => Some(("ethernet-detected", String::new())),
+        // What is left is a link that is no longer up: the cable was pulled, or
+        // Windows took the interface down while it stayed in. Both read the same
+        // from here, and neither should be announced as a fresh cable.
+        _ => Some(("ethernet-lost", String::new())),
+    }
+}
+
+/// The link's own rate, in the units a person reads: bits per second in,
+/// "1 Gbps" out.
+///
+/// This is the rate of the port, and not of whatever the network behind it is
+/// doing: a gigabit port on a slow line still reads 1 Gbps, which is what the
+/// label on the port means everywhere else. Windows reports zero, and on a few
+/// drivers a full 32-bit mask, when it does not know.
+fn link_speed(bits: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [
+        (1_000_000_000, "Gbps"),
+        (1_000_000, "Mbps"),
+        (1_000, "Kbps"),
+    ];
+
+    if bits == 0 || bits == u32::MAX as u64 {
+        return String::new();
+    }
+
+    let Some((scale, unit)) = UNITS.iter().find(|(scale, _)| bits >= *scale) else {
+        return String::new();
+    };
+
+    // Two decimals is plenty for a link rate, and it keeps 2.5 Gbps from
+    // arriving as 2.499999 or 2.5000000001.
+    let value = (bits as f64 / *scale as f64 * 100.0).round() / 100.0;
+    format!("{value} {unit}")
+}
+
+/// The state of the wireless interfaces, or `Err` when the question cannot be
+/// asked at all (no wireless service, no adapter).
+fn wifi_state() -> Result<Wifi, ()> {
     unsafe {
         let mut negotiated = 0u32;
         let mut handle = HANDLE::default();
@@ -228,19 +327,23 @@ fn wifi_ssid() -> Result<Option<String>, ()> {
         if WlanOpenHandle(2, None, &mut negotiated, &mut handle) != 0 {
             return Err(());
         }
-        let result = read_wifi_ssid(handle);
+        let result = read_wifi_state(handle);
         let _ = WlanCloseHandle(handle, None);
         result
     }
 }
 
-unsafe fn read_wifi_ssid(handle: HANDLE) -> Result<Option<String>, ()> {
+/// Walks the WLAN interfaces and reports the most useful thing they say.
+///
+/// One wireless card is the usual case and answers for itself; with several, a
+/// connected one wins, then one that is on its way in, and nothing making an
+/// attempt means idle.
+unsafe fn read_wifi_state(handle: HANDLE) -> Result<Wifi, ()> {
     let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
     if unsafe { WlanEnumInterfaces(handle, None, &mut list) } != 0 || list.is_null() {
         return Err(());
     }
 
-    let mut ssid = None;
     let interfaces = unsafe {
         std::slice::from_raw_parts(
             (*list).InterfaceInfo.as_ptr(),
@@ -248,47 +351,66 @@ unsafe fn read_wifi_ssid(handle: HANDLE) -> Result<Option<String>, ()> {
         )
     };
 
+    let mut state = Wifi::Idle;
     for interface in interfaces {
-        if interface.isState != wlan_interface_state_connected {
-            continue;
+        let now = interface.isState;
+        if now == wlan_interface_state_connected {
+            let ssid = unsafe { wifi_ssid(handle, &interface.InterfaceGuid) }.unwrap_or_default();
+            state = Wifi::Connected(ssid);
+            break;
         }
-
-        let mut size = 0u32;
-        let mut data: *mut c_void = std::ptr::null_mut();
-        let queried = unsafe {
-            WlanQueryInterface(
-                handle,
-                &interface.InterfaceGuid,
-                wlan_intf_opcode_current_connection,
-                None,
-                &mut size,
-                &mut data,
-                None,
-            )
-        };
-        if queried != 0 || data.is_null() {
-            continue;
+        // Associating, discovering and authenticating are the three shapes an
+        // attempt wears while it is in flight. Not ready, disconnecting,
+        // disconnected and ad-hoc are none of them a connection on its way in,
+        // so they leave the answer alone.
+        if now == wlan_interface_state_associating
+            || now == wlan_interface_state_discovering
+            || now == wlan_interface_state_authenticating
+        {
+            state = Wifi::Connecting;
         }
-
-        let attributes = unsafe { &*(data as *const WLAN_CONNECTION_ATTRIBUTES) };
-        let dot11 = &attributes.wlanAssociationAttributes.dot11Ssid;
-        let length = (dot11.uSSIDLength as usize).min(dot11.ucSSID.len());
-        ssid = Some(String::from_utf8_lossy(&dot11.ucSSID[..length]).into_owned());
-        unsafe { WlanFreeMemory(data as *const c_void) };
-        break;
     }
 
     unsafe { WlanFreeMemory(list as *const c_void) };
-    Ok(ssid)
+    Ok(state)
 }
 
-/// Whether a *physical* Ethernet link is up.
+/// The SSID an associated interface is on, if Windows will say.
+unsafe fn wifi_ssid(handle: HANDLE, guid: &GUID) -> Option<String> {
+    let mut size = 0u32;
+    let mut data: *mut c_void = std::ptr::null_mut();
+    let queried = unsafe {
+        WlanQueryInterface(
+            handle,
+            guid,
+            wlan_intf_opcode_current_connection,
+            None,
+            &mut size,
+            &mut data,
+            None,
+        )
+    };
+    if queried != 0 || data.is_null() {
+        return None;
+    }
+
+    let attributes = unsafe { &*(data as *const WLAN_CONNECTION_ATTRIBUTES) };
+    let dot11 = &attributes.wlanAssociationAttributes.dot11Ssid;
+    let length = (dot11.uSSIDLength as usize).min(dot11.ucSSID.len());
+    let ssid = String::from_utf8_lossy(&dot11.ucSSID[..length]).into_owned();
+    unsafe { WlanFreeMemory(data as *const c_void) };
+    Some(ssid)
+}
+
+/// Whether a cable is in and what the port negotiated, over the *physical*
+/// interfaces only.
 ///
-/// `GetIfTable2` reports the interface type, the operational status and - the
-/// part that matters here - whether the interface is backed by real hardware.
-/// Without that last check a VPN's virtual adapter and the host-only NICs that
-/// VirtualBox and Hyper-V leave installed would all count as "a cable".
-fn ethernet_up() -> Result<bool, ()> {
+/// `GetIfTable2` reports the interface type, the media state, the operational
+/// status and - the part that matters here - whether the interface is backed by
+/// real hardware. Without that last check a VPN's virtual adapter and the
+/// host-only NICs that VirtualBox and Hyper-V leave installed would all count as
+/// "a cable".
+fn ethernet_state() -> Result<Ethernet, ()> {
     // IANA ifType 6, "ethernetCsmacd". Spelled out because the windows crate
     // does not name these in the Ndis module.
     const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
@@ -303,14 +425,34 @@ fn ethernet_up() -> Result<bool, ()> {
 
         let rows =
             std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
-        let up = rows.iter().any(|row: &MIB_IF_ROW2| {
-            row.Type == IF_TYPE_ETHERNET_CSMACD
-                && row.OperStatus == IfOperStatusUp
-                && row.InterfaceAndOperStatusFlags._bitfield & HARDWARE_INTERFACE != 0
-        });
+        let mut state = Ethernet::Gone;
+
+        for row in rows {
+            if row.Type != IF_TYPE_ETHERNET_CSMACD
+                || row.InterfaceAndOperStatusFlags._bitfield & HARDWARE_INTERFACE == 0
+            {
+                continue;
+            }
+
+            // The media state is the cable itself. It comes up before Windows has
+            // finished bringing the interface up on it, and the interface being
+            // down while the cable is in is what "detected" names.
+            if row.MediaConnectState != MediaConnectStateConnected {
+                continue;
+            }
+
+            if row.OperStatus == IfOperStatusUp {
+                // More than one cable up - a dock and the machine's own port -
+                // reports whichever Windows lists first.
+                state = Ethernet::Up(row.TransmitLinkSpeed);
+                break;
+            }
+
+            state = Ethernet::Detected;
+        }
 
         FreeMibTable(table as *const c_void);
-        Ok(up)
+        Ok(state)
     }
 }
 
@@ -631,5 +773,108 @@ mod tests {
         );
         assert_eq!(best_name([""].into_iter()), "");
         assert_eq!(best_name(std::iter::empty()), "");
+    }
+
+    #[test]
+    fn wifi_reports_both_ends_of_an_attempt() {
+        let event = |was, now| wifi_event(&was, &now).map(|(kind, _)| kind);
+
+        assert_eq!(event(Wifi::Idle, Wifi::Connecting), Some("wifi-connecting"));
+        assert_eq!(
+            event(Wifi::Connecting, Wifi::Connected("Home".into())),
+            Some("wifi-connected")
+        );
+        // Windows often goes idle to connected without stopping at connecting;
+        // the indicator still has an arrival to play, and says so itself.
+        assert_eq!(
+            event(Wifi::Idle, Wifi::Connected("Home".into())),
+            Some("wifi-connected")
+        );
+        // Both the attempt that gave up and the link that dropped end the same
+        // way here; which of the two it was is the webview's story to tell.
+        assert_eq!(event(Wifi::Connecting, Wifi::Idle), Some("wifi-lost"));
+        assert_eq!(
+            event(Wifi::Connected("Home".into()), Wifi::Idle),
+            Some("wifi-lost")
+        );
+        assert_eq!(
+            event(
+                Wifi::Connected("Home".into()),
+                Wifi::Connected("Cafe".into())
+            ),
+            Some("wifi-connected")
+        );
+        // The same state twice is what most polls find, and it says nothing:
+        // repeating it would restart the indicator's own clock every second.
+        assert_eq!(
+            event(
+                Wifi::Connected("Home".into()),
+                Wifi::Connected("Home".into())
+            ),
+            None
+        );
+        assert_eq!(event(Wifi::Idle, Wifi::Idle), None);
+        assert_eq!(event(Wifi::Connecting, Wifi::Connecting), None);
+    }
+
+    #[test]
+    fn ethernet_reports_the_cable_and_then_the_link() {
+        let event = |was, now| ethernet_event(&was, &now).map(|(kind, _)| kind);
+
+        assert_eq!(
+            event(Ethernet::Gone, Ethernet::Detected),
+            Some("ethernet-detected")
+        );
+        assert_eq!(
+            event(Ethernet::Detected, Ethernet::Up(1_000_000_000)),
+            Some("ethernet-connected")
+        );
+        // A driver that brings the interface up in the same breath skips the
+        // detected phase, and there is nothing to report in between.
+        assert_eq!(
+            event(Ethernet::Gone, Ethernet::Up(1_000_000_000)),
+            Some("ethernet-connected")
+        );
+        assert_eq!(
+            event(Ethernet::Up(1_000_000_000), Ethernet::Gone),
+            Some("ethernet-lost")
+        );
+        assert_eq!(
+            event(Ethernet::Detected, Ethernet::Gone),
+            Some("ethernet-lost")
+        );
+        assert_eq!(
+            event(Ethernet::Up(1_000_000_000), Ethernet::Detected),
+            Some("ethernet-lost")
+        );
+        assert_eq!(event(Ethernet::Gone, Ethernet::Gone), None);
+        assert_eq!(event(Ethernet::Detected, Ethernet::Detected), None);
+        assert_eq!(
+            event(Ethernet::Up(1_000_000_000), Ethernet::Up(1_000_000_000)),
+            None
+        );
+    }
+
+    #[test]
+    fn ethernet_carries_the_link_speed() {
+        assert_eq!(
+            ethernet_event(&Ethernet::Detected, &Ethernet::Up(100_000_000))
+                .unwrap()
+                .1,
+            "100 Mbps"
+        );
+    }
+
+    #[test]
+    fn link_speed_reads_in_the_units_a_person_knows() {
+        assert_eq!(link_speed(1_000_000_000), "1 Gbps");
+        assert_eq!(link_speed(2_500_000_000), "2.5 Gbps");
+        assert_eq!(link_speed(10_000_000_000), "10 Gbps");
+        assert_eq!(link_speed(100_000_000), "100 Mbps");
+        assert_eq!(link_speed(10_000_000), "10 Mbps");
+        // Windows says zero, or a full mask, when it does not know: better to
+        // leave the label off than to invent a number.
+        assert_eq!(link_speed(0), "");
+        assert_eq!(link_speed(u32::MAX as u64), "");
     }
 }

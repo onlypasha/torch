@@ -132,9 +132,12 @@ body,
 
 /* The glow needs a layer of its own: the shell clips itself (that is what keeps
    the ears tidy and slides the bar out of sight on autohide), and a clip-path
-   would cut the shadow off along with everything else. */
+   would cut the shadow off along with everything else. The transition is for the
+   colour: when one tall indicator hands over to the other, the glow changes from
+   green to blue without a flicker. */
 .notch-glow {
   box-shadow: 0 8px 28px rgb(52 211 153 / 0.35);
+  transition: box-shadow 250ms ease-out;
 }
 
 .notch-charging {
@@ -233,4 +236,154 @@ body,
   to {
     transform: translateX(250%);
   }
+}
+
+/* ---------------------------------------------------------------------------
+   A network coming up.
+
+   Wi-Fi and the cable borrow the charger's bar and its timings, but they have
+   two phases to show rather than one. While the attempt is in flight the icon is
+   working and a segment travels the strip along the bottom; once the link is up
+   the icon lands, the glow appears and the strip fades out.
+   --------------------------------------------------------------------------- */
+
+/* Blue under the bar instead of the charger's green, and only once the link is
+   actually up - the attempt phase has nothing to glow about. */
+.notch-glow[data-tone="network"] {
+  box-shadow: 0 8px 28px rgb(96 165 250 / 0.35);
+}
+
+.notch-network {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Leave the strip its three pixels. */
+  padding-bottom: 3px;
+}
+
+.notch-network-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Wide enough for the arcs and the signal bars side by side, and for the plug to
+   sit to the left of the port. The space is held in both phases, so the caption
+   does not shift when the second half of the glyph arrives. */
+.notch-network-icon {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 52px;
+  height: 24px;
+  /* The glyph follows the phase over a beat rather than jumping. */
+  transition: opacity 200ms ease-out;
+}
+
+/* A notice - a link that failed or was cut - is not a link: the glyph goes quiet
+   rather than staying as bright as a live one. */
+.notch-network-icon[data-quiet] {
+  opacity: 0.5;
+}
+
+.notch-network-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.notch-network-arcs {
+  display: block;
+  width: 20px;
+  height: 20px;
+}
+
+.notch-network-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 14px;
+}
+
+.notch-network-bar {
+  width: 4px;
+  border-radius: 1px;
+  background: #60a5fa;
+  /* A bar grows out of the baseline rather than out of the middle. */
+  transform-origin: bottom;
+}
+
+/* The cable: a plug at the port's mouth, and the port itself. The plug starts
+   one gap to the left and slides until the two are flush. */
+.notch-network-plug {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  z-index: 1;
+  width: 12px;
+  height: 11px;
+  margin-top: -5.5px;
+  border-radius: 2px;
+  background: #60a5fa;
+}
+
+.notch-network-port {
+  position: absolute;
+  left: 23px;
+  top: 50%;
+  width: 18px;
+  height: 13px;
+  margin-top: -6.5px;
+  border: 1.5px solid #60a5fa;
+  border-radius: 2px;
+}
+
+/* The click: a ring the size of the port that expands out of it once the cable
+   lands, then fades. */
+.notch-network-click {
+  position: absolute;
+  inset: -2px;
+  border: 1.5px solid #60a5fa;
+  border-radius: 3px;
+}
+
+.notch-network-title {
+  display: inline-flex;
+  align-items: baseline;
+  font-size: 14px;
+  color: #ffffff;
+  white-space: nowrap;
+}
+
+.notch-network-caption {
+  display: inline-block;
+}
+
+/* The negotiated link speed, in the charger's level blue-on-white arrangement. */
+.notch-network-level {
+  color: #60a5fa;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The indeterminate strip: a bright third of the bar travelling its length. */
+.notch-network-track {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+  overflow: hidden;
+  background: rgb(96 165 250 / 0.18);
+}
+
+.notch-network-runner {
+  width: 35%;
+  height: 100%;
+  background: #60a5fa;
 }
