@@ -14,11 +14,6 @@ import { listen } from "@tauri-apps/api/event";
 const COLLAPSED = { width: 180, height: 32 };
 const EXPANDED = { width: 400, height: 180 };
 
-/** Must match the bottom corner radius used by the notch class below. */
-const CORNER = 22;
-/** Extra hit area under the notch so the drop shadow keeps its room. */
-const SHADOW_MARGIN = 20;
-
 const MORPH = { duration: 0.42, ease: [0.22, 1, 0.36, 1] as const };
 
 export default function App() {
@@ -31,21 +26,19 @@ export default function App() {
   /**
    * The native window always keeps the expanded size, so it never has to be
    * resized mid-animation (a resize makes WebView2 re-create its surface and the
-   * notch blinks). Instead the *hit region* shrinks to the notch silhouette
-   * while collapsed, which is also what makes the surrounding area click-through.
+   * notch blinks). Collapsed therefore means "click-through": while the notch is
+   * small the whole window ignores the mouse, and a low-level hook is what
+   * notices - and swallows - a click on the notch itself.
    */
-  const setHitRegion = useCallback(
+  const setHitArea = useCallback(
     async (which: "notch" | "full") => {
-      const size = which === "notch" ? COLLAPSED : { width: 0, height: 0 };
       try {
-        await invoke("set_hit_region", {
-          width: size.width,
-          height: size.height,
-          radius: which === "notch" ? CORNER : 0,
-          margin: which === "notch" ? SHADOW_MARGIN : 0,
+        await invoke("set_notch_hit", {
+          width: which === "notch" ? COLLAPSED.width : 0,
+          height: which === "notch" ? COLLAPSED.height : 0,
         });
       } catch (err) {
-        console.error("set_hit_region failed:", err);
+        console.error("set_notch_hit failed:", err);
       }
     },
     [],
@@ -53,12 +46,12 @@ export default function App() {
 
   const openPanel = useCallback(async () => {
     wanted.current = true;
-    // Unclip before the notch starts growing, otherwise the region would crop
-    // the expanding panel.
-    await setHitRegion("full");
+    // Stop passing clicks through before the notch starts growing, otherwise
+    // the panel would be click-through while it animates in.
+    await setHitArea("full");
     if (!wanted.current) return; // reversed while the call was in flight
     setOpen(true);
-  }, [setHitRegion]);
+  }, [setHitArea]);
 
   const closePanel = useCallback(() => {
     wanted.current = false;
@@ -72,14 +65,15 @@ export default function App() {
 
   const handleSettled = useCallback(() => {
     // Only once the closing animation is done is the notch small enough to
-    // shrink the hit region; doing it earlier would crop the animation.
-    if (!wanted.current) void setHitRegion("notch");
-  }, [setHitRegion]);
+    // shrink the hit area; doing it earlier would make the shrinking panel
+    // click-through mid-flight.
+    if (!wanted.current) void setHitArea("notch");
+  }, [setHitArea]);
 
   // Re-assert the collapsed hit area as soon as the webview is alive.
   useEffect(() => {
-    void setHitRegion("notch");
-  }, [setHitRegion]);
+    void setHitArea("notch");
+  }, [setHitArea]);
 
   // Outside clicks come from the native low-level mouse hook.
   useEffect(() => {
@@ -94,6 +88,21 @@ export default function App() {
       stop?.();
     };
   }, [closePanel]);
+
+  // While collapsed the window is click-through, so a click on the notch never
+  // reaches the DOM: the hook recognises it and tells us instead.
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let disposed = false;
+    void listen("notch-press", () => void openPanel()).then((unlisten) => {
+      if (disposed) unlisten();
+      else stop = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, [openPanel]);
 
   // Keep the native click-outside hook aware of whether the panel is open.
   useEffect(() => {
@@ -125,7 +134,7 @@ export default function App() {
           event.preventDefault();
           toggle();
         }}
-        className="absolute top-0 left-1/2 -translate-x-1/2 rounded-b-[22px] bg-[#1c1c1c] shadow-[0_8px_24px_rgba(0,0,0,0.45)] outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+        className="absolute top-0 left-1/2 -translate-x-1/2 rounded-b-[22px] bg-[#1c1c1c] outline-none focus-visible:ring-1 focus-visible:ring-white/40"
       />
     </div>
   );
