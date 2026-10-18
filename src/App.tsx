@@ -20,6 +20,20 @@ const CHARGING = { width: 300, height: 52, radius: 24, ear: 14 };
 const EXPANDED = { width: 420, height: 160, radius: 28, ear: 14 };
 
 /**
+ * The three shapes the bar can be in. Named separately from their sizes because
+ * the *move* between them is what picks the spring, not just the destination:
+ * growing into the panel or into the charger's bar springs open, everything else
+ * - the charger's return, the panel's close, autohide sliding the bar away -
+ * springs shut.
+ */
+type Bar = "bar" | "charging" | "panel";
+const BAR_SIZES: Record<Bar, typeof COLLAPSED> = {
+  bar: COLLAPSED,
+  charging: CHARGING,
+  panel: EXPANDED,
+};
+
+/**
  * Spring Expand / Spring Collapse from the spec.
  *
  * Spring Expand (stiffness 380, damping 26, mass 0.9) is underdamped - damping
@@ -301,6 +315,10 @@ export default function App() {
   // notch again, so it can still be clicked open.
   const hidden = autohide && !showingActivity;
 
+  // Which shape the bar is in, and which it was in a moment ago.
+  const bar: Bar = open ? "panel" : charging ? "charging" : "bar";
+  const previousBar = useRef<Bar>("bar");
+
   /**
    * The native window keeps one size for its whole life - a resize makes
    * WebView2 re-create its surface and the notch blinks - so it is larger than
@@ -313,22 +331,29 @@ export default function App() {
    * what the hook uses to tell "inside the notch" from "clicked away". A hidden
    * bar has no indicator on it, so hiding only ever applies to the small one.
    */
-  const silhouette = open
-    ? EXPANDED
-    : charging
-      ? CHARGING
-      : { ...COLLAPSED, height: hidden ? 0 : COLLAPSED.height };
+  const silhouette = bar === "bar" && hidden ? { ...COLLAPSED, height: 0 } : BAR_SIZES[bar];
 
-  // Growing uses the expand spring and shrinking the collapse one, which is what
-  // the charger asks for - 380/26/0.9 on the way in, 500/40 on the way out. With
-  // reduced motion the bar still ends up in the right shape, but it does not
-  // spring to get there; the panel's own open and close are left alone.
+  /**
+   * Reduced motion softens the charger's two moves - its arrival and its return -
+   * and nothing else. The panel keeps the springs it was approved with in both
+   * directions, so a machine with animations turned off at the OS level still
+   * gets a notch that opens and closes smoothly instead of snapping.
+   *
+   * `previousBar` is read during this render and updated after the commit, so it
+   * still holds where the bar came from: that is what tells the charger's
+   * arrival apart from its return, and both apart from a move the panel made.
+   */
+  const chargerMove = bar === "charging" || previousBar.current === "charging";
+  const panelMove = bar === "panel" || previousBar.current === "panel";
   const sizeTransition: Transition =
-    reducedMotion && !open
+    reducedMotion && chargerMove && !panelMove
       ? { duration: 0 }
-      : open || charging
-        ? SPRING_OPEN
-        : SPRING_CLOSE;
+      : bar === "bar"
+        ? SPRING_CLOSE
+        : SPRING_OPEN;
+  useEffect(() => {
+    previousBar.current = bar;
+  });
   // Content Blur Fade-In / Fade-Out for the arrival: 8px of blur and a 0.95 scale
   // behind a 250ms fade that starts 80ms after the bar begins to grow. Reduced
   // motion keeps only the fade, and neither the blur nor the scale.
