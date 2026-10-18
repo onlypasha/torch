@@ -69,8 +69,7 @@ body,
 }
 
 /* Activity indicator: the WPF original drew the icon at 11px and the text at
-   12px, both in its TextSecondary (LightGray). The two power events instead
-   reuse the charge row it drew by hand, whose text was white at 13px. */
+   12px, both in its TextSecondary (LightGray). */
 .notch-activity-glyph {
   font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets";
   font-size: 11px;
@@ -83,43 +82,88 @@ body,
   color: #d3d3d3;
 }
 
-/* The charge row's own text was white at 13px, not the secondary grey. */
-.notch-activity-text[data-power] {
-  font-size: 13px;
-  color: #ffffff;
+/* ---------------------------------------------------------------------------
+   The charger going out.
+
+   Taking the cable out uses the arrival's bar with none of its waiting: the bolt
+   that was drawing itself a moment ago is already here, full and green, and it
+   goes out rather than in. No glow - there is nothing to light up about.
+   --------------------------------------------------------------------------- */
+
+.notch-unplugged {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Leave the level's bar its three pixels. */
+  padding-bottom: 3px;
 }
 
-/* ChargeRow from the WPF original: a 30x14 outline with a nub on the right. The
-   cable is out by the time this shows - the arrival has a shape of its own - so
-   the fill is the grey one. */
-.notch-battery {
+.notch-unplugged-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Room for the ring, which starts wider than the bolt and collapses back into
+   it. */
+.notch-unplugged-bolt {
   position: relative;
-  display: inline-block;
-  width: 30px;
-  height: 14px;
+  display: inline-flex;
   flex: none;
-  border: 1px solid rgb(255 255 255 / 0.9);
-  border-radius: 3px;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
 }
 
-.notch-battery-fill {
-  position: absolute;
-  top: 2.5px;
-  bottom: 2.5px;
-  left: 2.5px;
-  border-radius: 1.5px;
-  background: #808080;
+.notch-unplugged-bolt-svg {
+  display: block;
+  width: 20px;
+  height: 20px;
 }
 
-.notch-battery-nub {
+.notch-unplugged-ring {
   position: absolute;
-  top: 50%;
-  right: -3px;
-  width: 2.5px;
-  height: 7px;
-  transform: translateY(-50%);
-  border-radius: 0 1.5px 1.5px 0;
-  background: rgb(255 255 255 / 0.9);
+  inset: 0;
+  border: 1.5px solid #34d399;
+  border-radius: 9999px;
+}
+
+.notch-unplugged-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: #e5e7eb;
+  white-space: nowrap;
+}
+
+/* The level is what is worth reading once the cable is out, so it is the larger,
+   brighter half of the line - and amber when it is low enough to matter. */
+.notch-unplugged-level {
+  font-size: 15px;
+  font-weight: 600;
+  color: #f5f5f5;
+  font-variant-numeric: tabular-nums;
+}
+
+.notch-unplugged-level[data-low] {
+  color: #f59e0b;
+}
+
+/* The level's own bar along the bottom edge. It is already the width the battery
+   is, so only its colour moves - and there is no shimmer, because nothing here
+   is filling. */
+.notch-unplugged-track {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+}
+
+.notch-unplugged-fill {
+  height: 100%;
 }
 
 /* ---------------------------------------------------------------------------

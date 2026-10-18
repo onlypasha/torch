@@ -99,11 +99,7 @@ type WireKind =
   | "ethernet-lost";
 
 /** The plain row: everything that does not take the whole bar. */
-type RowKind =
-  | "power-disconnected"
-  | "bluetooth-connected"
-  | "usb-connected"
-  | "usb-disconnected";
+type RowKind = "bluetooth-connected" | "usb-connected" | "usb-disconnected";
 
 type WireEvent = { kind: WireKind; detail: string };
 
@@ -136,11 +132,17 @@ type Activity = {
 
 const ACTIVITY_MS = 3000;
 /**
- * The charger gets longer than the rest: it has an animation to play - the bolt
- * drawing itself, the number counting up, the bar filling - and something to
- * read once it has. The clock starts when that animation does.
+ * How long each of the tall indicators holds the bar, counted from the first
+ * frame of its arrival - the same way the charger's own clock has always run.
+ *
+ * The charger is the longest thing the notch does: there is a bolt to draw, a
+ * level to count up and a bar to fill. Taking the cable out has that bar but
+ * nothing to wait for, so it is over sooner.
  */
-const POWER_MS = 3500;
+const TALL_MS: Partial<Record<ActivityKind, number>> = {
+  "power-connected": 3500,
+  "power-disconnected": 2400,
+};
 /**
  * A beat between a tall indicator's bar shrinking and the next one appearing: the
  * bar goes back to the clock's size first, with nothing on it, rather than the
@@ -195,6 +197,25 @@ const LEVEL_FILL: Transition = { duration: 0.7, delay: 0.15, ease: "easeOut" };
 const PULSE_RING: Transition = { duration: 1.4, ease: "easeOut", repeat: Infinity };
 
 /**
+ * Taking the cable out, in seconds. The bolt is not drawn this time - it is
+ * already there, full and green - so it shakes, and then goes out: the fill
+ * fades away and the stroke turns grey.
+ */
+const BOLT_SHAKE: Transition = { duration: 0.35, delay: 0.25, ease: "easeInOut" };
+const BOLT_OUT: Transition = { duration: 0.25, delay: 0.3, ease: "easeOut" };
+/**
+ * The ring runs the other way here: it starts wide and faint where the arrival's
+ * ring ended, and collapses behind the bolt as it goes out.
+ */
+const RING_IN: Transition = { duration: 0.45, delay: 0.25, ease: "easeIn" };
+/** The level's bar: it is already the right width, so only its colour moves. */
+const LEVEL_TINT: Transition = { duration: 0.4, delay: 0.3, ease: "easeOut" };
+const LEVEL_SHOW: Transition = { duration: 0.2, ease: "easeOut" };
+
+/** Where a level stops being white and starts being worth a warning. */
+const LOW_BATTERY = 20;
+
+/**
  * The bolt is drawn rather than typed: it has to be a real path so the stroke can
  * draw itself in (`pathLength`) and the fill can arrive afterwards, which the
  * emoji could not do.
@@ -203,19 +224,15 @@ const BOLT_PATH = "M12.6 2.4 5.2 13.4h5.9l-.5 8.2 8.6-11.3h-6.3z";
 
 /**
  * How each plain event presents itself. The wording is the part that does not
- * come from the machine; `detail` is the device name or the percentage.
+ * come from the machine; `detail` is the device name.
  *
- * The two power events are the ones without a glyph, and they no longer look
- * alike: plugging in gets the drawn bolt and the progress bar (see
- * `ChargingContent`), while unplugging stays on the small bar with the battery
- * the WPF original drew by hand. The networks are not here either: they have a
- * layer of their own, with two phases to show (see `NetworkContent`).
+ * The power events are not here at all any more: both take the whole bar, each
+ * with a shape of its own - the arrival with its drawn bolt and counting level
+ * (see `ChargingContent`), the unplug notice with the same bolt going out (see
+ * `UnpluggedContent`). The networks have a layer of their own too (see
+ * `NetworkContent`).
  */
 const ROW: Record<RowKind, { text: (detail: string) => string; glyph?: string }> = {
-  "power-disconnected": {
-    text: (detail) =>
-      detail ? `Charger dicabut · ${detail}` : "Charger dicabut",
-  },
   "bluetooth-connected": {
     glyph: "\uE702",
     text: (detail) =>
@@ -233,7 +250,6 @@ const ROW: Record<RowKind, { text: (detail: string) => string; glyph?: string }>
 
 /** Whether the clock's row is what this activity is drawn in. */
 const isRow = (kind: ActivityKind): kind is RowKind =>
-  kind === "power-disconnected" ||
   kind === "bluetooth-connected" ||
   kind === "usb-connected" ||
   kind === "usb-disconnected";
@@ -353,25 +369,6 @@ function enqueue(
 }
 
 /**
- * The WPF charge row, in DOM: a 30x14 outline with a 2.5px inset grey fill whose
- * width tracks the level (25px at 100%, exactly what `ChargeFill.Width` did) and
- * the little nub on the right.
- */
-function Battery({ detail }: { detail: string }) {
-  const percent = Number.parseInt(detail, 10);
-  const level = Number.isFinite(percent)
-    ? Math.max(0, Math.min(100, percent))
-    : 0;
-
-  return (
-    <span className="notch-battery" aria-hidden="true">
-      <span className="notch-battery-fill" style={{ width: `${level * 0.25}px` }} />
-      <span className="notch-battery-nub" />
-    </span>
-  );
-}
-
-/**
  * The level counts *up* to what the battery actually is, so plugging in reads as
  * charging rather than as a number that was already there. The value the machine
  * reported is where it lands, not where it starts.
@@ -392,6 +389,77 @@ function useCountUp(value: number) {
   }, [value]);
 
   return shown;
+}
+
+/**
+ * Taking the cable out. The arrival's bar, and then the bolt it just drew, going
+ * out: a shake, the green fill draining away while the stroke turns grey, and the
+ * ring behind it collapsing inwards instead of pulsing outwards.
+ *
+ * Nothing counts up and nothing grows here. The battery is whatever it is, so the
+ * percentage is simply shown and the bar along the bottom is already that wide -
+ * it only has to change colour, to grey, or to amber if the level is low.
+ *
+ * Reduced motion is ignored, exactly as it is for the arrival.
+ */
+function UnpluggedContent({ detail }: { detail: string }) {
+  const percent = Number.parseInt(detail, 10);
+  const level = Number.isFinite(percent)
+    ? Math.max(0, Math.min(100, percent))
+    : 0;
+  const low = level <= LOW_BATTERY;
+
+  return (
+    <>
+      <div className="notch-unplugged-row">
+        <span className="notch-unplugged-bolt" aria-hidden="true">
+          <motion.span
+            className="notch-unplugged-ring"
+            initial={{ scale: 1.9, opacity: 0.45 }}
+            animate={{ scale: 0.8, opacity: 0 }}
+            transition={RING_IN}
+          />
+          <motion.svg
+            viewBox="0 0 24 24"
+            className="notch-unplugged-bolt-svg"
+            aria-hidden="true"
+            initial={{ x: 0 }}
+            animate={{ x: [0, -3, 3, -2, 2, 0] }}
+            transition={BOLT_SHAKE}
+          >
+            <motion.path
+              d={BOLT_PATH}
+              strokeWidth={1.6}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              initial={{ fill: "#34d399", stroke: "#34d399" }}
+              animate={{ fill: "rgba(52, 211, 153, 0)", stroke: "#9ca3af" }}
+              transition={BOLT_OUT}
+            />
+          </motion.svg>
+        </span>
+        <span className="notch-unplugged-title">
+          Charger dilepas
+          <span
+            className="notch-unplugged-level"
+            data-low={low || undefined}
+          >{` · ${level}%`}</span>
+        </span>
+      </div>
+      <div className="notch-unplugged-track">
+        <motion.div
+          className="notch-unplugged-fill"
+          style={{ width: `${level}%` }}
+          initial={{ opacity: 0, backgroundColor: "#34d399" }}
+          animate={{
+            opacity: 1,
+            backgroundColor: low ? "#f59e0b" : "#6b7280",
+          }}
+          transition={{ opacity: LEVEL_SHOW, backgroundColor: LEVEL_TINT }}
+        />
+      </div>
+    </>
+  );
 }
 
 /**
@@ -742,12 +810,14 @@ export default function App() {
   // lives on the collapsed bar, so showing it would mean closing what the user
   // just opened. The queue is held, not dropped.
   const showingActivity = activity !== undefined && !open;
-  // The two tall indicators: the charger's arrival and a network coming up. The
-  // "unplugged" notice and the rest stay on the clock's small bar.
+  // The tall indicators all take the whole bar rather than the clock's row: the
+  // charger's arrival, the notice that the cable has come out, and a network
+  // coming up. Everything else stays on the small bar.
   const charging = showingActivity && activity.kind === "power-connected";
+  const unplugged = showingActivity && activity.kind === "power-disconnected";
   const network =
     showingActivity && activity !== undefined ? networkOf(activity) : undefined;
-  const tall = charging || network !== undefined;
+  const tall = charging || unplugged || network !== undefined;
   // What the clock's row shows. The tall indicators are not part of it - they
   // have layers of their own - and while the bar is settling after one, nothing
   // is.
@@ -982,8 +1052,8 @@ export default function App() {
    * burn its time behind an open panel, and closing the panel gives the one still
    * showing a fresh turn.
    *
-   * The charger gets longer than the rest because it has an animation to play,
-   * and once it is over the bar is left to shrink back on its own.
+   * A tall indicator holds the bar for its own length (see `TALL_MS`), and once
+   * it is over the bar is left to shrink back on its own.
    *
    * The networks are not a plain dwell. Their intro phase is a minimum rather
    * than a length: the indicator stays on the bar until the network answers, and
@@ -995,9 +1065,10 @@ export default function App() {
 
     const net = networkOf(activity);
     if (net === undefined) {
+      const hold = TALL_MS[activity.kind];
       const timer = window.setTimeout(
-        charging ? popTall : popActivity,
-        charging ? POWER_MS : ACTIVITY_MS,
+        hold === undefined ? popActivity : popTall,
+        hold ?? ACTIVITY_MS,
       );
       return () => window.clearTimeout(timer);
     }
@@ -1182,20 +1253,12 @@ export default function App() {
                   {(() => {
                     if (!isRow(rowActivity.kind)) return null;
                     const look = ROW[rowActivity.kind];
-                    const power = rowActivity.kind === "power-disconnected";
                     return (
                       <>
-                        {power ? (
-                          <Battery detail={rowActivity.detail} />
-                        ) : (
-                          <span className="notch-activity-glyph">
-                            {look.glyph}
-                          </span>
-                        )}
-                        <span
-                          className="notch-activity-text truncate"
-                          data-power={power || undefined}
-                        >
+                        <span className="notch-activity-glyph">
+                          {look.glyph}
+                        </span>
+                        <span className="notch-activity-text truncate">
                           {look.text(rowActivity.detail)}
                         </span>
                       </>
@@ -1229,6 +1292,22 @@ export default function App() {
                 className="notch-charging"
               >
                 <ChargingContent detail={activity.detail} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+          {/* Taking the cable out takes the same bar as putting it in, with the
+              bolt that was just drawing itself going out instead. */}
+          <AnimatePresence>
+            {unplugged && (
+              <motion.div
+                key={activity.id}
+                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
+                animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                exit={{ opacity: 0, filter: "blur(6px)", transition: arrivalExit }}
+                transition={arrivalEnter}
+                className="notch-unplugged"
+              >
+                <UnpluggedContent detail={activity.detail} />
               </motion.div>
             )}
           </AnimatePresence>
