@@ -9,3 +9,50 @@ body,
   background: transparent;
   overflow: hidden;
 }
+
+.notch-shell {
+  --ear-size: 6px;
+  --notch-color: #1c1c1c;
+  /* Keep horizontal room for ears, including spring overshoot. Vertical
+     clipping follows the animated height so autohide leaves no ears behind. */
+  clip-path: inset(0 -32px 0 -32px);
+}
+
+.notch-shell::before,
+.notch-shell::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  width: var(--ear-size);
+  height: var(--ear-size);
+  /* Decorative: do not turn the transparent part of the gradient into a
+     clickable rectangle or enlarge the native body's hit area. */
+  pointer-events: none;
+}
+
+.notch-shell::before {
+  left: calc(-1 * var(--ear-size));
+  background: radial-gradient(
+    circle at 0 100%,
+    transparent var(--ear-size),
+    var(--notch-color) calc(var(--ear-size) + 0.5px)
+  );
+}
+
+.notch-shell::after {
+  right: calc(-1 * var(--ear-size));
+  background: radial-gradient(
+    circle at 100% 100%,
+    transparent var(--ear-size),
+    var(--notch-color) calc(var(--ear-size) + 0.5px)
+  );
+}
+
+.notch-body {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: inherit;
+  background: var(--notch-color);
+}

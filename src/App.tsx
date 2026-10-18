@@ -11,8 +11,8 @@ import { listen } from "@tauri-apps/api/event";
  * never changes between tabs, and both the size and the bottom corner radius
  * run off the same spring.
  */
-const COLLAPSED = { width: 200, height: 34, radius: 14 };
-const EXPANDED = { width: 420, height: 160, radius: 28 };
+const COLLAPSED = { width: 200, height: 34, radius: 14, ear: 6 };
+const EXPANDED = { width: 420, height: 160, radius: 28, ear: 14 };
 
 /**
  * Spring Expand / Spring Collapse from the spec.
@@ -219,6 +219,7 @@ export default function App() {
           height: open ? EXPANDED.height : hidden ? 0 : COLLAPSED.height,
           borderBottomLeftRadius: open ? EXPANDED.radius : COLLAPSED.radius,
           borderBottomRightRadius: open ? EXPANDED.radius : COLLAPSED.radius,
+          "--ear-size": `${open ? EXPANDED.ear : COLLAPSED.ear}px`,
         }}
         transition={open ? SPRING_OPEN : SPRING_CLOSE}
         onAnimationComplete={handleSettled}
@@ -237,25 +238,27 @@ export default function App() {
           event.preventDefault();
           pressNotch();
         }}
-        className="absolute top-0 left-1/2 -translate-x-1/2 overflow-hidden bg-[#1c1c1c] outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+        className="notch-shell absolute top-0 left-1/2 -translate-x-1/2 outline-none focus-visible:ring-1 focus-visible:ring-white/40"
       >
-        {/* Placeholder only: the clock and the tabs replace this next. */}
-        <AnimatePresence>
-          {open && (
-            <motion.div
-              key="content"
-              initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
-              animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
-              exit={{ opacity: 0, filter: "blur(6px)", transition: CONTENT_EXIT }}
-              transition={CONTENT_ENTER}
-              className="flex h-full w-full items-center justify-center"
-            >
-              <span className="text-xs font-medium tracking-wide text-white/45">
-                Panel content
-              </span>
-            </motion.div>
-          )}
-        </AnimatePresence>
+        <div className="notch-body">
+          {/* Placeholder only: the tabs replace this next. */}
+          <AnimatePresence>
+            {open && (
+              <motion.div
+                key="content"
+                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
+                animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                exit={{ opacity: 0, filter: "blur(6px)", transition: CONTENT_EXIT }}
+                transition={CONTENT_ENTER}
+                className="flex h-full w-full items-center justify-center"
+              >
+                <span className="text-xs font-medium tracking-wide text-white/45">
+                  Panel content
+                </span>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
       </motion.div>
     </div>
   );
