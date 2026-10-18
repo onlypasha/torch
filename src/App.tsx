@@ -51,17 +51,128 @@ const CONTENT_EXIT: Transition = { duration: 0.12 };
 const formatClock = (date: Date) =>
   `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 
+/**
+ * Activity indicators: the charger, a network, a Bluetooth device, a USB
+ * device. Native detects them (see `activity.rs`) and each one takes the
+ * clock's place for three seconds, in turn, before the clock comes back.
+ */
+type ActivityKind =
+  | "power-connected"
+  | "power-disconnected"
+  | "wifi-connected"
+  | "ethernet-connected"
+  | "bluetooth-connected"
+  | "usb-connected"
+  | "usb-disconnected";
+
+type ActivityEvent = { kind: ActivityKind; detail: string };
+type Activity = ActivityEvent & { id: number };
+
+const ACTIVITY_MS = 3000;
+/** Guard against a device flapping faster than the queue can drain. */
+const ACTIVITY_QUEUE_MAX = 8;
+
+/**
+ * How each event presents itself. The wording is the part that does not come
+ * from the machine; `detail` is the SSID, the device name, the percentage.
+ *
+ * Events without a glyph are the two power ones, which use a drawn battery
+ * instead - the same 30x14 outline the WPF original used, green while charging
+ * and grey once the cable is out.
+ */
+const ACTIVITY: Record<
+  ActivityKind,
+  { text: (detail: string) => string; glyph?: string }
+> = {
+  "power-connected": {
+    text: (detail) => (detail ? `Mengisi daya · ${detail}` : "Mengisi daya"),
+  },
+  "power-disconnected": {
+    text: (detail) =>
+      detail ? `Charger dicabut · ${detail}` : "Charger dicabut",
+  },
+  "wifi-connected": {
+    glyph: "\uE701",
+    text: (detail) => (detail ? `Wi-Fi · ${detail}` : "Wi-Fi terhubung"),
+  },
+  "ethernet-connected": {
+    glyph: "\uE839",
+    text: () => "Ethernet terhubung",
+  },
+  "bluetooth-connected": {
+    glyph: "\uE702",
+    text: (detail) =>
+      detail ? `Bluetooth · ${detail}` : "Bluetooth terhubung",
+  },
+  "usb-connected": {
+    glyph: "\uE88E",
+    text: (detail) => (detail ? `USB · ${detail}` : "USB terhubung"),
+  },
+  "usb-disconnected": {
+    glyph: "\uE88E",
+    text: (detail) => (detail ? `${detail} dilepas` : "USB dilepas"),
+  },
+};
+
+/**
+ * The WPF charge row, in DOM: a 30x14 outline with a 2.5px inset fill whose
+ * width tracks the level (25px at 100%, exactly what `ChargeFill.Width` did),
+ * the little nub on the right, and a bolt that pops in while charging.
+ */
+function Battery({ detail, charging }: { detail: string; charging: boolean }) {
+  const percent = Number.parseInt(detail, 10);
+  const level = Number.isFinite(percent)
+    ? Math.max(0, Math.min(100, percent))
+    : 0;
+
+  return (
+    <span className="notch-battery" aria-hidden="true">
+      <span
+        className="notch-battery-fill"
+        data-charging={charging}
+        style={{ width: `${level * 0.25}px` }}
+      />
+      <span className="notch-battery-nub" />
+      {charging && (
+        <motion.span
+          initial={{ scale: 0 }}
+          animate={{ scale: 1 }}
+          transition={{ duration: 0.3, ease: [0.34, 1.56, 0.64, 1] }}
+          className="notch-battery-bolt"
+        >
+          ⚡
+        </motion.span>
+      )}
+    </span>
+  );
+}
+
 export default function App() {
   const [open, setOpen] = useState(false);
   const [time, setTime] = useState(() => formatClock(new Date()));
   // True while a foreground window covers the collapsed notch (native monitors
   // it, see the autohide module in lib.rs). Autohide never applies to the open
   // panel, so hidden and open are mutually exclusive in practice.
-  const [hidden, setHidden] = useState(false);
+  const [autohide, setAutohide] = useState(false);
+  // Activities are queued and shown one at a time, oldest first, for three
+  // seconds each.
+  const [activities, setActivities] = useState<Activity[]>([]);
+  const nextActivityId = useRef(0);
   // `wanted` is the user's intent; `open` is the rendered state. They differ
   // only while a native call is in flight, which is what lets a fast reverse
   // cancel an open that has not started animating yet.
   const wanted = useRef(false);
+
+  const activity = activities[0];
+  // While the panel is open the indicator waits rather than interrupting: it
+  // lives on the collapsed bar, so showing it would mean closing what the user
+  // just opened. The queue is held, not dropped.
+  const showingActivity = activity !== undefined && !open;
+  // An indicator is worth showing even when autohide would have hidden the
+  // notch; once it has had its three seconds the autohide state takes over
+  // again. Reporting it as *visible* to native matters: the hook then treats it
+  // as a notch again, so it can still be clicked open.
+  const hidden = autohide && !showingActivity;
 
   /**
    * The native window keeps one size for its whole life - a resize makes
@@ -174,7 +285,7 @@ export default function App() {
     let stop: (() => void) | undefined;
     let disposed = false;
     void listen<boolean>("notch-autohide", (event) =>
-      setHidden(event.payload),
+      setAutohide(event.payload),
     ).then((unlisten) => {
       if (disposed) unlisten();
       else stop = unlisten;
@@ -184,6 +295,39 @@ export default function App() {
       stop?.();
     };
   }, []);
+
+  // Charger, network, Bluetooth and USB, detected natively.
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let disposed = false;
+    void listen<ActivityEvent>("notch-activity", (event) =>
+      setActivities((queue) => {
+        if (queue.length >= ACTIVITY_QUEUE_MAX) return queue;
+        return [...queue, { ...event.payload, id: nextActivityId.current++ }];
+      }),
+    ).then((unlisten) => {
+      if (disposed) unlisten();
+      else stop = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, []);
+
+  /**
+   * Three seconds per activity, then the next one. The timer only runs while
+   * the activity is actually on screen: opening the panel pauses it, so an
+   * indicator cannot burn its time behind an open panel, and closing the panel
+   * gives the one still showing a fresh three seconds.
+   */
+  useEffect(() => {
+    if (activity === undefined || open) return;
+    const timer = window.setTimeout(() => {
+      setActivities((queue) => queue.slice(1));
+    }, ACTIVITY_MS);
+    return () => window.clearTimeout(timer);
+  }, [activity, open]);
 
   // Hiding never changes the click-through state - autohide only ever applies
   // while the notch is collapsed, and collapsed is already click-through. What
@@ -245,6 +389,7 @@ export default function App() {
     <div className="h-full w-full select-none bg-transparent">
       <motion.div
         data-notch="1"
+        data-activity={showingActivity ? activity.kind : ""}
         role="button"
         tabIndex={0}
         aria-label="Notch"
@@ -293,9 +438,58 @@ export default function App() {
               scale: open ? 0.95 : 1,
             }}
             transition={open ? CONTENT_EXIT : CONTENT_ENTER}
-            className="notch-clock pointer-events-none absolute inset-x-0 top-2 flex h-5 items-center justify-center text-sm text-white"
+            className="notch-clock pointer-events-none absolute inset-x-0 top-2 flex h-5 items-center justify-center px-3 text-sm text-white"
           >
-            {time}
+            {/* One indicator at a time takes the clock's place; the WPF original
+                kept the clock and put the activity beside it, but the clock is
+                what this notch shows when it has nothing to say. */}
+            <AnimatePresence mode="wait" initial={false}>
+              {showingActivity ? (
+                <motion.div
+                  key={activity.id}
+                  initial={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
+                  animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                  exit={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
+                  transition={{ duration: 0.18, ease: "easeOut" }}
+                  className="notch-activity flex min-w-0 items-center gap-1"
+                >
+                  {(() => {
+                    const look = ACTIVITY[activity.kind];
+                    const power = activity.kind.startsWith("power-");
+                    return (
+                      <>
+                        {power ? (
+                          <Battery
+                            detail={activity.detail}
+                            charging={activity.kind === "power-connected"}
+                          />
+                        ) : (
+                          <span className="notch-activity-glyph">
+                            {look.glyph}
+                          </span>
+                        )}
+                        <span
+                          className="notch-activity-text truncate"
+                          data-power={power || undefined}
+                        >
+                          {look.text(activity.detail)}
+                        </span>
+                      </>
+                    );
+                  })()}
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="clock"
+                  initial={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
+                  animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                  exit={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
+                  transition={{ duration: 0.18, ease: "easeOut" }}
+                >
+                  {time}
+                </motion.div>
+              )}
+            </AnimatePresence>
           </motion.div>
           {/* Placeholder only: the tabs replace this next. */}
           <AnimatePresence>

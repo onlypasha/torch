@@ -67,3 +67,73 @@ body,
      as the minutes tick over. */
   font-variant-numeric: tabular-nums;
 }
+
+/* Activity indicator: the WPF original drew the icon at 11px and the text at
+   12px, both in its TextSecondary (LightGray). The two power events instead
+   reuse the charge row it drew by hand, whose text was white at 13px. */
+.notch-activity-glyph {
+  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets";
+  font-size: 11px;
+  color: #d3d3d3;
+  line-height: 1;
+}
+
+.notch-activity-text {
+  font-size: 12px;
+  color: #d3d3d3;
+}
+
+/* The charge row's own text was white at 13px, not the secondary grey. */
+.notch-activity-text[data-power] {
+  font-size: 13px;
+  color: #ffffff;
+}
+
+/* ChargeRow from the WPF original: a 30x14 outline, a 2.5px inset fill that is
+   green while charging and grey once it is not, and a nub on the right. */
+.notch-battery {
+  position: relative;
+  display: inline-block;
+  width: 30px;
+  height: 14px;
+  flex: none;
+  border: 1px solid rgb(255 255 255 / 0.9);
+  border-radius: 3px;
+}
+
+.notch-battery-fill {
+  position: absolute;
+  top: 2.5px;
+  bottom: 2.5px;
+  left: 2.5px;
+  border-radius: 1.5px;
+  background: #7ed957;
+}
+
+.notch-battery-fill[data-charging="false"] {
+  background: #808080;
+}
+
+.notch-battery-nub {
+  position: absolute;
+  top: 50%;
+  right: -3px;
+  width: 2.5px;
+  height: 7px;
+  transform: translateY(-50%);
+  border-radius: 0 1.5px 1.5px 0;
+  background: rgb(255 255 255 / 0.9);
+}
+
+.notch-battery-bolt {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: "Segoe UI Emoji", "Segoe UI Symbol";
+  font-size: 8px;
+  line-height: 1;
+  color: #ffffff;
+  text-shadow: 0 0 2px #000000;
+}

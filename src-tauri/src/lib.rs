@@ -46,6 +46,11 @@ const INITIAL_HEIGHT: f64 = 220.0;
 /// does not swallow clicks in the first few frames after launch.
 const INITIAL_NOTCH: (f64, f64) = (200.0, 34.0);
 
+/// Activity indicators - charger, network, Bluetooth, USB - and the events they
+/// raise for the webview to display in place of the clock.
+#[cfg(target_os = "windows")]
+mod activity;
+
 #[cfg(target_os = "windows")]
 mod win {
     pub use platform_impl::*;
@@ -575,6 +580,7 @@ pub fn run() {
                 win::apply_styles(&window);
                 mouse_hook::install(app.handle());
                 autohide::install(app.handle());
+                activity::install(app.handle());
             }
 
             // Place it top-centre immediately so the first frames are already

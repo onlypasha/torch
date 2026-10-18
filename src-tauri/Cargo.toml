@@ -23,6 +23,15 @@ windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_LibraryLoader",
+    # Activity indicators: power, network, USB and Bluetooth.
+    # Bluetooth is the Win32 stack, not the WinRT one: see activity.rs.
+    "Win32_System_Power",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Bluetooth",
+    "Win32_Devices_Properties",
 ] }
 
 # See https://tauri.app/concept/size/#cargo-configuration
