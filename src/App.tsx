@@ -594,22 +594,6 @@ function WifiIcon({ phase }: { phase: NetPhase }) {
           ))}
         </svg>
       </Pop>
-      {/* The bars are the one part of the glyph the attempt does not have: a
-          signal meter only means something once there is a signal. The space is
-          held for them either way, so nothing shifts when they arrive. */}
-      <span className="notch-network-bars">
-        {live &&
-          SIGNAL_BARS.map((height, index) => (
-            <motion.span
-              key={height}
-              className="notch-network-bar"
-              style={{ height }}
-              initial={{ scaleY: 0.25, opacity: 0.3 }}
-              animate={{ scaleY: 1, opacity: 1 }}
-              transition={{ ...BAR_SPRING, delay: index * BAR_STEP }}
-            />
-          ))}
-      </span>
     </span>
   );
 }
@@ -658,6 +642,7 @@ function NetworkContent({
   // The cable's one thing to read is how fast the port negotiated, and native
   // leaves it empty when Windows will not say.
   const speed = kind === "ethernet" && phase === "connected" && detail;
+  const live = phase === "connected";
 
   return (
     <>
@@ -689,6 +674,24 @@ function NetworkContent({
             >
               · {detail}
             </motion.span>
+          )}
+        </span>
+        {/* The signal meter, out at the bar's other end. Wi-Fi is the only one
+            with a signal to measure, and only once it has one. */}
+        <span className="notch-network-meter" aria-hidden="true">
+          {kind === "wifi" && live && (
+            <span className="notch-network-bars">
+              {SIGNAL_BARS.map((height, index) => (
+                <motion.span
+                  key={height}
+                  className="notch-network-bar"
+                  style={{ height }}
+                  initial={{ scaleY: 0.25, opacity: 0.3 }}
+                  animate={{ scaleY: 1, opacity: 1 }}
+                  transition={{ ...BAR_SPRING, delay: index * BAR_STEP }}
+                />
+              ))}
+            </span>
           )}
         </span>
       </div>

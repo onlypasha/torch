@@ -263,26 +263,42 @@ body,
   padding-bottom: 3px;
 }
 
+/* The three parts of a status bar: the glyph, the name beside it, and the signal
+   meter out at the right. The two ends are the same width, so the name starts in
+   the same place in every phase and the bar does not look lopsided when there is
+   no meter to show. */
 .notch-network-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  width: 100%;
+  gap: 10px;
+  padding: 0 16px;
 }
 
-/* Wide enough for the arcs and the signal bars side by side, and for the plug to
-   sit to the left of the port. The space is held in both phases, so the caption
-   does not shift when the second half of the glyph arrives. */
+/* The glyph's own end: wide enough for the arcs, and for the plug to sit to the
+   left of the port. */
 .notch-network-icon {
   position: relative;
   display: inline-flex;
   flex: none;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  width: 52px;
+  width: 46px;
   height: 24px;
   /* The glyph follows the phase over a beat rather than jumping. */
   transition: opacity 200ms ease-out;
+}
+
+/* The signal meter's end. It holds its place from the first frame - the meter
+   arrives later than the glyph does - and it is centred in a box the height of
+   the tallest bars, so the short ones grow up out of the same baseline. */
+.notch-network-meter {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  width: 46px;
+  height: 14px;
 }
 
 /* A notice - a link that failed or was cut - is not a link: the glyph goes quiet
@@ -319,10 +335,11 @@ body,
 }
 
 /* The cable: a plug at the port's mouth, and the port itself. The plug starts
-   one gap to the left and slides until the two are flush. */
+   one gap to the left and slides until the two are flush. The two of them are 30
+   wide together, centred in the glyph's 46. */
 .notch-network-plug {
   position: absolute;
-  left: 11px;
+  left: 8px;
   top: 50%;
   z-index: 1;
   width: 12px;
@@ -334,7 +351,7 @@ body,
 
 .notch-network-port {
   position: absolute;
-  left: 23px;
+  left: 20px;
   top: 50%;
   width: 18px;
   height: 13px;
@@ -352,23 +369,41 @@ body,
   border-radius: 3px;
 }
 
+/* The name, and the speed beside it. It takes the room the two ends leave and
+   starts at its left edge, so a longer name grows to the right instead of
+   pushing the glyph about. */
 .notch-network-title {
-  display: inline-flex;
+  display: flex;
+  flex: 1;
+  min-width: 0;
   align-items: baseline;
+  /* Between the name and its speed: without it the two run together, because
+     there is no whitespace between the two spans in the markup. */
+  gap: 5px;
   font-size: 14px;
   color: #ffffff;
+}
+
+/* A 32-character SSID is the longest this can be asked to hold, and it fits - but
+   if one ever does not, it ends in an ellipsis rather than running past the
+   bar. */
+.notch-network-caption {
+  display: inline-block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.notch-network-caption {
-  display: inline-block;
-}
-
-/* The negotiated link speed, in the charger's level blue-on-white arrangement. */
+/* The negotiated link speed, in the charger's level blue-on-white arrangement.
+   It never gives way to the name: it is two or three characters of unit. */
 .notch-network-level {
+  flex: none;
   color: #60a5fa;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* The indeterminate strip: a bright third of the bar travelling its length. */
