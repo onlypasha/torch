@@ -20,11 +20,10 @@ const CHARGING = { width: 300, height: 52, radius: 24, ear: 14 };
 const EXPANDED = { width: 420, height: 160, radius: 28, ear: 14 };
 
 /**
- * The three shapes the bar can be in. Named separately from their sizes because
- * the *move* between them is what picks the spring, not just the destination:
- * growing into the panel or into the charger's bar springs open, everything else
- * - the charger's return, the panel's close, autohide sliding the bar away -
- * springs shut.
+ * The three shapes the bar can be in. The destination is what picks the spring -
+ * growing into the panel or into the charger's bar springs open, shrinking back
+ * to the clock's bar springs shut - so the shape is named separately from its
+ * size.
  */
 type Bar = "bar" | "charging" | "panel";
 const BAR_SIZES: Record<Bar, typeof COLLAPSED> = {
@@ -315,9 +314,8 @@ export default function App() {
   // notch again, so it can still be clicked open.
   const hidden = autohide && !showingActivity;
 
-  // Which shape the bar is in, and which it was in a moment ago.
+  // Which shape the bar is in.
   const bar: Bar = open ? "panel" : charging ? "charging" : "bar";
-  const previousBar = useRef<Bar>("bar");
 
   /**
    * The native window keeps one size for its whole life - a resize makes
@@ -334,26 +332,16 @@ export default function App() {
   const silhouette = bar === "bar" && hidden ? { ...COLLAPSED, height: 0 } : BAR_SIZES[bar];
 
   /**
-   * Reduced motion softens the charger's two moves - its arrival and its return -
-   * and nothing else. The panel keeps the springs it was approved with in both
-   * directions, so a machine with animations turned off at the OS level still
-   * gets a notch that opens and closes smoothly instead of snapping.
-   *
-   * `previousBar` is read during this render and updated after the commit, so it
-   * still holds where the bar came from: that is what tells the charger's
-   * arrival apart from its return, and both apart from a move the panel made.
+   * The bar always springs between its shapes: growing into the panel or into the
+   * charger's bar uses the expand spring, and every return - the charger's, the
+   * panel's, autohide sliding the bar away - uses the collapse one. The size is
+   * the notch's personality, so it is kept on every machine; a system set to
+   * reduce motion still loses the charger's flourish (ring, shimmer, count-up,
+   * drawn bolt, growing bar, content blur and scale), which is where the motion
+   * the setting is really about lives. Swapping in `{ duration: 0 }` here again
+   * is what it would take to have the OS setting win.
    */
-  const chargerMove = bar === "charging" || previousBar.current === "charging";
-  const panelMove = bar === "panel" || previousBar.current === "panel";
-  const sizeTransition: Transition =
-    reducedMotion && chargerMove && !panelMove
-      ? { duration: 0 }
-      : bar === "bar"
-        ? SPRING_CLOSE
-        : SPRING_OPEN;
-  useEffect(() => {
-    previousBar.current = bar;
-  });
+  const sizeTransition: Transition = bar === "bar" ? SPRING_CLOSE : SPRING_OPEN;
   // Content Blur Fade-In / Fade-Out for the arrival: 8px of blur and a 0.95 scale
   // behind a 250ms fade that starts 80ms after the bar begins to grow. Reduced
   // motion keeps only the fade, and neither the blur nor the scale.
