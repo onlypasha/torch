@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import { AnimatePresence, motion } from "motion/react";
 import type { Transition } from "motion/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -183,16 +183,10 @@ function Battery({ detail }: { detail: string }) {
  * charging rather than as a number that was already there. The value the machine
  * reported is where it lands, not where it starts.
  */
-function useCountUp(value: number, instant: boolean) {
-  const [shown, setShown] = useState(instant ? value : 0);
+function useCountUp(value: number) {
+  const [shown, setShown] = useState(0);
 
   useEffect(() => {
-    if (instant) {
-      // Reduced motion: the level is simply there at its final value.
-      setShown(value);
-      return;
-    }
-
     const started = performance.now();
     let frame = window.requestAnimationFrame(function step() {
       const progress = Math.min(1, (performance.now() - started) / COUNT_UP_MS);
@@ -202,7 +196,7 @@ function useCountUp(value: number, instant: boolean) {
     });
 
     return () => window.cancelAnimationFrame(frame);
-  }, [value, instant]);
+  }, [value]);
 
   return shown;
 }
@@ -214,32 +208,29 @@ function useCountUp(value: number, instant: boolean) {
  *
  * It sits on its own layer rather than in the clock's 20px row, because it takes
  * the whole bar. Mounted per activity, so a second plug replays all of it.
+ *
+ * All of it plays on every machine. A system set to reduce motion asks for less,
+ * but the arrival is the notch's whole personality and is over in a couple of
+ * seconds, so the spec's accessibility carve-out was dropped after seeing it
+ * land on the machine this is built on.
  */
-function ChargingContent({
-  detail,
-  instant,
-}: {
-  detail: string;
-  instant: boolean;
-}) {
+function ChargingContent({ detail }: { detail: string }) {
   const percent = Number.parseInt(detail, 10);
   const level = Number.isFinite(percent)
     ? Math.max(0, Math.min(100, percent))
     : 0;
-  const shown = useCountUp(level, instant);
+  const shown = useCountUp(level);
 
   return (
     <>
       <div className="notch-charging-row">
         <span className="notch-charging-bolt" aria-hidden="true">
-          {!instant && (
-            <motion.span
-              className="notch-charging-ring"
-              initial={{ scale: 1, opacity: 0.5 }}
-              animate={{ scale: 1.9, opacity: 0 }}
-              transition={PULSE_RING}
-            />
-          )}
+          <motion.span
+            className="notch-charging-ring"
+            initial={{ scale: 1, opacity: 0.5 }}
+            animate={{ scale: 1.9, opacity: 0 }}
+            transition={PULSE_RING}
+          />
           <svg
             viewBox="0 0 24 24"
             className="notch-charging-bolt-svg"
@@ -252,8 +243,7 @@ function ChargingContent({
               strokeWidth={1.6}
               strokeLinecap="round"
               strokeLinejoin="round"
-              // Reduced motion has nothing to draw: it starts finished.
-              initial={instant ? false : { pathLength: 0, fillOpacity: 0 }}
+              initial={{ pathLength: 0, fillOpacity: 0 }}
               animate={{ pathLength: 1, fillOpacity: 1 }}
               transition={{ pathLength: BOLT_DRAW, fillOpacity: BOLT_FILL }}
             />
@@ -267,11 +257,11 @@ function ChargingContent({
       <div className="notch-charging-track">
         <motion.div
           className="notch-charging-fill"
-          initial={instant ? false : { width: 0 }}
+          initial={{ width: 0 }}
           animate={{ width: `${level}%` }}
           transition={LEVEL_FILL}
         >
-          {!instant && <span className="notch-charging-shimmer" />}
+          <span className="notch-charging-shimmer" />
         </motion.div>
       </div>
     </>
@@ -294,7 +284,6 @@ export default function App() {
   // only while a native call is in flight, which is what lets a fast reverse
   // cancel an open that has not started animating yet.
   const wanted = useRef(false);
-  const reducedMotion = useReducedMotion() === true;
 
   const activity = activities[0];
   // While the panel is open the indicator waits rather than interrupting: it
@@ -334,20 +323,19 @@ export default function App() {
   /**
    * The bar always springs between its shapes: growing into the panel or into the
    * charger's bar uses the expand spring, and every return - the charger's, the
-   * panel's, autohide sliding the bar away - uses the collapse one. The size is
-   * the notch's personality, so it is kept on every machine; a system set to
-   * reduce motion still loses the charger's flourish (ring, shimmer, count-up,
-   * drawn bolt, growing bar, content blur and scale), which is where the motion
-   * the setting is really about lives. Swapping in `{ duration: 0 }` here again
-   * is what it would take to have the OS setting win.
+   * panel's, autohide sliding the bar away - uses the collapse one. Nothing here
+   * consults `prefers-reduced-motion`: the arrival is the notch's personality and
+   * plays on every machine, including the one this is built on, which asks for
+   * reduced motion and had been getting a bar that simply jumped.
    */
   const sizeTransition: Transition = bar === "bar" ? SPRING_CLOSE : SPRING_OPEN;
   // Content Blur Fade-In / Fade-Out for the arrival: 8px of blur and a 0.95 scale
-  // behind a 250ms fade that starts 80ms after the bar begins to grow. Reduced
-  // motion keeps only the fade, and neither the blur nor the scale.
-  const chargerEnter: Transition = reducedMotion
-    ? { duration: 0.12 }
-    : { duration: 0.25, delay: 0.08, ease: "easeOut" };
+  // behind a 250ms fade that starts 80ms after the bar begins to grow.
+  const chargerEnter: Transition = {
+    duration: 0.25,
+    delay: 0.08,
+    ease: "easeOut",
+  };
   const chargerExit: Transition = { duration: 0.12 };
 
   const setHitArea = useCallback(
@@ -594,7 +582,7 @@ export default function App() {
         }}
         transition={{
           ...sizeTransition,
-          opacity: { duration: reducedMotion ? 0 : 0.2 },
+          opacity: { duration: 0.2 },
         }}
         className="notch-glow pointer-events-none absolute top-0 left-1/2 -translate-x-1/2"
       />
@@ -710,25 +698,13 @@ export default function App() {
             {charging && (
               <motion.div
                 key={activity.id}
-                initial={
-                  reducedMotion
-                    ? { opacity: 0 }
-                    : { opacity: 0, filter: "blur(8px)", scale: 0.95 }
-                }
-                animate={
-                  reducedMotion
-                    ? { opacity: 1 }
-                    : { opacity: 1, filter: "blur(0px)", scale: 1 }
-                }
-                exit={
-                  reducedMotion
-                    ? { opacity: 0, transition: chargerExit }
-                    : { opacity: 0, filter: "blur(6px)", transition: chargerExit }
-                }
+                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
+                animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                exit={{ opacity: 0, filter: "blur(6px)", transition: chargerExit }}
                 transition={chargerEnter}
                 className="notch-charging"
               >
-                <ChargingContent detail={activity.detail} instant={reducedMotion} />
+                <ChargingContent detail={activity.detail} />
               </motion.div>
             )}
           </AnimatePresence>
