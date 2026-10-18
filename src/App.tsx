@@ -7,48 +7,58 @@ import { listen } from "@tauri-apps/api/event";
  * Foundation prototype: an empty notch that opens, closes and settles cleanly.
  * No clock, no tabs, no widgets yet - those are layered on only once the
  * open/close motion is known to feel right.
+ *
+ * Two states, two sizes. Every future tab will reuse EXPANDED so the geometry
+ * never changes between tabs; varying sizes can be revisited later.
  */
-
-// Two states, two sizes. Every future tab will reuse EXPANDED so the geometry
-// never changes between tabs; varying sizes can be revisited later.
 const COLLAPSED = { width: 180, height: 32 };
 const EXPANDED = { width: 400, height: 180 };
 
-// Fixed canvas: the native window stays at EXPANDED and only the painted notch
-// animates, so there is no native resize racing the animation. Flip this to
-// false to instead grow/shrink the window around the animation (the window is
-// grown to the union box *before* the notch animates and shrunk only after the
-// closing animation settles).
-const FIXED_CANVAS = true;
+/** Must match the bottom corner radius used by the notch class below. */
+const CORNER = 22;
+/** Extra hit area under the notch so the drop shadow keeps its room. */
+const SHADOW_MARGIN = 20;
 
 const MORPH = { duration: 0.42, ease: [0.22, 1, 0.36, 1] as const };
 
 export default function App() {
   const [open, setOpen] = useState(false);
   // `wanted` is the user's intent; `open` is the rendered state. They differ
-  // only while the native resize is in flight, which is what lets a fast
-  // reverse cancel an in-progress open.
+  // only while a native call is in flight, which is what lets a fast reverse
+  // cancel an open that has not started animating yet.
   const wanted = useRef(false);
-  const resizeSeq = useRef(0);
 
-  const setWindowSize = useCallback(async (width: number, height: number) => {
-    const token = ++resizeSeq.current;
-    try {
-      await invoke("set_notch_size", { width, height });
-    } catch (err) {
-      console.error("set_notch_size failed:", err);
-    }
-    return token === resizeSeq.current;
-  }, []);
+  /**
+   * The native window always keeps the expanded size, so it never has to be
+   * resized mid-animation (a resize makes WebView2 re-create its surface and the
+   * notch blinks). Instead the *hit region* shrinks to the notch silhouette
+   * while collapsed, which is also what makes the surrounding area click-through.
+   */
+  const setHitRegion = useCallback(
+    async (which: "notch" | "full") => {
+      const size = which === "notch" ? COLLAPSED : { width: 0, height: 0 };
+      try {
+        await invoke("set_hit_region", {
+          width: size.width,
+          height: size.height,
+          radius: which === "notch" ? CORNER : 0,
+          margin: which === "notch" ? SHADOW_MARGIN : 0,
+        });
+      } catch (err) {
+        console.error("set_hit_region failed:", err);
+      }
+    },
+    [],
+  );
 
   const openPanel = useCallback(async () => {
     wanted.current = true;
-    if (!FIXED_CANVAS) {
-      await setWindowSize(EXPANDED.width, EXPANDED.height);
-      if (!wanted.current) return; // reversed while resizing
-    }
+    // Unclip before the notch starts growing, otherwise the region would crop
+    // the expanding panel.
+    await setHitRegion("full");
+    if (!wanted.current) return; // reversed while the call was in flight
     setOpen(true);
-  }, [setWindowSize]);
+  }, [setHitRegion]);
 
   const closePanel = useCallback(() => {
     wanted.current = false;
@@ -61,12 +71,17 @@ export default function App() {
   }, [closePanel, openPanel]);
 
   const handleSettled = useCallback(() => {
-    if (FIXED_CANVAS) return;
-    if (!wanted.current) void setWindowSize(COLLAPSED.width, COLLAPSED.height);
-  }, [setWindowSize]);
+    // Only once the closing animation is done is the notch small enough to
+    // shrink the hit region; doing it earlier would crop the animation.
+    if (!wanted.current) void setHitRegion("notch");
+  }, [setHitRegion]);
 
-  // Outside clicks come from the native low-level mouse hook: the window is
-  // WS_EX_NOACTIVATE and only notch-sized, so it never sees those clicks itself.
+  // Re-assert the collapsed hit area as soon as the webview is alive.
+  useEffect(() => {
+    void setHitRegion("notch");
+  }, [setHitRegion]);
+
+  // Outside clicks come from the native low-level mouse hook.
   useEffect(() => {
     let stop: (() => void) | undefined;
     let disposed = false;
@@ -84,19 +99,6 @@ export default function App() {
   useEffect(() => {
     void invoke("set_panel_open", { open }).catch(() => {});
   }, [open]);
-
-  // Debug probe: a click that reaches the webview outside the painted notch
-  // means the transparent canvas is swallowing desktop clicks. The title is
-  // readable from Win32, so it doubles as the assertion channel.
-  useEffect(() => {
-    const onDown = (event: MouseEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target?.dataset.notch) return;
-      document.title = `hit ${Math.round(event.clientX)},${Math.round(event.clientY)}`;
-    };
-    window.addEventListener("mousedown", onDown, true);
-    return () => window.removeEventListener("mousedown", onDown, true);
-  }, []);
 
   return (
     <div className="h-full w-full select-none bg-transparent">

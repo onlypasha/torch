@@ -1,7 +1,18 @@
 //! Windows notch overlay - foundation layer.
 //!
-//! This module owns everything native: window styling, positioning, the
-//! click-outside hook and the size command. UI behaviour lives in the webview.
+//! This module owns everything native: window styling, positioning, hit area,
+//! the click-outside hook and the size command. UI behaviour lives in the webview.
+//!
+//! A note on the window size: resizing the native window while its WebView2
+//! surface is re-created makes the notch blink for a couple of frames (measured
+//! on Windows 11, ~35 ms of blank). So the window keeps the *expanded* size for
+//! its whole life and the collapsed state is expressed as a window region
+//! instead: pixels outside the region are click-through, and changing the region
+//! never touches the webview surface.
+//!
+//! WebView2 also delivers mouse events over fully transparent pixels, so an
+//! unclipped window would quietly swallow desktop clicks over the whole
+//! top-centre block. The region is what prevents that.
 
 use tauri::{Manager, WebviewWindow};
 
@@ -9,6 +20,11 @@ use tauri::{Manager, WebviewWindow};
 /// the webview never has to think about DPI.
 const INITIAL_WIDTH: f64 = 400.0;
 const INITIAL_HEIGHT: f64 = 180.0;
+
+/// Startup hit area: must match COLLAPSED in src/App.tsx. The frontend re-asserts
+/// the same values as soon as it mounts, this is only so the window does not
+/// swallow clicks in the first few frames after launch.
+const INITIAL_NOTCH: (f64, f64, f64, f64) = (180.0, 32.0, 22.0, 20.0);
 
 #[cfg(target_os = "windows")]
 mod win {
@@ -53,16 +69,75 @@ mod win {
         use super::*;
         pub fn apply_styles(_window: &WebviewWindow) {}
     }
+
+    /// The hit area. Outside it the window is transparent to both painting and
+    /// the mouse, which is how the collapsed notch stops eating desktop clicks.
+    pub mod region {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Gdi::{
+            CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, HGDIOBJ, HRGN, RGN_OR,
+            SetWindowRgn,
+        };
+
+        /// Full window: used while the panel is open or animating, so nothing
+        /// the notch paints can ever be clipped.
+        pub fn clear(hwnd: HWND) {
+            unsafe {
+                // A null region restores the default rectangular hit area.
+                let _ = SetWindowRgn(hwnd, HRGN::default(), true);
+            }
+        }
+
+        /// The notch silhouette - square top corners (it hangs off the screen
+        /// edge), rounded bottom corners - grown downwards by `margin` so the
+        /// drop shadow still has room to render.
+        pub fn notch(
+            hwnd: HWND,
+            x: i32,
+            y: i32,
+            w: i32,
+            h: i32,
+            radius: i32,
+            margin: i32,
+        ) -> windows::core::Result<()> {
+            unsafe {
+                let straight = (h - radius).max(1);
+                let upper = CreateRectRgn(x, y, x + w, y + straight);
+                let lower = CreateRoundRectRgn(
+                    x,
+                    y + straight - radius,
+                    x + w + 1,
+                    y + h + margin + 1,
+                    radius * 2,
+                    radius * 2,
+                );
+
+                if upper.is_invalid() || lower.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(upper.0));
+                    let _ = DeleteObject(HGDIOBJ(lower.0));
+                    return Err(windows::core::Error::from_win32());
+                }
+
+                let _ = CombineRgn(upper, upper, lower, RGN_OR);
+                let _ = DeleteObject(HGDIOBJ(lower.0));
+
+                // SetWindowRgn takes ownership on success, so only free it if
+                // the call failed.
+                let applied = SetWindowRgn(hwnd, upper, true);
+                if applied == 0 {
+                    let _ = DeleteObject(HGDIOBJ(upper.0));
+                    return Err(windows::core::Error::from_win32());
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Position the window horizontally centred on its monitor and flush with the
 /// top edge. `width`/`height` are logical pixels.
 #[tauri::command]
 fn set_notch_size(window: WebviewWindow, width: f64, height: f64) -> Result<(), String> {
-    // Anything taller than the collapsed bar means the panel is open.
-    #[cfg(target_os = "windows")]
-    click_outside::set_panel_open(height > 40.0);
-
     let monitor = window
         .current_monitor()
         .map_err(|e| e.to_string())?
@@ -102,8 +177,53 @@ fn set_notch_size(window: WebviewWindow, width: f64, height: f64) -> Result<(), 
     Err("no hwnd".into())
 }
 
-/// The hook needs to know whether the panel is open; with a fixed canvas the
-/// size never changes, so the frontend reports the state directly.
+/// The hit area of the window. `width <= 0` means "whole window", which is what
+/// the panel needs while it is open or mid-animation. Values are logical pixels.
+#[tauri::command]
+fn set_hit_region(
+    window: WebviewWindow,
+    width: f64,
+    height: f64,
+    radius: f64,
+    margin: f64,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let hwnd = win::raw(&window).ok_or("no hwnd")?;
+
+        if width <= 0.0 || height <= 0.0 {
+            win::region::clear(hwnd);
+            return Ok(());
+        }
+
+        let scale = window.scale_factor().map_err(|e| e.to_string())?;
+        let inner = window.inner_size().map_err(|e| e.to_string())?;
+
+        // The notch is centred in the window, matching `left-1/2 -translate-x-1/2`.
+        let w = (width * scale).round() as i32;
+        let x = (inner.width as i32 - w) / 2;
+
+        return win::region::notch(
+            hwnd,
+            x,
+            0,
+            w,
+            (height * scale).round() as i32,
+            (radius * scale).round() as i32,
+            (margin * scale).round() as i32,
+        )
+        .map_err(|e| e.to_string());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, width, height, radius, margin);
+        Ok(())
+    }
+}
+
+/// The hook needs to know whether the panel is open, because the click-outside
+/// callback on the hook thread only has the atomics, not the webview.
 #[tauri::command]
 fn set_panel_open(open: bool) {
     #[cfg(target_os = "windows")]
@@ -112,10 +232,10 @@ fn set_panel_open(open: bool) {
     let _ = open;
 }
 
-// The window is WS_EX_NOACTIVATE and (with the fixed canvas) only as large as
-// the notch itself, so it never receives the clicks that land on other apps.
-// A low-level mouse hook is therefore the only reliable way to notice an
-// outside click and collapse the panel.
+// The window is WS_EX_NOACTIVATE and (with the collapsed hit region in place)
+// does not even see the clicks that land on other applications, so it cannot
+// notice an outside click by itself. A low-level mouse hook is therefore the
+// only reliable way to collapse the panel when the user clicks away.
 #[cfg(target_os = "windows")]
 mod click_outside {
     use std::sync::OnceLock;
@@ -222,9 +342,17 @@ pub fn run() {
             set_notch_size(window.clone(), INITIAL_WIDTH, INITIAL_HEIGHT)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
+            let (w, h, radius, margin) = INITIAL_NOTCH;
+            set_hit_region(window.clone(), w, h, radius, margin)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![set_notch_size, set_panel_open])
+        .invoke_handler(tauri::generate_handler![
+            set_notch_size,
+            set_hit_region,
+            set_panel_open
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
