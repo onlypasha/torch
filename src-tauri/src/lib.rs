@@ -11,7 +11,7 @@
 //!    keeps the expanded size for its whole life and never resizes.
 //! 2. The webview receives mouse events over fully transparent pixels, so an
 //!    unmodified collapsed window would quietly swallow desktop clicks across
-//!    the whole 400x180 block.
+//!    the whole window.
 //! 3. Neither a window region (`SetWindowRgn`) nor answering `WM_NCHITTEST`
 //!    restrains that: the region is ignored by Tauri's composition-based window
 //!    (painting and hit-testing both unchanged), and the parent window procedure
@@ -27,15 +27,18 @@
 use tauri::menu::{Menu, MenuItem};
 use tauri::{Manager, WebviewWindow};
 
-/// Sizes are given in logical pixels; the physical conversion happens here so
-/// the webview never has to think about DPI.
-const INITIAL_WIDTH: f64 = 400.0;
-const INITIAL_HEIGHT: f64 = 180.0;
+/// The window is deliberately larger than the expanded panel: the opening
+/// spring overshoots by ~4.5% of its travel (420x160 reaches roughly 430x166),
+/// and the window is never resized mid-animation, so that room has to exist
+/// from the start. The margins are transparent and, while the panel is open,
+/// they are what the hook treats as "outside".
+const INITIAL_WIDTH: f64 = 480.0;
+const INITIAL_HEIGHT: f64 = 220.0;
 
-/// Startup hit area: must match COLLAPSED in src/App.tsx. The frontend re-asserts
-/// the same values as soon as it mounts, this is only so the window does not
-/// swallow clicks in the first few frames after launch.
-const INITIAL_NOTCH: (f64, f64) = (180.0, 32.0);
+/// Startup silhouette: must match COLLAPSED in src/App.tsx. The frontend
+/// re-asserts the same values as soon as it mounts; this is only so the window
+/// does not swallow clicks in the first few frames after launch.
+const INITIAL_NOTCH: (f64, f64) = (200.0, 34.0);
 
 #[cfg(target_os = "windows")]
 mod win {
@@ -132,8 +135,10 @@ fn set_notch_size(window: WebviewWindow, width: f64, height: f64) -> Result<(), 
     Err("no hwnd".into())
 }
 
-/// Geometry of the collapsed notch, in physical pixels. The hook needs it to
-/// recognise a click on the notch while the whole window is click-through.
+/// Geometry of the current notch silhouette, in physical pixels. The hook needs
+/// it both to recognise a click on the collapsed notch (while the whole window
+/// is click-through) and to tell a click inside the open panel from a click
+/// that should close it.
 #[cfg(target_os = "windows")]
 mod notch_geometry {
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -152,8 +157,8 @@ mod notch_geometry {
         COLLAPSED.load(Ordering::Relaxed)
     }
 
-    /// Screen-space rect of the collapsed notch: centred horizontally in the
-    /// window and flush with its top edge, matching the webview layout.
+    /// Screen-space rect of the silhouette: centred horizontally in the window
+    /// and flush with its top edge, matching the webview layout.
     pub fn rect(window: &windows::Win32::Foundation::RECT) -> (i32, i32, i32, i32) {
         let width = WIDTH.load(Ordering::Relaxed);
         let height = HEIGHT.load(Ordering::Relaxed);
@@ -163,33 +168,32 @@ mod notch_geometry {
     }
 }
 
-/// Restrict or release the click-through state. `width <= 0` means the panel is
-/// open (or animating), so the whole window must accept input again. Values are
-/// logical pixels.
+/// Tell the native side which silhouette is currently on screen, in logical
+/// pixels, and whether the window should be click-through. Collapsed is
+/// click-through (the hook feeds the webview the clicks instead); expanded
+/// keeps the whole window interactive.
 #[tauri::command]
-fn set_notch_hit(window: WebviewWindow, width: f64, height: f64) -> Result<(), String> {
+fn set_notch_hit(
+    window: WebviewWindow,
+    width: f64,
+    height: f64,
+    click_through: bool,
+) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        let collapsing = width > 0.0 && height > 0.0;
-
-        if collapsing {
-            let scale = window.scale_factor().map_err(|e| e.to_string())?;
-            notch_geometry::set(
-                true,
-                (width * scale).round() as i32,
-                (height * scale).round() as i32,
-            );
-        } else {
-            notch_geometry::set(false, 0, 0);
-        }
-
-        win::set_click_through(&window, collapsing);
+        let scale = window.scale_factor().map_err(|e| e.to_string())?;
+        notch_geometry::set(
+            click_through,
+            (width * scale).round() as i32,
+            (height * scale).round() as i32,
+        );
+        win::set_click_through(&window, click_through);
         return Ok(());
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (window, width, height);
+        let _ = (window, width, height, click_through);
         Ok(())
     }
 }
@@ -269,15 +273,6 @@ mod mouse_hook {
         }
     }
 
-    /// True when the point is inside the collapsed notch silhouette.
-    fn inside_collapsed_notch(rect: &RECT, x: i32, y: i32) -> bool {
-        if !super::notch_geometry::is_collapsed() {
-            return false;
-        }
-        let (nl, nt, nr, nb) = super::notch_geometry::rect(rect);
-        x >= nl && x < nr && y >= nt && y < nb
-    }
-
     /// Runs on the hook thread.
     unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code >= 0 && !MENU_OPEN.load(Ordering::Relaxed) {
@@ -287,17 +282,20 @@ mod mouse_hook {
                 if let Some(info) = unsafe { (lparam.0 as *const MSLLHOOKSTRUCT).as_ref() } {
                     let POINT { x, y } = info.pt;
                     if let Some(rect) = window_rect() {
+                        // The silhouette is the panel while it is open and the
+                        // notch bar while it is collapsed, so one rect answers
+                        // both questions.
+                        let (pl, pt, pr, pb) = super::notch_geometry::rect(&rect);
+                        let inside = x >= pl && x < pr && y >= pt && y < pb;
+
                         if OPEN.load(Ordering::Relaxed) {
-                            // The panel is interactive, so only a click outside
-                            // it matters - and that one is never swallowed.
-                            let inside = x >= rect.left
-                                && x < rect.right
-                                && y >= rect.top
-                                && y < rect.bottom;
+                            // The window has transparent margins for the spring
+                            // overshoot, so "outside the window" is not the same
+                            // as "outside the panel".
                             if !inside {
                                 notify(Signal::Outside);
                             }
-                        } else if inside_collapsed_notch(&rect, x, y) {
+                        } else if super::notch_geometry::is_collapsed() && inside {
                             // The collapsed window is click-through, so this
                             // click never reaches the webview: swallow it so it
                             // does not reach the window below either. A right
@@ -430,11 +428,7 @@ pub fn run() {
                 let (w, h) = INITIAL_NOTCH;
                 win::set_click_through(&window, true);
                 let scale = window.scale_factor().unwrap_or(1.0);
-                notch_geometry::set(
-                    true,
-                    (w * scale).round() as i32,
-                    (h * scale).round() as i32,
-                );
+                notch_geometry::set(true, (w * scale).round() as i32, (h * scale).round() as i32);
             }
 
             Ok(())

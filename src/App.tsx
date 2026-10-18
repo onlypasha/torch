@@ -1,20 +1,47 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { motion } from "motion/react";
+import { AnimatePresence, motion } from "motion/react";
+import type { Transition } from "motion/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /**
- * Foundation prototype: an empty notch that opens, closes and settles cleanly.
- * No clock, no tabs, no widgets yet - those are layered on only once the
- * open/close motion is known to feel right.
+ * Foundation prototype: a notch that opens, closes and settles cleanly.
  *
  * Two states, two sizes. Every future tab will reuse EXPANDED so the geometry
- * never changes between tabs; varying sizes can be revisited later.
+ * never changes between tabs, and both the size and the bottom corner radius
+ * run off the same spring.
  */
-const COLLAPSED = { width: 180, height: 32 };
-const EXPANDED = { width: 400, height: 180 };
+const COLLAPSED = { width: 200, height: 34, radius: 14 };
+const EXPANDED = { width: 420, height: 160, radius: 28 };
 
-const MORPH = { duration: 0.42, ease: [0.22, 1, 0.36, 1] as const };
+/**
+ * Spring Expand / Spring Collapse from the spec.
+ *
+ * Spring Expand (stiffness 380, damping 26, mass 0.9) is underdamped - damping
+ * ratio ~0.70 - so it overshoots by about 4.5% of the distance travelled:
+ * opening measures 420 wide at rest but peaks near 430, and 160 tall peaking
+ * near 166. That overshoot is why the window keeps transparent margins.
+ *
+ * Spring Collapse (stiffness 500, damping 40) has a ratio of ~0.89, i.e. the
+ * damping table's "almost no bounce". Measured, the close settles flat with no
+ * visible springback. That is what the spec asked for; if a livelier close is
+ * ever wanted, damping 26-30 on this spring is the knob.
+ */
+const SPRING_OPEN: Transition = {
+  type: "spring",
+  stiffness: 380,
+  damping: 26,
+  mass: 0.9,
+};
+const SPRING_CLOSE: Transition = { type: "spring", stiffness: 500, damping: 40 };
+
+/**
+ * Content Blur Fade-In / Content Blur Fade-Out. The fade-in starts 80ms after
+ * the press so the panel has already opened up behind it; the fade-out is
+ * deliberately quick, because the panel is shrinking under it at the same time.
+ */
+const CONTENT_ENTER: Transition = { duration: 0.25, delay: 0.08, ease: "easeOut" };
+const CONTENT_EXIT: Transition = { duration: 0.12 };
 
 export default function App() {
   const [open, setOpen] = useState(false);
@@ -24,31 +51,34 @@ export default function App() {
   const wanted = useRef(false);
 
   /**
-   * The native window always keeps the expanded size, so it never has to be
-   * resized mid-animation (a resize makes WebView2 re-create its surface and the
-   * notch blinks). Collapsed therefore means "click-through": while the notch is
-   * small the whole window ignores the mouse, and a low-level hook is what
-   * notices - and swallows - a click on the notch itself.
+   * The native window keeps one size for its whole life - a resize makes
+   * WebView2 re-create its surface and the notch blinks - so it is larger than
+   * the panel and leaves room for the spring's overshoot. Collapsed means
+   * "click-through": the window ignores the mouse and a low-level hook notices
+   * (and swallows) clicks on the notch itself, while expanded keeps the whole
+   * window interactive.
+   *
+   * The silhouette is handed to the native side in both states, because that
+   * is what the hook uses to tell "inside the panel" from "clicked away".
    */
-  const setHitArea = useCallback(
-    async (which: "notch" | "full") => {
-      try {
-        await invoke("set_notch_hit", {
-          width: which === "notch" ? COLLAPSED.width : 0,
-          height: which === "notch" ? COLLAPSED.height : 0,
-        });
-      } catch (err) {
-        console.error("set_notch_hit failed:", err);
-      }
-    },
-    [],
-  );
+  const setHitArea = useCallback(async (state: "collapsed" | "expanded") => {
+    const size = state === "collapsed" ? COLLAPSED : EXPANDED;
+    try {
+      await invoke("set_notch_hit", {
+        width: size.width,
+        height: size.height,
+        clickThrough: state === "collapsed",
+      });
+    } catch (err) {
+      console.error("set_notch_hit failed:", err);
+    }
+  }, []);
 
   const openPanel = useCallback(async () => {
     wanted.current = true;
     // Stop passing clicks through before the notch starts growing, otherwise
     // the panel would be click-through while it animates in.
-    await setHitArea("full");
+    await setHitArea("expanded");
     if (!wanted.current) return; // reversed while the call was in flight
     setOpen(true);
   }, [setHitArea]);
@@ -84,15 +114,15 @@ export default function App() {
   }, []);
 
   const handleSettled = useCallback(() => {
-    // Only once the closing animation is done is the notch small enough to
-    // shrink the hit area; doing it earlier would make the shrinking panel
-    // click-through mid-flight.
-    if (!wanted.current) void setHitArea("notch");
+    // Only once the closing spring has come to rest is the notch small enough
+    // to hand the mouse back to the desktop; doing it earlier would make the
+    // shrinking panel click-through mid-flight.
+    if (!wanted.current) void setHitArea("collapsed");
   }, [setHitArea]);
 
-  // Re-assert the collapsed hit area as soon as the webview is alive.
+  // Re-assert the collapsed state as soon as the webview is alive.
   useEffect(() => {
-    void setHitArea("notch");
+    void setHitArea("collapsed");
   }, [setHitArea]);
 
   // Outside clicks come from the native low-level mouse hook.
@@ -155,8 +185,10 @@ export default function App() {
         animate={{
           width: open ? EXPANDED.width : COLLAPSED.width,
           height: open ? EXPANDED.height : COLLAPSED.height,
+          borderBottomLeftRadius: open ? EXPANDED.radius : COLLAPSED.radius,
+          borderBottomRightRadius: open ? EXPANDED.radius : COLLAPSED.radius,
         }}
-        transition={MORPH}
+        transition={open ? SPRING_OPEN : SPRING_CLOSE}
         onAnimationComplete={handleSettled}
         onMouseDown={(event) => {
           if (event.button !== 0) return;
@@ -173,8 +205,26 @@ export default function App() {
           event.preventDefault();
           pressNotch();
         }}
-        className="absolute top-0 left-1/2 -translate-x-1/2 rounded-b-[22px] bg-[#1c1c1c] outline-none focus-visible:ring-1 focus-visible:ring-white/40"
-      />
+        className="absolute top-0 left-1/2 -translate-x-1/2 overflow-hidden bg-[#1c1c1c] outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+      >
+        {/* Placeholder only: the clock and the tabs replace this next. */}
+        <AnimatePresence>
+          {open && (
+            <motion.div
+              key="content"
+              initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
+              animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+              exit={{ opacity: 0, filter: "blur(6px)", transition: CONTENT_EXIT }}
+              transition={CONTENT_ENTER}
+              className="flex h-full w-full items-center justify-center"
+            >
+              <span className="text-xs font-medium tracking-wide text-white/45">
+                Panel content
+              </span>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </motion.div>
     </div>
   );
 }
