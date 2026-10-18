@@ -51,34 +51,6 @@ const INITIAL_NOTCH: (f64, f64) = (200.0, 34.0);
 #[cfg(target_os = "windows")]
 mod activity;
 
-/// The charger's state, shared by the `notch-power` event that keeps the dot on
-/// the bar alive and by the `power_state` command the webview calls when it
-/// mounts. It lives here rather than inside the Windows-only `activity` module so
-/// the command keeps one signature on every target.
-#[derive(Clone, serde::Serialize)]
-pub struct PowerState {
-    pub plugged: bool,
-    /// Already formatted for display, as `"79%"`, or empty when Windows will not
-    /// say - which is what a desktop with no battery reports.
-    pub percentage: String,
-}
-
-/// The charger's state right now. The watcher reports every *change* on its own,
-/// but its first poll can happen before the webview has a listener, and a machine
-/// that was already charging would then keep its dot hidden until the cable
-/// moved again. The webview asks once on mount and listens after that.
-#[tauri::command]
-fn power_state() -> Option<PowerState> {
-    #[cfg(target_os = "windows")]
-    {
-        activity::power_snapshot()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        None
-    }
-}
-
 #[cfg(target_os = "windows")]
 mod win {
     pub use platform_impl::*;
@@ -631,8 +603,7 @@ pub fn run() {
             set_notch_hit,
             set_panel_open,
             set_notch_hidden,
-            show_notch_menu,
-            power_state
+            show_notch_menu
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

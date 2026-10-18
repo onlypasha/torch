@@ -27,8 +27,6 @@ use std::mem::size_of;
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter};
-
-use crate::PowerState;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_PRESENT, GUID_DEVCLASS_USB, HDEVINFO, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
     SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
@@ -53,11 +51,6 @@ use windows::core::PCWSTR;
 
 /// Event the webview listens on. The payload is `{ kind, detail }`.
 pub const ACTIVITY_EVENT: &str = "notch-activity";
-
-/// Event carrying the charger's *state* rather than a one-off arrival. It is what
-/// keeps the green dot on the collapsed bar, so unlike `ACTIVITY_EVENT` it is
-/// sent whenever the state is read, not only when the cable moves.
-pub const POWER_EVENT: &str = "notch-power";
 
 const POWER_PERIOD: Duration = Duration::from_millis(1000);
 const NETWORK_PERIOD: Duration = Duration::from_millis(2000);
@@ -139,45 +132,31 @@ impl<T: Default> Tracker<T> {
 // Power
 // ---------------------------------------------------------------------------
 
-/// The charger's state, kept apart from the arrival: the dot on the bar is not an
-/// event that comes and goes, it is there for as long as the cable is.
-fn emit_power(app: &AppHandle, state: &PowerState) {
-    if let Err(err) = app.emit(POWER_EVENT, state.clone()) {
-        eprintln!("emitting the charger state failed: {err}");
-    }
-}
-
 fn watch_power(app: AppHandle) {
     let mut plugged = Tracker::new();
 
     loop {
-        if let Some(state) = power_snapshot() {
-            let first = !plugged.seeded;
-            let changed = plugged.changed(state.plugged);
-
-            // The first poll is the baseline. Nothing is *announced* (the machine
-            // may well have been charging since before the app started) but the
-            // state is, so the dot can appear without the arrival animation.
-            if first || changed {
-                emit_power(&app, &state);
-            }
-            if changed {
-                let kind = if state.plugged {
-                    "power-connected"
-                } else {
-                    "power-disconnected"
-                };
-                emit(&app, kind, state.percentage);
-            }
+        if let Some(status) = power_status()
+            && plugged.changed(status.plugged)
+        {
+            let kind = if status.plugged {
+                "power-connected"
+            } else {
+                "power-disconnected"
+            };
+            emit(&app, kind, status.percentage);
         }
         std::thread::sleep(POWER_PERIOD);
     }
 }
 
-/// What Windows will say about the charger right now. `None` means "no news",
-/// which is also the answer for a machine whose line status Windows will not
-/// report.
-pub fn power_snapshot() -> Option<PowerState> {
+struct PowerStatus {
+    plugged: bool,
+    /// Already formatted for display, or empty when Windows will not say.
+    percentage: String,
+}
+
+fn power_status() -> Option<PowerStatus> {
     let mut status = SYSTEM_POWER_STATUS::default();
     unsafe { GetSystemPowerStatus(&mut status).ok()? };
 
@@ -195,7 +174,7 @@ pub fn power_snapshot() -> Option<PowerState> {
         _ => String::new(),
     };
 
-    Some(PowerState {
+    Some(PowerStatus {
         plugged,
         percentage,
     })

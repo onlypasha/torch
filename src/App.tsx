@@ -73,9 +73,6 @@ type ActivityKind =
 type ActivityEvent = { kind: ActivityKind; detail: string };
 type Activity = ActivityEvent & { id: number };
 
-/** The charger's state; mirrors `PowerState` in src-tauri. */
-type PowerState = { plugged: boolean; percentage: string };
-
 const ACTIVITY_MS = 3000;
 /**
  * The charger gets longer than the rest: it has an animation to play - the bolt
@@ -268,30 +265,6 @@ function ChargingContent({
   );
 }
 
-/**
- * The charger's *state*, not an arrival: this dot is on the bar for as long as
- * the cable is in - including when the app starts with the charger already
- * attached, where nothing is announced - and it blinks slowly while it is there.
- */
-function ChargingDot({ instant }: { instant: boolean }) {
-  return (
-    <motion.span
-      aria-hidden="true"
-      className="notch-charging-dot"
-      initial={instant ? false : { scale: 0 }}
-      animate={{ scale: 1, opacity: instant ? 1 : [1, 0.35, 1] }}
-      transition={{
-        scale: instant
-          ? { duration: 0 }
-          : { type: "spring", stiffness: 500, damping: 28 },
-        opacity: instant
-          ? { duration: 0 }
-          : { duration: 1.8, repeat: Infinity, ease: "easeInOut", delay: 0.4 },
-      }}
-    />
-  );
-}
-
 export default function App() {
   const [open, setOpen] = useState(false);
   const [time, setTime] = useState(() => formatClock(new Date()));
@@ -302,9 +275,6 @@ export default function App() {
   // Activities are queued and shown one at a time, oldest first.
   const [activities, setActivities] = useState<Activity[]>([]);
   const nextActivityId = useRef(0);
-  // The charger's state, deliberately *outside* the queue: the dot on the bar is
-  // not an event that comes and goes, and a queued indicator must not delay it.
-  const [plugged, setPlugged] = useState(false);
   // Set between the charger's bar shrinking and the next indicator taking over.
   const [settling, setSettling] = useState(false);
   // `wanted` is the user's intent; `open` is the rendered state. They differ
@@ -515,32 +485,6 @@ export default function App() {
     };
   }, []);
 
-  // The charger's *state*, which is what keeps the dot on the bar. Asking for it
-  // on mount matters: native's first poll can beat this listener, and a machine
-  // that was already charging would then have no dot until the cable moved.
-  const sawPowerEvent = useRef(false);
-  useEffect(() => {
-    let stop: (() => void) | undefined;
-    let disposed = false;
-    void listen<PowerState>("notch-power", (event) => {
-      sawPowerEvent.current = true;
-      setPlugged(event.payload.plugged);
-    }).then((unlisten) => {
-      if (disposed) unlisten();
-      else stop = unlisten;
-    });
-    void invoke<PowerState | null>("power_state")
-      .then((state) => {
-        // Anything that arrived while the call was in flight is newer news.
-        if (state && !sawPowerEvent.current) setPlugged(state.plugged);
-      })
-      .catch((err) => console.error("power_state failed:", err));
-    return () => {
-      disposed = true;
-      stop?.();
-    };
-  }, []);
-
   /**
    * One activity at a time, then the next. The timer only runs while the
    * activity is actually on screen: opening the panel pauses it, so an indicator
@@ -740,12 +684,8 @@ export default function App() {
                   animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
                   exit={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
                   transition={{ duration: 0.18, ease: "easeOut" }}
-                  className="flex items-center"
                 >
                   {time}
-                  {/* Only ever on the bar itself: an activity takes the clock's
-                      place, and the dot goes with it. */}
-                  {plugged && <ChargingDot instant={reducedMotion} />}
                 </motion.div>
               )}
             </AnimatePresence>

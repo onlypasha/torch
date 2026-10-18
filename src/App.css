@@ -233,17 +233,6 @@ body,
   }
 }
 
-/* The charger's state, on the bar itself: a dot beside the clock for as long as
-   the cable is in, whether or not anything was just announced. */
-.notch-charging-dot {
-  width: 7px;
-  height: 7px;
-  margin-left: 6px;
-  flex: none;
-  border-radius: 9999px;
-  background: #34d399;
-}
-
 /* The shimmer is the one piece of the arrival that moves on its own in CSS; the
    rest of the reduced-motion handling sits where those parts are rendered. */
 @media (prefers-reduced-motion: reduce) {
