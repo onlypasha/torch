@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="id">
+  <head><meta charset="UTF-8" /><title>Notch panel tabs test</title></head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import "./mock-native.js";
+      await import("../src/main.tsx");
+      const { runPanelScenario } = await import("./panel-ui-probe.js");
+      window.runPanelScenario = runPanelScenario;
+    </script>
+  </body>
+</html>
