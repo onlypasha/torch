@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="id">
+  <head><meta charset="UTF-8" /><title>Notch Nook test</title></head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import "./mock-native.js";
+      await import("../src/main.tsx");
+      const { runNookScenario } = await import("./nook-ui-probe.js");
+      window.runNookScenario = runNookScenario;
+    </script>
+  </body>
+</html>

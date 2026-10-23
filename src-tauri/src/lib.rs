@@ -33,13 +33,16 @@
 use tauri::menu::{Menu, MenuItem};
 use tauri::{Manager, WebviewWindow};
 
-/// The window is deliberately larger than the expanded panel: the opening
-/// spring overshoots by ~4.5% of its travel (420x160 reaches roughly 430x166),
+/// The window is deliberately larger than the widest panel: the opening
+/// spring overshoots by ~4.5% of its travel - the 520x236 tab panel peaks near
+/// 543, and the Nook's pinned column will widen it to 642 (~671 at the peak) -
 /// and the window is never resized mid-animation, so that room has to exist
 /// from the start. The margins are transparent and, while the panel is open,
-/// they are what the hook treats as "outside".
-const INITIAL_WIDTH: f64 = 480.0;
-const INITIAL_HEIGHT: f64 = 220.0;
+/// they are what the hook treats as "outside". Sized once for the 642 panel
+/// (700 logical) so no later step needs a resize and the blinking surface
+/// re-creation it would cause.
+const INITIAL_WIDTH: f64 = 700.0;
+const INITIAL_HEIGHT: f64 = 320.0;
 
 /// Startup silhouette: must match COLLAPSED in src/App.tsx. The frontend
 /// re-asserts the same values as soon as it mounts; this is only so the window
@@ -50,6 +53,9 @@ const INITIAL_NOTCH: (f64, f64) = (200.0, 34.0);
 /// raise for the webview to display in place of the clock.
 #[cfg(target_os = "windows")]
 mod activity;
+
+#[cfg(target_os = "windows")]
+mod media;
 
 #[cfg(target_os = "windows")]
 mod win {
@@ -562,6 +568,20 @@ fn show_notch_menu(window: WebviewWindow) -> Result<(), String> {
     shown.map_err(|e| e.to_string())
 }
 
+/// The webview's media transport buttons. The worker owns the WinRT session and
+/// runs the action on its own apartment, then polls again immediately.
+#[tauri::command]
+fn media_control(control: tauri::State<'_, media::Control>, action: String) -> Result<(), String> {
+    media::command(&control, &action)
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn media_control(action: String) -> Result<(), String> {
+    let _ = action;
+    Err("media control is Windows-only".into())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -581,6 +601,7 @@ pub fn run() {
                 mouse_hook::install(app.handle());
                 autohide::install(app.handle());
                 activity::install(app.handle());
+                app.manage(media::install(app.handle().clone()));
             }
 
             // Place it top-centre immediately so the first frames are already
@@ -603,6 +624,7 @@ pub fn run() {
             set_notch_hit,
             set_panel_open,
             set_notch_hidden,
+            media_control,
             show_notch_menu
         ])
         .run(tauri::generate_context!())

@@ -1,9 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { AnimatePresence, motion } from "motion/react";
-import type { Transition } from "motion/react";
+import { AnimatePresence, motion } from "framer-motion";
+import type { Transition } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  foldUsb,
+  isUsbKind,
+  USB_READING_MS,
+  USB_READY_MS,
+  USB_REMOVED_MS,
+  USB_TIMEOUT_MS,
+} from "./usb";
+import type { UsbPayload, UsbState, UsbPhase } from "./usb";
+import { UsbContent } from "./UsbContent";
+import { BluetoothContent } from "./BluetoothContent";
+import { Panel } from "./Panel";
+import { BT_CONNECTING_MS, BT_CONNECTED_MS, foldBluetooth, isBluetoothKind } from "./bluetooth";
+import type { BluetoothPayload, BluetoothState } from "./bluetooth";
 
 /**
  * Foundation prototype: a notch that opens, closes and settles cleanly.
@@ -19,7 +33,13 @@ const COLLAPSED = { width: 200, height: 34, radius: 14, ear: 6 };
  * rounder to match. The main panel is not involved.
  */
 const TALL = { width: 300, height: 52, radius: 24, ear: 14 };
-const EXPANDED = { width: 420, height: 160, radius: 28, ear: 14 };
+/**
+ * The open panel: four tabs (see `Panel.tsx`). The Nook widens it by exactly
+ * the pinned column (112) plus its gap (10) once a widget is pinned there; the
+ * tab bar and the other tabs keep the 520 shape.
+ */
+const EXPANDED = { width: 520, height: 236, radius: 28, ear: 14 };
+const EXPANDED_WIDE = { width: 642, height: 236, radius: 28, ear: 14 };
 
 /**
  * The three shapes the bar can be in. The destination is what picks the spring -
@@ -60,7 +80,14 @@ const SPRING_CLOSE: Transition = { type: "spring", stiffness: 500, damping: 40 }
  * deliberately quick, because the panel is shrinking under it at the same time.
  */
 const CONTENT_ENTER: Transition = { duration: 0.25, delay: 0.08, ease: "easeOut" };
-const CONTENT_EXIT: Transition = { duration: 0.12 };
+
+/**
+ * The open panel's own body follows the tabs spec: a slightly later, slightly
+ * smaller entrance than the indicators' (delay 0.1s, scale 0.97) and the same
+ * quick blurred exit.
+ */
+const PANEL_ENTER: Transition = { duration: 0.25, delay: 0.1, ease: "easeOut" };
+const PANEL_EXIT: Transition = { duration: 0.12 };
 
 /**
  * The idle clock: `HH:mm`, 24-hour local time, exactly as the WPF original
@@ -71,9 +98,8 @@ const formatClock = (date: Date) =>
   `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 
 /**
- * Activity indicators: the charger, a network, a Bluetooth device, a USB
- * device. Native detects them (see `activity.rs`) and each one takes the
- * clock's place for three seconds, in turn, before the clock comes back.
+ * Native detects activity (see `activity.rs`); each source takes the clock's
+ * place in turn. USB, Bluetooth and networks have phases; power has a dwell.
  */
 type ActivityKind =
   | "power-connected"
@@ -98,10 +124,12 @@ type WireKind =
   | "ethernet-connected"
   | "ethernet-lost";
 
-/** The plain row: everything that does not take the whole bar. */
-type RowKind = "bluetooth-connected" | "usb-connected" | "usb-disconnected";
-
-type WireEvent = { kind: WireKind; detail: string };
+type WireEvent = {
+  kind: WireKind | "usb-ready" | "bluetooth-updated" | "bluetooth-disconnected";
+  detail: string;
+  usb?: UsbPayload;
+  bluetooth?: BluetoothPayload;
+};
 
 /** Which network an activity is about. */
 type NetKind = "wifi" | "ethernet";
@@ -128,9 +156,10 @@ type Activity = {
   kind: ActivityKind;
   detail: string;
   net?: Network;
+  usb?: UsbState;
+  bluetooth?: BluetoothState;
 };
 
-const ACTIVITY_MS = 3000;
 /**
  * How long each of the tall indicators holds the bar, counted from the first
  * frame of its arrival - the same way the charger's own clock has always run.
@@ -223,38 +252,6 @@ const LOW_BATTERY = 20;
 const BOLT_PATH = "M12.6 2.4 5.2 13.4h5.9l-.5 8.2 8.6-11.3h-6.3z";
 
 /**
- * How each plain event presents itself. The wording is the part that does not
- * come from the machine; `detail` is the device name.
- *
- * The power events are not here at all any more: both take the whole bar, each
- * with a shape of its own - the arrival with its drawn bolt and counting level
- * (see `ChargingContent`), the unplug notice with the same bolt going out (see
- * `UnpluggedContent`). The networks have a layer of their own too (see
- * `NetworkContent`).
- */
-const ROW: Record<RowKind, { text: (detail: string) => string; glyph?: string }> = {
-  "bluetooth-connected": {
-    glyph: "\uE702",
-    text: (detail) =>
-      detail ? `Bluetooth · ${detail}` : "Bluetooth terhubung",
-  },
-  "usb-connected": {
-    glyph: "\uE88E",
-    text: (detail) => (detail ? `USB · ${detail}` : "USB terhubung"),
-  },
-  "usb-disconnected": {
-    glyph: "\uE88E",
-    text: (detail) => (detail ? `${detail} dilepas` : "USB dilepas"),
-  },
-};
-
-/** Whether the clock's row is what this activity is drawn in. */
-const isRow = (kind: ActivityKind): kind is RowKind =>
-  kind === "bluetooth-connected" ||
-  kind === "usb-connected" ||
-  kind === "usb-disconnected";
-
-/**
  * The network an activity is about, if it is one. Narrowing the kind here is what
  * tells the rest of the file which of the two tall indicators it is looking at.
  */
@@ -278,9 +275,9 @@ function replace(
 }
 
 /**
- * The queue. Everything queues one activity per event, except the networks: a
- * connection arrives as two or three events, and they are all one indicator that
- * changes phase rather than several that show up one after another.
+ * Networks and USB fold several native events into one activity with phases.
+ * USB additionally uses an attachment identity so removal cancels only its own
+ * arrival, including one still waiting behind another indicator.
  *
  * `open` decides whether a link that is already up counts as old news. If the
  * notch was busy - the panel open, another indicator ahead - then the connection
@@ -294,6 +291,16 @@ function enqueue(
   open: boolean,
   nextId: number,
 ): Activity[] {
+  if (isBluetoothKind(event.kind)) {
+    if (!event.bluetooth?.deviceId) return queue;
+    return foldBluetooth(queue, { ...event, kind: event.kind, bluetooth: event.bluetooth }, nextId);
+  }
+  if (isUsbKind(event.kind)) {
+    // USB metadata/removals must carry the same native attachment identity.
+    // Reject malformed replies instead of associating two equal product names.
+    if (!event.usb?.deviceId) return queue;
+    return foldUsb(queue, { ...event, kind: event.kind, usb: event.usb }, nextId);
+  }
   const wire = NETWORK_WIRE[event.kind];
   if (wire === undefined) {
     return [
@@ -802,6 +809,9 @@ export default function App() {
   const nextActivityId = useRef(0);
   // Set between the charger's bar shrinking and the next indicator taking over.
   const [settling, setSettling] = useState(false);
+  // The Nook reports whether its pinned column is showing; the open panel's
+  // width follows it without ever resizing the native window.
+  const [wide, setWide] = useState(false);
   // `wanted` is the user's intent; `open` is the rendered state. They differ
   // only while a native call is in flight, which is what lets a fast reverse
   // cancel an open that has not started animating yet.
@@ -815,22 +825,15 @@ export default function App() {
   // While the panel is open the indicator waits rather than interrupting: it
   // lives on the collapsed bar, so showing it would mean closing what the user
   // just opened. The queue is held, not dropped.
-  const showingActivity = activity !== undefined && !open;
-  // The tall indicators all take the whole bar rather than the clock's row: the
-  // charger's arrival, the notice that the cable has come out, and a network
-  // coming up. Everything else stays on the small bar.
+  const showingActivity = activity !== undefined && !open && !settling;
+  // All activity sources now take the tall bar; only the idle clock is small.
   const charging = showingActivity && activity.kind === "power-connected";
   const unplugged = showingActivity && activity.kind === "power-disconnected";
   const network =
     showingActivity && activity !== undefined ? networkOf(activity) : undefined;
-  const tall = charging || unplugged || network !== undefined;
-  // What the clock's row shows. The tall indicators are not part of it - they
-  // have layers of their own - and while the bar is settling after one, nothing
-  // is.
-  const rowActivity =
-    showingActivity && !settling && !tall && activity !== undefined && isRow(activity.kind)
-      ? activity
-      : undefined;
+  const usb = showingActivity ? activity.usb : undefined;
+  const bluetooth = showingActivity ? activity.bluetooth : undefined;
+  const tall = charging || unplugged || network !== undefined || usb !== undefined || bluetooth !== undefined;
   // An indicator is worth showing even when autohide would have hidden the
   // notch; once it has had its turn the autohide state takes over again.
   // Reporting it as *visible* to native matters: the hook then treats it as a
@@ -852,7 +855,11 @@ export default function App() {
    * what the hook uses to tell "inside the notch" from "clicked away". A hidden
    * bar has no indicator on it, so hiding only ever applies to the small one.
    */
-  const silhouette = bar === "bar" && hidden ? { ...COLLAPSED, height: 0 } : BAR_SIZES[bar];
+  const silhouette = bar === "bar" && hidden
+    ? { ...COLLAPSED, height: 0 }
+    : bar === "panel" && wide
+      ? EXPANDED_WIDE
+      : BAR_SIZES[bar];
 
   /**
    * The bar always springs between its shapes: growing into the panel or into the
@@ -887,6 +894,26 @@ export default function App() {
       console.error("set_notch_hit failed:", err);
     }
   }, []);
+
+  /**
+   * The Nook's pinned column changes the open panel's width from 520 to 642.
+   * The silhouette animates, and the native hit rect has to follow it or the
+   * column would look like "outside" to the mouse hook and close the panel.
+   */
+  const handlePanelWide = useCallback((next: boolean) => setWide(next), []);
+
+  useEffect(() => {
+    if (!open) {
+      if (wide) setWide(false);
+      return;
+    }
+    const size = wide ? EXPANDED_WIDE : EXPANDED;
+    void invoke("set_notch_hit", {
+      width: size.width,
+      height: size.height,
+      clickThrough: false,
+    }).catch((err) => console.error("set_notch_hit failed:", err));
+  }, [open, wide]);
 
   const openPanel = useCallback(async () => {
     wanted.current = true;
@@ -1000,10 +1027,10 @@ export default function App() {
     let disposed = false;
     void listen<WireEvent>("notch-activity", (event) => {
       const id = nextActivityId.current++;
+      // The bound applies to new arrivals, not metadata/removals for an existing
+      // attachment. A full queue must never swallow a cancellation.
       setActivities((queue) =>
-        queue.length >= ACTIVITY_QUEUE_MAX
-          ? queue
-          : enqueue(queue, event.payload, openRef.current, id),
+        enqueue(queue, event.payload, openRef.current, id).slice(0, ACTIVITY_QUEUE_MAX),
       );
     }).then((unlisten) => {
       if (disposed) unlisten();
@@ -1042,6 +1069,19 @@ export default function App() {
     );
   }, []);
 
+  const advanceUsb = useCallback((id: number, phase: UsbPhase) => {
+    setActivities((queue) => queue.map((item) =>
+      item.id === id && item.usb ? { ...item, usb: { ...item.usb, phase } } : item,
+    ));
+  }, []);
+
+  const advanceBluetooth = useCallback((id: number) => {
+    setActivities((queue) => queue.map((item) =>
+      item.id === id && item.bluetooth?.phase === "connecting"
+        ? { ...item, bluetooth: { ...item.bluetooth, phase: "connected" } } : item,
+    ));
+  }, []);
+
   /**
    * When the network's intro phase went on screen. Its minimum is measured from
    * there, and closing the panel starts it over, the same way the charger's dwell
@@ -1050,7 +1090,7 @@ export default function App() {
   const introAt = useRef(0);
   useEffect(() => {
     introAt.current = performance.now();
-  }, [activity?.id, activity?.net?.phase, open]);
+  }, [activity?.id, activity?.net?.phase, activity?.usb?.phase, activity?.bluetooth?.phase, open, settling]);
 
   /**
    * One activity at a time, then the next. The timers only run while the activity
@@ -1067,15 +1107,43 @@ export default function App() {
    * that never answers at all is what the give-up guard is for.
    */
   useEffect(() => {
+    if (activity?.bluetooth?.phase === "cancelled") {
+      // No disconnect notice. Collapse before handing the bar to another item;
+      // a cancellation hidden behind the panel/settle can simply leave the queue.
+      if (open || settling) popActivity();
+      else popTall();
+      return;
+    }
     if (activity === undefined || open || settling) return;
+
+    if (activity.bluetooth) {
+      const connecting = activity.bluetooth.phase === "connecting";
+      const left = Math.max(0, introAt.current + (connecting ? BT_CONNECTING_MS : BT_CONNECTED_MS) - performance.now());
+      const timer = window.setTimeout(connecting ? () => advanceBluetooth(activity.id) : popTall, left);
+      return () => window.clearTimeout(timer);
+    }
+
+    if (activity.usb) {
+      const state = activity.usb;
+      let timer: number;
+      if (state.phase === "reading") {
+        // Metadata may have arrived while this attachment was queued. It still
+        // gets its 800ms opener, but never pretends a disk has answered earlier.
+        const deadline = introAt.current + (state.ready ? USB_READING_MS : USB_TIMEOUT_MS);
+        timer = window.setTimeout(
+          () => advanceUsb(activity.id, "ready"),
+          Math.max(0, deadline - performance.now()),
+        );
+      } else {
+        timer = window.setTimeout(popTall, state.phase === "ready" ? USB_READY_MS : USB_REMOVED_MS);
+      }
+      return () => window.clearTimeout(timer);
+    }
 
     const net = networkOf(activity);
     if (net === undefined) {
       const hold = TALL_MS[activity.kind];
-      const timer = window.setTimeout(
-        hold === undefined ? popActivity : popTall,
-        hold ?? ACTIVITY_MS,
-      );
+      const timer = window.setTimeout(popTall, hold ?? 0);
       return () => window.clearTimeout(timer);
     }
 
@@ -1104,7 +1172,7 @@ export default function App() {
       net.phase === "connected" ? NET_LINK_MS : NET_NOTICE_MS,
     );
     return () => window.clearTimeout(timer);
-  }, [activity, open, settling, charging, popActivity, popTall, advanceNetwork]);
+  }, [activity, open, settling, charging, popActivity, popTall, advanceNetwork, advanceUsb, advanceBluetooth]);
 
   // Hiding never changes the click-through state - autohide only ever applies
   // while the notch is collapsed, and collapsed is already click-through. What
@@ -1177,13 +1245,13 @@ export default function App() {
           height: silhouette.height,
           borderBottomLeftRadius: silhouette.radius,
           borderBottomRightRadius: silhouette.radius,
-          opacity: charging || network?.phase === "connected" ? 1 : 0,
+          opacity: charging || network?.phase === "connected" || usb?.phase === "ready" || bluetooth?.phase === "connected" ? 1 : 0,
         }}
         transition={{
           ...sizeTransition,
           opacity: { duration: 0.2 },
         }}
-        data-tone={network ? "network" : "power"}
+        data-tone={bluetooth ? "bluetooth" : usb ? "usb" : network ? "network" : "power"}
         className="notch-glow pointer-events-none absolute top-0 left-1/2 -translate-x-1/2"
       />
       <motion.div
@@ -1240,38 +1308,14 @@ export default function App() {
               filter: open ? "blur(6px)" : "blur(0px)",
               scale: open ? 0.95 : 1,
             }}
-            transition={open ? CONTENT_EXIT : CONTENT_ENTER}
+            transition={open ? PANEL_EXIT : CONTENT_ENTER}
             className="notch-clock pointer-events-none absolute inset-x-0 top-2 flex h-5 items-center justify-center px-3 text-sm text-white"
           >
             {/* One indicator at a time takes the clock's place; the WPF original
                 kept the clock and put the activity beside it, but the clock is
                 what this notch shows when it has nothing to say. */}
             <AnimatePresence mode="wait" initial={false}>
-              {rowActivity ? (
-                <motion.div
-                  key={rowActivity.id}
-                  initial={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
-                  animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
-                  exit={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
-                  transition={{ duration: 0.18, ease: "easeOut" }}
-                  className="notch-activity flex min-w-0 items-center gap-1"
-                >
-                  {(() => {
-                    if (!isRow(rowActivity.kind)) return null;
-                    const look = ROW[rowActivity.kind];
-                    return (
-                      <>
-                        <span className="notch-activity-glyph">
-                          {look.glyph}
-                        </span>
-                        <span className="notch-activity-text truncate">
-                          {look.text(rowActivity.detail)}
-                        </span>
-                      </>
-                    );
-                  })()}
-                </motion.div>
-              ) : tall || settling ? null : (
+              {tall || settling ? null : (
                 <motion.div
                   key="clock"
                   initial={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
@@ -1339,20 +1383,49 @@ export default function App() {
               </motion.div>
             )}
           </AnimatePresence>
-          {/* Placeholder only: the tabs replace this next. */}
+          <AnimatePresence>
+            {usb && (
+              <motion.div
+                key={activity.id}
+                className="notch-usb"
+                data-phase={usb.phase}
+                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
+                animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                exit={{ opacity: 0, filter: "blur(6px)", transition: arrivalExit }}
+                transition={arrivalEnter}
+              >
+                <UsbContent usb={usb} detail={activity.detail} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+          <AnimatePresence>
+            {bluetooth && bluetooth.phase !== "cancelled" && (
+              <motion.div
+                key={activity.id}
+                className="notch-bluetooth"
+                data-phase={bluetooth.phase}
+                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
+                animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                exit={{ opacity: 0, filter: "blur(6px)", transition: arrivalExit }}
+                transition={arrivalEnter}
+              >
+                <BluetoothContent bluetooth={bluetooth} detail={activity.detail} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+          {/* The open panel: nav bar plus the active tab's (still empty)
+              content. Enters late and small-blurred, exits quickly, exactly
+              like the clock row above it did when it was a placeholder. */}
           <AnimatePresence>
             {open && (
               <motion.div
-                key="content"
-                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
+                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.97 }}
                 animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
-                exit={{ opacity: 0, filter: "blur(6px)", transition: CONTENT_EXIT }}
-                transition={CONTENT_ENTER}
-                className="flex h-full w-full items-center justify-center"
+                exit={{ opacity: 0, filter: "blur(6px)", transition: PANEL_EXIT }}
+                transition={PANEL_ENTER}
+                className="notch-panel"
               >
-                <span className="text-xs font-medium tracking-wide text-white/45">
-                  Panel content
-                </span>
+                <Panel onWide={handlePanelWide} />
               </motion.div>
             )}
           </AnimatePresence>
