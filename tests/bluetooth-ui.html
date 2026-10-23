@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="id">
+  <head><meta charset="UTF-8" /><title>Notch Bluetooth animation test</title></head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import "./mock-native.js";
+      await import("../src/main.tsx");
+      const { runBluetoothScenario } = await import("./bluetooth-ui-probe.js");
+      window.runBluetoothScenario = runBluetoothScenario;
+    </script>
+  </body>
+</html>

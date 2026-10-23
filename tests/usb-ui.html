@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Notch USB animation test</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      // A separate browser page for deterministic animation tests. Native IPC
+      // is mocked, not Windows itself; no mouse hook, focus or disk is changed.
+      import "./mock-native.js";
+      await import("../src/main.tsx");
+      const { runUsbScenario } = await import("./usb-ui-probe.js");
+      window.runUsbScenario = runUsbScenario;
+    </script>
+  </body>
+</html>

@@ -1,11 +1,9 @@
 //! Activity indicators: what the notch shows *instead of* the clock when the
 //! machine changes state.
 //!
-//! Four watchers run on their own threads and each polls one Windows API. The
-//! period is set by how quickly that change is worth showing, not by what the
-//! call costs - all four together measure well under a millisecond per second
-//! of runtime - so the charger and the networks are checked every second, the
-//! USB tree every one and a half, and Bluetooth every four.
+//! Power/network poll every second and USB every half second. Bluetooth uses
+//! incremental Windows connection notifications for both Classic and BLE;
+//! cached battery reads run separately so they never hold up a disconnect.
 //!
 //! The networks are the reason one second is not generous: associating to a
 //! wireless network is often over inside two seconds, and the indicator has a
@@ -25,24 +23,28 @@
 //!   asked for it: the charger and USB report both directions, and so do the
 //!   networks - an attempt that gives up is worth a notice, but only if the
 //!   notch was already showing that network, which is the webview's call.
-//!   Bluetooth only ever reports coming up.
+//!   Bluetooth disconnects only cancel pending notices, never show one of their own.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    DIGCF_PRESENT, GUID_DEVCLASS_USB, HDEVINFO, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
-    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
-    SetupDiGetDevicePropertyW,
+    CM_Get_Device_IDW, CM_Get_Parent, CR_SUCCESS, DIGCF_ALLCLASSES, DIGCF_DEVICEINTERFACE,
+    DIGCF_PRESENT, GUID_DEVCLASS_DISKDRIVE, HDEVINFO, SP_DEVICE_INTERFACE_DATA,
+    SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
+    SetupDiEnumDeviceInfo, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceInterfaceDetailW, SetupDiGetDevicePropertyW,
 };
 use windows::Win32::Devices::Properties::{
-    DEVPKEY_Device_BusReportedDeviceDesc, DEVPKEY_Device_DeviceDesc, DEVPKEY_Device_FriendlyName,
-    DEVPROP_TYPE_STRING, DEVPROPKEY, DEVPROPTYPE,
+    DEVPKEY_Device_BusReportedDeviceDesc, DEVPKEY_Device_CompatibleIds, DEVPKEY_Device_DeviceDesc,
+    DEVPKEY_Device_FriendlyName, DEVPKEY_Device_Service, DEVPROP_TYPE_STRING,
+    DEVPROP_TYPE_STRING_LIST, DEVPROPKEY, DEVPROPTYPE,
 };
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_ITEMS, HANDLE, HWND};
 use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
 use windows::Win32::NetworkManagement::Ndis::{IfOperStatusUp, MediaConnectStateConnected};
 use windows::Win32::NetworkManagement::WiFi::{
@@ -51,23 +53,28 @@ use windows::Win32::NetworkManagement::WiFi::{
     wlan_interface_state_authenticating, wlan_interface_state_connected,
     wlan_interface_state_discovering, wlan_intf_opcode_current_connection,
 };
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::System::Ioctl::{DISK_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::core::{GUID, PCWSTR};
 
-/// Event the webview listens on. The payload is `{ kind, detail }`.
+mod bluetooth;
+
+/// USB and Bluetooth also carry connection identities and optional metadata.
 pub const ACTIVITY_EVENT: &str = "notch-activity";
 
 const POWER_PERIOD: Duration = Duration::from_millis(1000);
 /// Short on purpose: an association can be over inside two seconds, and the
 /// indicator shows a phase of its own while one is in flight.
 const NETWORK_PERIOD: Duration = Duration::from_millis(1000);
-const USB_PERIOD: Duration = Duration::from_millis(1500);
-const BLUETOOTH_PERIOD: Duration = Duration::from_millis(4000);
+const USB_PERIOD: Duration = Duration::from_millis(500);
+const USB_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// How long the USB watcher waits for the device tree to finish growing before
-/// it decides what was plugged in. One physical device enumerates as several
-/// nodes - a composite parent plus its functions - and they do not always land
-/// in the same enumeration pass.
+/// Minimum age before metadata can complete. Detection/removal are not delayed:
+/// the tree can grow while the frontend is already showing its reading phase.
 const USB_SETTLE: Duration = Duration::from_millis(700);
 
 /// One indicator. `kind` picks the icon and the wording, `detail` is the part
@@ -76,13 +83,26 @@ const USB_SETTLE: Duration = Duration::from_millis(700);
 pub struct Activity {
     pub kind: &'static str,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usb: Option<UsbPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bluetooth: Option<bluetooth::BluetoothPayload>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsbPayload {
+    /// Unique to this attachment, not just its port: a late disk query from a
+    /// previous insertion must never complete a new one in the same port.
+    device_id: String,
+    capacity_bytes: Option<u64>,
 }
 
 pub fn install(app: &AppHandle) {
     spawn(app, "activity-power", watch_power);
     spawn(app, "activity-network", watch_network);
     spawn(app, "activity-usb", watch_usb);
-    spawn(app, "activity-bluetooth", watch_bluetooth);
+    spawn(app, "activity-bluetooth", bluetooth::watch);
 }
 
 fn spawn(app: &AppHandle, name: &str, watcher: fn(AppHandle)) {
@@ -100,6 +120,8 @@ fn emit(app: &AppHandle, kind: &'static str, detail: impl Into<String>) {
     let payload = Activity {
         kind,
         detail: detail.into(),
+        usb: None,
+        bluetooth: None,
     };
     if let Err(err) = app.emit(ACTIVITY_EVENT, payload) {
         eprintln!("emitting {kind} failed: {err}");
@@ -460,9 +482,55 @@ fn ethernet_state() -> Result<Ethernet, ()> {
 // USB
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Default)]
+struct UsbDevice {
+    name: String,
+    storage: bool,
+}
+
+struct UsbAttachment {
+    token: String,
+    since: Instant,
+    ready: bool,
+}
+
+fn emit_usb(app: &AppHandle, kind: &'static str, token: &str, name: &str, capacity: Option<u64>) {
+    let payload = Activity {
+        kind,
+        detail: name.to_string(),
+        usb: Some(UsbPayload {
+            device_id: token.to_string(),
+            capacity_bytes: capacity,
+        }),
+        bluetooth: None,
+    };
+    if let Err(err) = app.emit(ACTIVITY_EVENT, payload) {
+        eprintln!("emitting {kind} failed: {err}");
+    }
+}
+
+/// One capacity worker, bounded to one outstanding request. A driver that hangs
+/// on an IOCTL cannot block removals or create an unbounded number of threads.
 fn watch_usb(app: AppHandle) {
-    let mut previous: HashMap<String, String> = HashMap::new();
+    type Request = Vec<(String, String)>;
+    let (request_tx, request_rx) = mpsc::sync_channel::<Request>(1);
+    let (result_tx, result_rx) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("usb-capacity".into())
+        .spawn(move || {
+            while let Ok(request) = request_rx.recv() {
+                let capacities = usb_capacities(&request);
+                if result_tx.send((request, capacities)).is_err() {
+                    break;
+                }
+            }
+        });
+
+    let mut previous: HashMap<String, UsbDevice> = HashMap::new();
+    let mut attached: HashMap<String, UsbAttachment> = HashMap::new();
     let mut seeded = false;
+    let mut serial = 0u64;
+    let mut querying = false;
 
     loop {
         let now = match usb_devices() {
@@ -472,71 +540,130 @@ fn watch_usb(app: AppHandle) {
                 continue;
             }
         };
-
-        if !seeded {
-            seeded = true;
-            previous = now;
-            std::thread::sleep(USB_PERIOD);
-            continue;
+        // Sort transitions for a stable ordering when a hub brings several
+        // physical devices in together. Functions of one device are grouped.
+        let mut roots: Vec<_> = now.keys().cloned().collect();
+        roots.sort();
+        for root in roots {
+            if !previous.contains_key(&root) {
+                serial += 1;
+                let token = format!("{root}#{serial}");
+                if seeded {
+                    emit_usb(&app, "usb-connected", &token, &now[&root].name, None);
+                }
+                attached.insert(
+                    root,
+                    UsbAttachment {
+                        token,
+                        since: Instant::now(),
+                        ready: !seeded,
+                    },
+                );
+            }
         }
-
-        let arrived = now.keys().any(|id| !previous.contains_key(id));
-        let left = previous.keys().any(|id| !now.contains_key(id));
-        if !arrived && !left {
-            previous = now;
-            std::thread::sleep(USB_PERIOD);
-            continue;
-        }
-
-        // Let the tree finish settling, then look again: one plug is one
-        // indicator, carrying the best name the device gave us.
-        std::thread::sleep(USB_SETTLE);
-        let settled = usb_devices().unwrap_or(now);
-
-        let added: Vec<String> = settled
-            .iter()
-            .filter(|(id, _)| !previous.contains_key(*id))
-            .map(|(_, name)| name.clone())
+        let mut removed: Vec<_> = previous
+            .keys()
+            .filter(|id| !now.contains_key(*id))
+            .cloned()
             .collect();
-        let removed: Vec<String> = previous
-            .iter()
-            .filter(|(id, _)| !settled.contains_key(*id))
-            .map(|(_, name)| name.clone())
-            .collect();
-
-        if !added.is_empty() {
-            emit(
-                &app,
-                "usb-connected",
-                best_name(added.iter().map(String::as_str)),
-            );
+        removed.sort();
+        for root in removed {
+            if let Some(device) = attached.remove(&root) {
+                emit_usb(
+                    &app,
+                    "usb-disconnected",
+                    &device.token,
+                    &previous[&root].name,
+                    None,
+                );
+            }
         }
-        if !removed.is_empty() {
-            emit(
-                &app,
-                "usb-disconnected",
-                best_name(removed.iter().map(String::as_str)),
-            );
-        }
+        seeded = true;
 
-        previous = settled;
+        let mut capacities = HashMap::new();
+        if let Ok((request, result)) = result_rx.try_recv() {
+            querying = false;
+            for (root, token) in request {
+                // Discard replies for a device removed/reinserted in the meantime.
+                if attached.get(&root).is_some_and(|item| item.token == token)
+                    && let Some(bytes) = result.get(&root)
+                {
+                    capacities.insert(root, *bytes);
+                }
+            }
+        }
+        for (root, item) in &mut attached {
+            let device = &now[root];
+            let capacity = capacities.get(root).copied();
+            if !item.ready && usb_metadata_ready(item.since.elapsed(), device, capacity) {
+                item.ready = true;
+                emit_usb(&app, "usb-ready", &item.token, &device.name, capacity);
+            }
+        }
+        if !querying {
+            let request: Request = attached
+                .iter()
+                .filter(|(root, item)| {
+                    !item.ready && now[*root].storage && item.since.elapsed() >= USB_SETTLE
+                })
+                .map(|(root, item)| (root.clone(), item.token.clone()))
+                .collect();
+            if !request.is_empty() && request_tx.try_send(request).is_ok() {
+                querying = true;
+            }
+        }
+        previous = now;
         std::thread::sleep(USB_PERIOD);
     }
 }
 
-/// Every present device of the USB class, keyed by instance id, with a name to
-/// show. The instance id is what makes this a set rather than a count.
-fn usb_devices() -> Result<HashMap<String, String>, ()> {
+fn usb_metadata_ready(elapsed: Duration, device: &UsbDevice, capacity: Option<u64>) -> bool {
+    elapsed >= USB_TIMEOUT
+        || (elapsed >= USB_SETTLE
+            && ((!device.storage && !device.name.is_empty()) || capacity.is_some()))
+}
+
+/// A physical USB node, not its HID/audio/storage functions. Walking upward also
+/// maps UASP/SCSI disks and composite functions to the same attachment.
+fn physical_usb_id(id: &str) -> bool {
+    let upper = id.to_ascii_uppercase();
+    let hardware = upper.split('\\').nth(1).unwrap_or_default();
+    upper.starts_with("USB\\VID_") && !hardware.contains("&MI_")
+}
+
+unsafe fn usb_root(mut node: u32) -> Option<String> {
+    for _ in 0..32 {
+        let mut id = [0u16; 512];
+        if unsafe { CM_Get_Device_IDW(node, &mut id, 0) } != CR_SUCCESS {
+            return None;
+        }
+        let id = wide_to_string(&id);
+        if physical_usb_id(&id) {
+            return Some(id);
+        }
+        let mut parent = 0;
+        if unsafe { CM_Get_Parent(&mut parent, node, 0) } != CR_SUCCESS {
+            return None;
+        }
+        node = parent;
+    }
+    None
+}
+
+/// Enumerate all setup classes: HID-only devices are not necessarily members of
+/// GUID_DEVCLASS_USB. Keep one entry per physical ancestor, not per function.
+fn usb_devices() -> Result<HashMap<String, UsbDevice>, ()> {
     unsafe {
         let set = SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_USB),
+            None,
             PCWSTR::null(),
             HWND::default(),
-            DIGCF_PRESENT,
+            DIGCF_PRESENT | DIGCF_ALLCLASSES,
         )
         .map_err(|_| ())?;
 
         let mut devices = HashMap::new();
+        let mut root_names = HashMap::new();
         let mut index = 0u32;
 
         loop {
@@ -544,12 +671,17 @@ fn usb_devices() -> Result<HashMap<String, String>, ()> {
                 cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
                 ..Default::default()
             };
-            if SetupDiEnumDeviceInfo(set, index, &mut info).is_err() {
-                break;
+            if let Err(error) = SetupDiEnumDeviceInfo(set, index, &mut info) {
+                if error.code() == windows::core::HRESULT::from_win32(ERROR_NO_MORE_ITEMS.0) {
+                    break;
+                }
+                // An incomplete enumeration is not evidence of removal.
+                let _ = SetupDiDestroyDeviceInfoList(set);
+                return Err(());
             }
             index += 1;
 
-            let Some(id) = instance_id(set, &info) else {
+            let Some(id) = usb_root(info.DevInst) else {
                 continue;
             };
 
@@ -563,12 +695,140 @@ fn usb_devices() -> Result<HashMap<String, String>, ()> {
                 .or_else(|| device_string(set, &info, &DEVPKEY_Device_DeviceDesc))
                 .unwrap_or_default();
 
-            devices.insert(id, name);
+            if instance_id(set, &info).as_deref() == Some(id.as_str()) {
+                root_names.insert(id.clone(), name.clone());
+            }
+
+            let compatible =
+                device_string(set, &info, &DEVPKEY_Device_CompatibleIds).unwrap_or_default();
+            let service = device_string(set, &info, &DEVPKEY_Device_Service).unwrap_or_default();
+            let storage = info.ClassGuid == GUID_DEVCLASS_DISKDRIVE
+                || compatible.to_ascii_uppercase().contains("USB\\CLASS_08")
+                || service.eq_ignore_ascii_case("USBSTOR")
+                || service.eq_ignore_ascii_case("UASPStor");
+            let device: &mut UsbDevice = devices.entry(id).or_default();
+            device.name = best_name([device.name.as_str(), name.as_str()].into_iter());
+            device.storage |= storage;
         }
 
+        for (id, name) in root_names {
+            if let Some(device) = devices.get_mut(&id) {
+                device.name = best_name([name.as_str(), device.name.as_str()].into_iter());
+            }
+        }
         let _ = SetupDiDestroyDeviceInfoList(set);
         Ok(devices)
     }
+}
+
+/// Capacity of the entire physical disk, not free space or a drive-letter's
+/// partition size. FILE_ANY_ACCESS geometry queries work without administrator
+/// privileges. Never read user files or mount/unlock a volume to obtain this.
+fn usb_capacities(request: &[(String, String)]) -> HashMap<String, u64> {
+    const DISK: GUID = GUID::from_u128(0x53f56307_b6bf_11d0_94f2_00a0c91efb8b);
+    let mut capacities = HashMap::new();
+    let mut unavailable = HashSet::new();
+    unsafe {
+        let Ok(set) = SetupDiGetClassDevsW(
+            Some(&DISK),
+            PCWSTR::null(),
+            HWND::default(),
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        ) else {
+            return capacities;
+        };
+        let mut index = 0;
+        loop {
+            let mut interface = SP_DEVICE_INTERFACE_DATA {
+                cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+                ..Default::default()
+            };
+            if SetupDiEnumDeviceInterfaces(set, None, &DISK, index, &mut interface).is_err() {
+                break;
+            }
+            index += 1;
+            let mut required = 0;
+            let _ = SetupDiGetDeviceInterfaceDetailW(
+                set,
+                &interface,
+                None,
+                0,
+                Some(&mut required),
+                None,
+            );
+            if required < size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32 {
+                continue;
+            }
+            // u64 storage gives the detail header its native alignment.
+            let mut buffer = vec![0u64; (required as usize).div_ceil(8)];
+            let detail = buffer
+                .as_mut_ptr()
+                .cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+            (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            let mut info = SP_DEVINFO_DATA {
+                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            if SetupDiGetDeviceInterfaceDetailW(
+                set,
+                &interface,
+                Some(detail),
+                required,
+                None,
+                Some(&mut info),
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let Some(root) = usb_root(info.DevInst) else {
+                continue;
+            };
+            if !request.iter().any(|(id, _)| *id == root) {
+                continue;
+            }
+            let path = PCWSTR(std::ptr::addr_of!((*detail).DevicePath).cast());
+            let Ok(handle) = CreateFileW(
+                path,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                HANDLE::default(),
+            ) else {
+                unavailable.insert(root);
+                continue;
+            };
+            let mut output = [0u64; 64];
+            let mut returned = 0;
+            let result = DeviceIoControl(
+                handle,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                None,
+                0,
+                Some(output.as_mut_ptr().cast()),
+                size_of_val(&output) as u32,
+                Some(&mut returned),
+                None,
+            );
+            let _ = CloseHandle(handle);
+            if result.is_ok() && returned as usize >= size_of::<DISK_GEOMETRY_EX>() {
+                let bytes = (*(output.as_ptr().cast::<DISK_GEOMETRY_EX>())).DiskSize;
+                if bytes > 0 {
+                    *capacities.entry(root).or_default() += bytes as u64;
+                } else {
+                    unavailable.insert(root);
+                }
+            } else {
+                unavailable.insert(root);
+            }
+        }
+        let _ = SetupDiDestroyDeviceInfoList(set);
+    }
+    // Multi-LUN devices must not advertise a partial sum as their total size.
+    capacities.retain(|root, _| !unavailable.contains(root));
+    capacities
 }
 
 unsafe fn instance_id(set: HDEVINFO, info: &SP_DEVINFO_DATA) -> Option<String> {
@@ -597,7 +857,7 @@ unsafe fn device_string(set: HDEVINFO, info: &SP_DEVINFO_DATA, key: &DEVPROPKEY)
     unsafe {
         SetupDiGetDevicePropertyW(set, info, key, &mut kind, Some(&mut buffer), None, 0).ok()?
     };
-    if kind != DEVPROP_TYPE_STRING {
+    if kind != DEVPROP_TYPE_STRING && kind != DEVPROP_TYPE_STRING_LIST {
         return None;
     }
 
@@ -607,7 +867,13 @@ unsafe fn device_string(set: HDEVINFO, info: &SP_DEVINFO_DATA, key: &DEVPROPKEY)
         .iter()
         .map(|pair| u16::from_le_bytes(*pair))
         .collect();
-    Some(wide_to_string(&wide))
+    Some(
+        wide.split(|unit| *unit == 0)
+            .filter(|part| !part.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 fn wide_to_string(wide: &[u16]) -> String {
@@ -656,92 +922,61 @@ fn best_name<'a>(names: impl Iterator<Item = &'a str>) -> String {
     best.to_string()
 }
 
-// ---------------------------------------------------------------------------
-// Bluetooth
-// ---------------------------------------------------------------------------
-
-fn watch_bluetooth(app: AppHandle) {
-    let mut connected: HashSet<String> = HashSet::new();
-    let mut seeded = false;
-
-    loop {
-        if let Some(now) = connected_bluetooth() {
-            if !seeded {
-                seeded = true;
-            } else {
-                let mut arrived: Vec<&String> = now.difference(&connected).collect();
-                arrived.sort();
-                for name in arrived {
-                    emit(&app, "bluetooth-connected", name.clone());
-                }
-            }
-            connected = now;
-        }
-        std::thread::sleep(BLUETOOTH_PERIOD);
-    }
-}
-
-/// The names of the Bluetooth devices connected at this moment.
-///
-/// `BluetoothFindFirstDevice` answers from the stack's own cache - `fIssueInquiry`
-/// is off, so nothing is scanned for - which measures at well under a
-/// millisecond here and is what makes a four-second poll affordable. The
-/// alternative, enumerating association endpoints through WinRT, was measured
-/// at a flat 30 seconds per call, scan or no scan.
-///
-/// The cost of that choice: this API is the classic (BR/EDR) Bluetooth stack, so
-/// a device that speaks nothing but Bluetooth Low Energy - some modern mice and
-/// keyboards - never shows up. Everything Windows uses for audio and for phones
-/// is classic, so headphones, speakers and handsets are covered.
-fn connected_bluetooth() -> Option<HashSet<String>> {
-    use windows::Win32::Devices::Bluetooth::{
-        BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BluetoothFindDeviceClose,
-        BluetoothFindFirstDevice, BluetoothFindNextDevice,
-    };
-    use windows::Win32::Foundation::BOOL;
-
-    unsafe {
-        let params = BLUETOOTH_DEVICE_SEARCH_PARAMS {
-            dwSize: size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32,
-            // The union of everything the stack knows, then filter on the
-            // `fConnected` flag Windows sets for the connection itself.
-            fReturnAuthenticated: BOOL(1),
-            fReturnRemembered: BOOL(1),
-            fReturnUnknown: BOOL(0),
-            fReturnConnected: BOOL(1),
-            fIssueInquiry: BOOL(0),
-            cTimeoutMultiplier: 0,
-            hRadio: HANDLE::default(),
-        };
-        let fresh = || BLUETOOTH_DEVICE_INFO {
-            dwSize: size_of::<BLUETOOTH_DEVICE_INFO>() as u32,
-            ..Default::default()
-        };
-
-        let mut info = fresh();
-        let find = BluetoothFindFirstDevice(&params, &mut info).ok()?;
-
-        let mut connected = HashSet::new();
-        loop {
-            if info.fConnected.as_bool() {
-                let name = wide_to_string(&info.szName);
-                if !name.is_empty() {
-                    connected.insert(name);
-                }
-            }
-            info = fresh();
-            if BluetoothFindNextDevice(find, &mut info).is_err() {
-                break;
-            }
-        }
-        let _ = BluetoothFindDeviceClose(find);
-
-        Some(connected)
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usb_functions_share_the_physical_parent() {
+        assert!(physical_usb_id(r"USB\VID_0781&PID_5567\1234"));
+        assert!(physical_usb_id(r"usb\vid_046d&pid_c548\receiver"));
+        assert!(!physical_usb_id(r"USB\VID_046D&PID_C548&MI_01\1234"));
+        assert!(!physical_usb_id(r"HID\VID_046D&PID_C548\1234"));
+        assert!(!physical_usb_id(r"USBSTOR\DISK&VEN_SANDISK\1234"));
+        assert!(!physical_usb_id(r"USB\ROOT_HUB30\1234"));
+    }
+
+    #[test]
+    fn usb_metadata_waits_for_windows_but_has_a_deadline() {
+        let storage = UsbDevice {
+            name: "SanDisk".into(),
+            storage: true,
+        };
+        let mouse = UsbDevice {
+            name: "Mouse".into(),
+            storage: false,
+        };
+        assert!(!usb_metadata_ready(Duration::ZERO, &mouse, None));
+        assert!(usb_metadata_ready(USB_SETTLE, &mouse, None));
+        assert!(!usb_metadata_ready(USB_SETTLE, &storage, None));
+        assert!(usb_metadata_ready(
+            USB_SETTLE,
+            &storage,
+            Some(32_000_000_000)
+        ));
+        assert!(!usb_metadata_ready(USB_SETTLE, &UsbDevice::default(), None));
+        assert!(usb_metadata_ready(USB_TIMEOUT, &storage, None));
+        assert!(usb_metadata_ready(USB_TIMEOUT, &UsbDevice::default(), None));
+    }
+
+    #[test]
+    #[ignore = "manual Windows USB inventory and read-only capacity probe"]
+    fn usb_hardware_inventory() {
+        let devices = usb_devices().expect("enumerate USB tree");
+        let request: Vec<_> = devices
+            .keys()
+            .map(|root| (root.clone(), "probe".into()))
+            .collect();
+        let capacities = usb_capacities(&request);
+        for (root, device) in devices {
+            println!(
+                "{} storage={} capacity={:?}",
+                device.name,
+                device.storage,
+                capacities.get(&root)
+            );
+        }
+    }
 
     #[test]
     fn tracker_seeds_before_it_reports() {
