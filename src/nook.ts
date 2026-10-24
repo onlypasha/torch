@@ -133,40 +133,12 @@ export const compactMonth = (date: Date): string => MONTH_SHORT_ID[date.getMonth
 export const weekdayLong = (date: Date): string => WEEKDAY_ID[date.getDay()];
 
 // ---------------------------------------------------------------------------
-// Lyrics and Pomodoro
+// Pomodoro
 // ---------------------------------------------------------------------------
-
-/**
- * Windows' media session carries no timed lyrics, so the app must say so
- * instead of animating invented verses. The three-line motion below is kept
- * ready for the day a lyrics source exists: flip this to true and the widget
- * will start cycling `LYRIC_LINES` again.
- */
-export const LYRIC_SOURCE_AVAILABLE = false;
-export const LYRIC_UNAVAILABLE = "Lirik belum tersedia";
-
-/**
- * Placeholder verses for that future source (and for layout previews). They
- * are never shown in the app while `LYRIC_SOURCE_AVAILABLE` is false.
- */
-export const LYRIC_LINES = [
-  LYRIC_UNAVAILABLE,
-  "Baris demo untuk tata letak",
-  "Nyanyian mengikuti irama",
-  "Satu baris, satu tarikan",
-  "Ganti lagu, ganti cerita",
-  "Dan notch tetap tenang",
-] as const;
-
-export const lyricWindow = (index: number): { previous: string; current: string; next: string } => {
-  const length = LYRIC_LINES.length;
-  const at = ((index % length) + length) % length;
-  return {
-    previous: LYRIC_LINES[(at - 1 + length) % length],
-    current: LYRIC_LINES[at],
-    next: LYRIC_LINES[(at + 1) % length],
-  };
-};
+//
+// Timed lyrics live in `lyrics.ts`: they are fetched from LRCLIB rather than
+// invented, so they belong with the fetching and parsing, not with the pure
+// widget rules here.
 
 export const POMODORO_SECONDS = 25 * 60;
 export const POMODORO_SESSION = "1/4";

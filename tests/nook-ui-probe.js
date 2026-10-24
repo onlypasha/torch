@@ -21,10 +21,16 @@ const TRACK = {
   playing: true,
   positionMs: 61_000,
   durationMs: 180_000,
+  hasTimeline: true,
   thumbnail: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
   canPrevious: true,
   canNext: true,
   canToggle: true,
+  canSeek: true,
+  shuffle: false,
+  shuffleSupported: true,
+  repeat: "none",
+  repeatSupported: true,
   source: "Spotify.exe",
 };
 
@@ -38,6 +44,9 @@ function state() {
   const stackPomodoro = s?.querySelector('.notch-stack-card[data-widget="pomodoro"]');
   const cards = pinnedCards();
   const cover = n?.querySelector(".notch-media-cover");
+  const lyricCard = s?.querySelector('.notch-stack-card[data-widget="lyric"]');
+  const shuffle = n?.querySelector('.notch-media-toggle[aria-label="Acak lagu"]');
+  const repeat = n?.querySelector('.notch-media-toggle[aria-label^="Repeat"]');
   return {
     open: n?.getAttribute("aria-expanded") === "true",
     width: n?.getBoundingClientRect().width ?? 0,
@@ -53,12 +62,27 @@ function state() {
     menuRect: menuEl() ? menuEl().getBoundingClientRect() : null,
     title: n?.querySelector(".notch-media-title")?.textContent ?? "",
     artist: n?.querySelector(".notch-media-artist")?.textContent ?? "",
+    album: n?.querySelector(".notch-media-album")?.textContent ?? "",
     cover: cover ? getComputedStyle(cover).backgroundImage : "",
     current: times[0]?.textContent ?? "",
     duration: times[1]?.textContent ?? "",
+    notice: times[1]?.dataset.notice ?? "",
     play: n?.querySelector(".notch-media-play")?.getAttribute("aria-label") ?? "",
     playDisabled: !!n?.querySelector(".notch-media-play")?.disabled,
     fill: track && fill ? fill.getBoundingClientRect().width / Math.max(1, track.getBoundingClientRect().width) : 0,
+    seekable: track?.dataset.interactive === "true",
+    shufflePressed: shuffle?.getAttribute("aria-pressed") ?? "",
+    shuffleColor: shuffle ? getComputedStyle(shuffle).color : "",
+    repeatLabel: repeat?.getAttribute("aria-label") ?? "",
+    repeatOne: !!n?.querySelector(".notch-media-repeat-one"),
+    volumeOpen: !!n?.querySelector(".notch-volume"),
+    volumeValue: n?.querySelector(".notch-volume-value")?.textContent ?? "",
+    volumeNote: n?.querySelector(".notch-volume-note")?.textContent ?? "",
+    lyrics: [...(lyricCard?.querySelectorAll(".notch-lyric-line") ?? [])].map((row) => ({
+      text: row.textContent,
+      current: row.dataset.current === "true",
+      status: row.dataset.status ?? "",
+    })),
     stackTime: stackPomodoro?.querySelector(".notch-pomodoro-time")?.textContent ?? "",
     stackStart: stackPomodoro?.querySelector(".notch-pill-light")?.textContent ?? "",
     pinnedTime: pinPomodoro?.querySelector(".notch-pin-time")?.textContent ?? "",
@@ -67,6 +91,8 @@ function state() {
     pinnedPressed: pinPomodoro?.getAttribute("aria-pressed") ?? "",
     pinnedRing: !!pinPomodoro?.querySelector(".notch-pin-progress"),
     pinFill: pinPomodoro?.querySelector(".notch-pin-progress")?.style.getPropertyValue("--fill") ?? "",
+    clockMedia: !!n?.querySelector(".notch-clock-media"),
+    clockBars: n?.querySelectorAll(".notch-clock-bar").length ?? 0,
     scrollTop: document.scrollingElement?.scrollTop ?? 0,
   };
 }
@@ -97,6 +123,21 @@ const contextMenu = (element) => {
     button: 2,
     clientX: rect.left + rect.width / 2,
     clientY: rect.top + rect.height / 2,
+  }));
+};
+
+/** Synthetic pointer step; the seek bar has no capture in a headless page. */
+const pointer = (element, type, clientX) => {
+  element.dispatchEvent(new PointerEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    pointerId: 7,
+    pointerType: "mouse",
+    isPrimary: true,
+    button: 0,
+    buttons: type === "pointerup" ? 0 : 1,
+    clientX,
+    clientY: element.getBoundingClientRect().top + 4,
   }));
 };
 
@@ -179,6 +220,222 @@ export async function runNookScenario(scenario = "media") {
     now = sample();
     check(now.title === "Tidak ada media", `no session is explicit, got "${now.title}"`);
     check(now.playDisabled, "transport disabled without a session");
+  }
+
+  if (scenario === "seek") {
+    await openPanel();
+    await emit("media-state", TRACK);
+    await wait(300);
+
+    const bar = notch().querySelector(".notch-media-track");
+    const rect = bar.getBoundingClientRect();
+    check(bar.dataset.interactive === "true", "a seekable session makes the bar interactive");
+    check(bar.getAttribute("role") === "slider", "the bar announces itself as a slider");
+
+    const seeks = () => window.__notchCommands.filter((entry) => entry.command === "media_seek");
+    const before = seeks().length;
+
+    pointer(bar, "pointerdown", rect.left + rect.width * 0.25);
+    await wait(80);
+    let now = sample();
+    check(now.current === "0:45", `pressing previews 0:45, got "${now.current}"`);
+
+    pointer(bar, "pointermove", rect.left + rect.width * 0.75);
+    await wait(80);
+    now = sample();
+    check(now.current === "2:15", `dragging previews 2:15, got "${now.current}"`);
+    check(seeks().length === before, "moving the thumb does not seek on every pixel");
+
+    pointer(bar, "pointerup", rect.left + rect.width * 0.75);
+    await wait(150);
+    check(seeks().length === before + 1, "releasing sends exactly one seek");
+    check(seeks().at(-1)?.args?.positionMs === 135000, `seek target 135000ms, got ${seeks().at(-1)?.args?.positionMs}`);
+
+    now = sample();
+    check(now.current === "2:15", `the bar holds the target until the player answers, got "${now.current}"`);
+    check(now.notice === "", "no warning while the seek is in flight");
+
+    await emit("media-state", { ...TRACK, positionMs: 135_000 });
+    await emit("media-seek", { applied: true, positionMs: 135_000 });
+    await wait(150);
+    now = sample();
+    check(now.current === "2:15" && now.notice === "", `a confirmed seek settles quietly, got "${now.current}"`);
+
+    pointer(bar, "pointerdown", rect.left + rect.width * 0.05);
+    pointer(bar, "pointerup", rect.left + rect.width * 0.05);
+    await wait(150);
+    await emit("media-seek", { applied: false, positionMs: 135_000 });
+    await wait(150);
+    now = sample();
+    check(now.notice === "true", "a rejected seek is reported on the bar");
+    check(now.duration === "Seek ditolak", `the notice replaces the duration, got "${now.duration}"`);
+
+    // A player that cannot report a timeline gets a read-only bar.
+    await emit("media-state", { ...TRACK, canSeek: false, hasTimeline: false });
+    await wait(150);
+    now = sample();
+    check(!now.seekable, "a session without seeking keeps the bar static");
+  }
+
+  if (scenario === "shuffle") {
+    await openPanel();
+    await emit("media-state", TRACK);
+    await wait(250);
+
+    let now = sample();
+    check(now.shufflePressed === "false", `shuffle starts off, got "${now.shufflePressed}"`);
+
+    notch().querySelector('.notch-media-toggle[aria-label="Acak lagu"]').click();
+    await wait(90);
+    const shuffleCalls = window.__notchCommands.filter((entry) => entry.command === "media_shuffle");
+    check(shuffleCalls.at(-1)?.args?.active === true, `shuffle asks for on, got ${JSON.stringify(shuffleCalls.at(-1)?.args)}`);
+
+    await emit("media-state", { ...TRACK, shuffle: true });
+    await wait(140);
+    now = sample();
+    check(now.shufflePressed === "true", "the player's own shuffle state is what the button shows");
+
+    notch().querySelector('.notch-media-toggle[aria-label^="Repeat"]').click();
+    await wait(90);
+    check(
+      window.__notchCommands.some((entry) => entry.command === "media_repeat"),
+      "repeat cycles through the worker",
+    );
+
+    await emit("media-state", { ...TRACK, repeat: "track" });
+    await wait(140);
+    now = sample();
+    check(now.repeatLabel === "Repeat satu", `repeat-one is labelled, got "${now.repeatLabel}"`);
+    check(now.repeatOne, "repeat-one shows its badge");
+
+    // A source that cannot shuffle must not show a button that does nothing.
+    await emit("media-state", { ...TRACK, shuffleSupported: false, repeatSupported: false });
+    await wait(160);
+    now = sample();
+    check(now.shufflePressed === "" && now.repeatLabel === "", "unsupported controls are hidden");
+  }
+
+  if (scenario === "lyrics") {
+    const original = window.fetch;
+    const body = {
+      syncedLyrics: "[00:00.00]Awal lagu\n[00:30.00]Tengah lagu\n[01:00.00]Akhir lagu",
+      duration: 180,
+      trackName: "Malam Ini",
+      artistName: "Contoh Band",
+    };
+    window.fetch = async (input) => {
+      const url = String(input);
+      const payload = url.includes("/api/get") ? body : [body];
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    try {
+      await openPanel();
+      wheel(stackEl(), 120);
+      await wait(360);
+      wheel(stackEl(), 120);
+      await wait(420);
+      let now = sample();
+      check(now.active === "lyric", `lyric widget is active, got ${now.active}`);
+
+      await emit("media-state", TRACK);
+      await wait(500);
+      now = sample();
+      const rows = now.lyrics.map((row) => row.text);
+      check(rows.includes("Akhir lagu"), `the row follows the 61s position, got ${JSON.stringify(rows)}`);
+      check(
+        now.lyrics.some((row) => row.current && row.text === "Akhir lagu"),
+        "the line being sung is the current one",
+      );
+      check(rows.includes("Tengah lagu"), "the line just sung stays as context");
+
+      await emit("media-state", { ...TRACK, positionMs: 5_000 });
+      await wait(200);
+      now = sample();
+      check(
+        now.lyrics.some((row) => row.current && row.text === "Awal lagu"),
+        `a new position moves the current line, got ${JSON.stringify(now.lyrics)}`,
+      );
+
+      // No artist means no service call, and the widget says so plainly.
+      await emit("media-state", { ...TRACK, title: "", artist: "", album: "" });
+      await wait(200);
+      now = sample();
+      check(
+        now.lyrics.some((row) => row.text === "Lirik belum tersedia"),
+        `an unusable track says so, got ${JSON.stringify(now.lyrics)}`,
+      );
+    } finally {
+      window.fetch = original;
+    }
+  }
+
+  if (scenario === "volume") {
+    await openPanel();
+    await emit("media-state", TRACK);
+    await wait(250);
+
+    notch().querySelector(".notch-media-volume").click();
+    await wait(220);
+    let now = sample();
+    check(now.volumeOpen, "the speaker opens the volume panel");
+    check(now.volumeValue === "40%", `the endpoint's own level is shown, got "${now.volumeValue}"`);
+
+    const range = notch().querySelector(".notch-volume-range");
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    setter.call(range, "75");
+    range.dispatchEvent(new Event("input", { bubbles: true }));
+    await wait(180);
+
+    const sets = window.__notchCommands.filter((entry) => entry.command === "volume_set");
+    check(
+      Math.abs((sets.at(-1)?.args?.level ?? 0) - 0.75) < 0.01,
+      `the slider sets 0.75, got ${sets.at(-1)?.args?.level}`,
+    );
+    check(sets.at(-1)?.args?.muted === false, "moving the slider unmutes");
+
+    notch().querySelector(".notch-volume-mute").click();
+    await wait(180);
+    check(window.__notchVolume.muted === true, "mute reaches the endpoint");
+    now = sample();
+    check(now.volumeValue === "75%", `the level survives mute, got "${now.volumeValue}"`);
+
+    press(window, "Escape");
+    await wait(200);
+    check(!sample().volumeOpen, "Escape closes the volume panel");
+    check(sample().open, "closing the volume panel leaves the notch open");
+
+    // A real press is a pointerdown followed by a click: the same button has
+    // to toggle rather than close-and-reopen.
+    const speaker = () => notch().querySelector(".notch-media-volume");
+    const tap = (element) => {
+      const rect = element.getBoundingClientRect();
+      pointer(element, "pointerdown", rect.left + rect.width / 2);
+      element.click();
+    };
+
+    tap(speaker());
+    await wait(220);
+    check(sample().volumeOpen, "the speaker reopens the panel");
+    tap(speaker());
+    await wait(240);
+    check(!sample().volumeOpen, "pressing the speaker again closes it");
+
+    // No render endpoint: the panel must say so instead of showing a slider
+    // that cannot move anything.
+    window.__notchVolumeFail = true;
+    tap(speaker());
+    await wait(260);
+    now = sample();
+    check(now.volumeOpen, "the panel still opens when the endpoint is missing");
+    check(now.volumeNote === "Volume sistem tidak tersedia", `a missing endpoint is reported, got "${now.volumeNote}"`);
+    check(now.volumeValue === "", "no fake percentage without an endpoint");
+    window.__notchVolumeFail = false;
+    tap(speaker());
+    await wait(200);
   }
 
   if (scenario === "stack") {
@@ -391,6 +648,8 @@ export async function runNookScenario(scenario = "media") {
 
   if (scenario === "collapsed") {
     await openPanel();
+    await emit("media-state", TRACK);
+    await wait(300);
     await pinActive();
     let now = sample();
     check(now.pinned.join() === "calendar", "pin exists before closing");
@@ -399,10 +658,18 @@ export async function runNookScenario(scenario = "media") {
     now = sample();
     check(!now.open, "outside click closes the wide panel");
     check(Math.abs(now.width - 200) < 3 && Math.abs(now.height - 34) < 3, `collapses to 200x34, got ${now.width.toFixed(1)}x${now.height.toFixed(1)}`);
+    check(now.clockMedia && now.clockBars === 3, "the closed bar shows the playing badge");
+    await emit("media-state", { ...TRACK, playing: false });
+    await wait(250);
+    now = sample();
+    check(!now.clockMedia, "a paused player removes the badge");
+    await emit("media-state", TRACK);
+    await wait(250);
     await emit("notch-press", null);
     await wait(900);
     now = sample();
     check(now.open, "reopens");
+    check(!now.clockMedia, "the badge belongs to the closed bar, not the panel");
     check(Math.abs(now.width - 520) < 4, `a fresh panel is 520 again, got ${now.width.toFixed(1)}`);
     check(now.pinned.length === 0, "pins do not survive the panel closing");
   }

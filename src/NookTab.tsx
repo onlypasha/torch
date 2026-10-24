@@ -1,15 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, RefObject } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { AnimatePresence, motion } from "framer-motion";
 import type { PanInfo, Transition } from "framer-motion";
-import { mediaCaption, mediaPercent, mediaTime } from "./media";
+import { useCoverAccent } from "./accent";
+import { mediaCaption, mediaPercent, mediaTime, seekRatio, seekTarget, REPEAT_LABEL } from "./media";
+import { LYRIC_FAILED, LYRIC_LOADING, LYRIC_UNAVAILABLE } from "./lyrics";
 import {
   calendarTitle,
   compactMonth,
-  LYRIC_LINES,
-  LYRIC_SOURCE_AVAILABLE,
-  LYRIC_UNAVAILABLE,
-  lyricWindow,
   POMODORO_SESSION,
   POMODORO_STATUS,
   pomodoroClock,
@@ -45,6 +44,8 @@ const MENU_HEIGHT = 50;
 const WHEEL_COOLDOWN = 320;
 const DRAG_DISTANCE = 36;
 const DRAG_VELOCITY = 400;
+/** Keyboard seek step, matching what a player's arrow keys do. */
+const SEEK_STEP_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // Media
@@ -54,10 +55,20 @@ const PREVIOUS = "M10.5 4 5 8l5.5 4M13 4v8";
 const NEXT = "M5.5 4 11 8l-5.5 4M3 4v8";
 const PLAY = "M6 3.8 12 8l-6 4.2Z";
 const PAUSE = "M5.5 4v8M10.5 4v8";
+const SHUFFLE = "M2.5 4.5h2l6.5 7h2M2.5 11.5h2l6.5-7h2M11.5 2.8 13.6 4.5l-2.1 1.7M11.5 9.8l2.1 1.7-2.1 1.7";
+const REPEAT = "M4.2 6.3V5.6c0-.9.7-1.6 1.6-1.6h6.4M12.2 4 10.6 2.4M12.2 4l-1.6 1.6M11.8 9.7v.7c0 .9-.7 1.6-1.6 1.6H3.8M3.8 12l1.6 1.6M3.8 12l1.6-1.6";
 
-function TransportIcon({ path, filled = false }: { path: string; filled?: boolean }) {
+function TransportIcon({
+  path,
+  filled = false,
+  size = 16,
+}: {
+  path: string;
+  filled?: boolean;
+  size?: number;
+}) {
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"
+    <svg width={size} height={size} viewBox="0 0 16 16" aria-hidden="true"
       stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
       fill={filled ? "currentColor" : "none"}>
       <path d={path} />
@@ -65,14 +76,278 @@ function TransportIcon({ path, filled = false }: { path: string; filled?: boolea
   );
 }
 
+/**
+ * Scrolling title, only when the text is wider than the space it was given.
+ * CSS drives the movement so a long title costs one animation, not a React
+ * render per frame; a short one stays perfectly still.
+ */
+function Marquee({ text, className }: { text: string; className?: string }) {
+  const box = useRef<HTMLSpanElement>(null);
+  const inner = useRef<HTMLSpanElement>(null);
+  const [shift, setShift] = useState(0);
+
+  useEffect(() => {
+    const measure = () => {
+      const outer = box.current;
+      const content = inner.current;
+      if (!outer || !content) return;
+      const overflow = content.scrollWidth - outer.clientWidth;
+      setShift(overflow > 2 ? overflow + 16 : 0);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (box.current) observer.observe(box.current);
+    return () => observer.disconnect();
+  }, [text]);
+
+  const style = shift > 0
+    ? ({
+        "--marquee-shift": `-${shift}px`,
+        "--marquee-duration": `${Math.max(3, shift / 26)}s`,
+      } as CSSProperties)
+    : undefined;
+
+  return (
+    <span ref={box} className={`notch-marquee ${className ?? ""}`} title={text}>
+      <span ref={inner} className="notch-marquee-inner" data-scroll={shift > 0 ? "true" : "false"} style={style}>
+        {text}
+      </span>
+    </span>
+  );
+}
+
+/**
+ * The progress bar, which is also the seek control. The preview is optimistic:
+ * the thumb follows the pointer immediately and the player is only asked once,
+ * on release, so dragging does not flood the session with seeks.
+ */
+function SeekBar({ nook }: { nook: NookModel }) {
+  const { media, positionMs } = nook;
+  const track = useRef<HTMLDivElement>(null);
+  const dragging = useRef(false);
+  const [hover, setHover] = useState<number | null>(null);
+
+  const duration = media?.durationMs ?? 0;
+  const canSeek = media?.canSeek === true && duration > 0;
+  const percent = mediaPercent(positionMs, duration);
+
+  const ratioAt = (clientX: number) => {
+    const rect = track.current?.getBoundingClientRect();
+    if (!rect) return 0;
+    return seekRatio(clientX, rect.left, rect.width);
+  };
+
+  const finish = (clientX: number) => {
+    if (!dragging.current) return;
+    dragging.current = false;
+    nook.commitSeek(ratioAt(clientX));
+    setHover(null);
+  };
+
+  const step = (deltaMs: number) => {
+    if (!canSeek) return;
+    const target = Math.min(duration, Math.max(0, positionMs + deltaMs));
+    nook.commitSeek(target / duration);
+  };
+
+  return (
+    <div className="notch-media-progress">
+      <div
+        ref={track}
+        className="notch-media-track"
+        data-interactive={canSeek ? "true" : "false"}
+        data-failed={nook.seekFailed ? "true" : "false"}
+        role={canSeek ? "slider" : undefined}
+        tabIndex={canSeek ? 0 : -1}
+        aria-label="Posisi lagu"
+        aria-valuemin={0}
+        aria-valuemax={Math.round(duration / 1000)}
+        aria-valuenow={Math.round(positionMs / 1000)}
+        aria-valuetext={mediaTime(positionMs)}
+        onPointerDown={(event) => {
+          if (!canSeek || event.button !== 0) return;
+          dragging.current = true;
+          // A capture on a pointer the browser no longer tracks throws; the
+          // drag still works without it, so this must never break the handler.
+          try {
+            event.currentTarget.setPointerCapture(event.pointerId);
+          } catch {
+            /* not capturable in this environment */
+          }
+          nook.beginSeek();
+          nook.previewSeek(ratioAt(event.clientX));
+        }}
+        onPointerMove={(event) => {
+          const ratio = ratioAt(event.clientX);
+          if (dragging.current) nook.previewSeek(ratio);
+          else if (canSeek) setHover(ratio);
+        }}
+        onPointerUp={(event) => finish(event.clientX)}
+        onPointerCancel={(event) => finish(event.clientX)}
+        onPointerLeave={() => setHover(null)}
+        onKeyDown={(event) => {
+          if (!canSeek) return;
+          if (event.key === "ArrowRight") {
+            event.preventDefault();
+            step(SEEK_STEP_MS);
+          } else if (event.key === "ArrowLeft") {
+            event.preventDefault();
+            step(-SEEK_STEP_MS);
+          } else if (event.key === "Home") {
+            event.preventDefault();
+            nook.commitSeek(0);
+          } else if (event.key === "End") {
+            event.preventDefault();
+            nook.commitSeek(1);
+          }
+        }}
+      >
+        <span className="notch-media-fill" style={{ width: `${percent}%` }} />
+        {hover !== null && canSeek && (
+          <span className="notch-media-hover" style={{ left: `${hover * 100}%` }} aria-hidden="true">
+            {mediaTime(seekTarget(hover, duration))}
+          </span>
+        )}
+      </div>
+      <span className="notch-media-times">
+        <span>{mediaTime(positionMs)}</span>
+        <span data-notice={nook.seekFailed ? "true" : undefined}>
+          {nook.seekFailed ? "Seek ditolak" : mediaTime(duration)}
+        </span>
+      </span>
+    </div>
+  );
+}
+
+type Volume = { level: number; muted: boolean };
+
+/** System volume, which is what the Windows flyout changes too. */
+function VolumePanel({
+  anchor,
+  onClose,
+}: {
+  /** The speaker that opened the panel; pressing it again must close, not reopen. */
+  anchor: RefObject<HTMLButtonElement | null>;
+  onClose: () => void;
+}) {
+  const [volume, setVolume] = useState<Volume | null>(null);
+  const [failed, setFailed] = useState(false);
+  const card = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    void invoke<Volume>("volume_get")
+      .then((value) => {
+        if (!disposed) setVolume(value);
+      })
+      .catch(() => {
+        if (!disposed) setFailed(true);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const onPointer = (event: PointerEvent) => {
+      const target = event.target as Node;
+      // The speaker's own click toggles the panel; treating it as "outside"
+      // would close and immediately reopen it.
+      if (card.current?.contains(target) || anchor.current?.contains(target)) return;
+      onClose();
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("pointerdown", onPointer, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", onPointer, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [anchor, onClose]);
+
+  const publish = useCallback((next: Volume) => {
+    setVolume(next);
+    void invoke("volume_set", { level: next.level, muted: next.muted }).catch(() => {
+      setFailed(true);
+    });
+  }, []);
+
+  const level = volume?.level ?? 0;
+  const muted = volume?.muted ?? false;
+
+  return (
+    <motion.div
+      ref={card}
+      className="notch-volume"
+      role="group"
+      aria-label="Volume sistem"
+      initial={{ opacity: 0, y: 6, scale: 0.96 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={{ opacity: 0, y: 6, scale: 0.96 }}
+      transition={{ duration: 0.14, ease: "easeOut" }}
+    >
+      {failed ? (
+        <p className="notch-volume-note">Volume sistem tidak tersedia</p>
+      ) : (
+        <>
+          <div className="notch-volume-head">
+            <span>{muted ? "Senyap" : "Volume"}</span>
+            <span className="notch-volume-value">{volume ? `${Math.round(level * 100)}%` : "…"}</span>
+          </div>
+          <input
+            className="notch-volume-range"
+            type="range"
+            min={0}
+            max={100}
+            step={1}
+            value={Math.round(level * 100)}
+            disabled={!volume}
+            aria-label="Tingkat volume"
+            onChange={(event) => publish({ level: Number(event.target.value) / 100, muted: false })}
+          />
+          <button
+            type="button"
+            className="notch-pill-ghost notch-volume-mute"
+            disabled={!volume}
+            onClick={() => publish({ level, muted: !muted })}
+          >
+            {muted ? "Bunyikan" : "Senyapkan"}
+          </button>
+        </>
+      )}
+    </motion.div>
+  );
+}
+
 function MediaPanel({ nook }: { nook: NookModel }) {
   const { media } = nook;
   const caption = mediaCaption(media);
-  const percent = media ? mediaPercent(media.positionMs, media.durationMs) : 0;
   const playing = media?.playing === true;
+  const accent = useCoverAccent(media?.thumbnail);
+  const [volumeOpen, setVolumeOpen] = useState(false);
+  const volumeButton = useRef<HTMLButtonElement>(null);
+
+  const style = accent ? ({ "--media-accent": accent } as CSSProperties) : undefined;
 
   return (
-    <section className="notch-media" aria-label="Media">
+    <section className="notch-media" aria-label="Media" style={style}>
+      <button
+        ref={volumeButton}
+        type="button"
+        className="notch-media-volume"
+        aria-label={volumeOpen ? "Tutup volume" : "Volume sistem"}
+        aria-expanded={volumeOpen}
+        onClick={() => setVolumeOpen((open) => !open)}
+      >
+        <TransportIcon path="M3 6.3h2L8.2 3.6v8.8L5 9.7H3ZM10.6 6.1a2.7 2.7 0 0 1 0 3.8M12.4 4.4a5 5 0 0 1 0 7.2" size={13} />
+      </button>
+
+      <AnimatePresence>
+        {volumeOpen && <VolumePanel anchor={volumeButton} onClose={() => setVolumeOpen(false)} />}
+      </AnimatePresence>
+
       <div className="notch-media-head">
         <div
           className="notch-media-cover"
@@ -97,27 +372,29 @@ function MediaPanel({ nook }: { nook: NookModel }) {
           </span>
         </div>
         <div className="notch-media-text">
-          <span className="notch-media-title" title={caption.title}>{caption.title}</span>
-          <span className="notch-media-artist" title={caption.artist}>{caption.artist}</span>
+          <Marquee text={caption.title} className="notch-media-title" />
+          <Marquee text={caption.artist} className="notch-media-artist" />
+          {caption.album && <Marquee text={caption.album} className="notch-media-album" />}
         </div>
       </div>
 
-      <div className="notch-media-progress" aria-hidden="true">
-        <span className="notch-media-track">
-          <motion.span
-            className="notch-media-fill"
-            initial={false}
-            animate={{ width: `${percent}%` }}
-            transition={playing ? { duration: 1, ease: "linear" } : { duration: 0.2 }}
-          />
-        </span>
-        <span className="notch-media-times">
-          <span>{mediaTime(media?.positionMs ?? 0)}</span>
-          <span>{mediaTime(media?.durationMs ?? 0)}</span>
-        </span>
-      </div>
+      <SeekBar nook={nook} />
 
-      <div className="notch-media-controls">
+      <div className="notch-media-controls" data-wide={media?.shuffleSupported || media?.repeatSupported ? "true" : "false"}>
+        {media?.shuffleSupported && (
+          <motion.button
+            type="button"
+            className="notch-media-button notch-media-toggle"
+            data-on={media.shuffle ? "true" : "false"}
+            whileTap={{ scale: 0.85 }}
+            onClick={nook.toggleShuffle}
+            aria-pressed={media.shuffle}
+            aria-label="Acak lagu"
+            title={media.shuffle ? "Acak: aktif" : "Acak: mati"}
+          >
+            <TransportIcon path={SHUFFLE} size={14} />
+          </motion.button>
+        )}
         <motion.button
           type="button"
           className="notch-media-button"
@@ -148,6 +425,20 @@ function MediaPanel({ nook }: { nook: NookModel }) {
         >
           <TransportIcon path={NEXT} />
         </motion.button>
+        {media?.repeatSupported && (
+          <motion.button
+            type="button"
+            className="notch-media-button notch-media-toggle"
+            data-on={media.repeat !== "none" ? "true" : "false"}
+            whileTap={{ scale: 0.85 }}
+            onClick={nook.cycleRepeat}
+            aria-label={REPEAT_LABEL[media.repeat]}
+            title={REPEAT_LABEL[media.repeat]}
+          >
+            <TransportIcon path={REPEAT} size={14} />
+            {media.repeat === "track" && <span className="notch-media-repeat-one">1</span>}
+          </motion.button>
+        )}
       </div>
     </section>
   );
@@ -241,33 +532,49 @@ function PomodoroStack({ nook }: { nook: NookModel }) {
   );
 }
 
+/** What the lyric widget says when there are no timed words to show. */
+function lyricNotice(nook: NookModel): string {
+  if (nook.lyrics.status === "loading") return LYRIC_LOADING;
+  if (nook.lyrics.status === "failed") return LYRIC_FAILED;
+  return LYRIC_UNAVAILABLE;
+}
+
 function LyricRows({ nook }: { nook: NookModel }) {
-  if (!LYRIC_SOURCE_AVAILABLE) {
+  if (nook.lyrics.status !== "ready") {
     return (
       <div className="notch-lyrics">
-        <motion.span className="notch-lyric-line" data-current="true" data-placeholder="true">
-          {LYRIC_UNAVAILABLE}
+        <motion.span
+          className="notch-lyric-line"
+          data-current="true"
+          data-placeholder="true"
+          data-status={nook.lyrics.status}
+          initial={false}
+          animate={{ opacity: 1 }}
+        >
+          {lyricNotice(nook)}
         </motion.span>
       </div>
     );
   }
-  const window = lyricWindow(nook.lyricIndex);
+
   const rows = [
-    { key: nook.lyricIndex - 1, text: window.previous, current: false },
-    { key: nook.lyricIndex, text: window.current, current: true },
-    { key: nook.lyricIndex + 1, text: window.next, current: false },
-  ];
+    { role: "previous", text: nook.lyricRow.previous, current: false },
+    { role: "current", text: nook.lyricRow.current, current: true },
+    { role: "next", text: nook.lyricRow.next, current: false },
+  ].filter((row) => row.text.length > 0);
+
   return (
     <div className="notch-lyrics">
       <AnimatePresence initial={false} mode="popLayout">
         {rows.map((row) => (
           <motion.span
-            key={((row.key % LYRIC_LINES.length) + LYRIC_LINES.length) % LYRIC_LINES.length}
+            key={`${row.role}:${row.text}`}
             className="notch-lyric-line"
+            data-role={row.role}
             data-current={row.current ? "true" : "false"}
-            initial={{ opacity: 0, y: 12 }}
+            initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: row.current ? 1 : 0.35, y: 0 }}
-            exit={{ opacity: 0, y: -12 }}
+            exit={{ opacity: 0, y: -10 }}
             transition={LYRIC_SPRING}
           >
             {row.text}
@@ -423,7 +730,7 @@ function PinBadge() {
   );
 }
 
-function PinnedPopover({ widget, lyricIndex }: { widget: WidgetId; lyricIndex: number }) {
+function PinnedPopover({ widget, nook }: { widget: WidgetId; nook: NookModel }) {
   const today = new Date();
   if (widget === "calendar") {
     return (
@@ -436,8 +743,8 @@ function PinnedPopover({ widget, lyricIndex }: { widget: WidgetId; lyricIndex: n
   }
   if (widget === "lyric") {
     return (
-      <span className="notch-pin-lyric">
-        {LYRIC_SOURCE_AVAILABLE ? lyricWindow(lyricIndex).current : LYRIC_UNAVAILABLE}
+      <span className="notch-pin-lyric" data-status={nook.lyrics.status}>
+        {nook.lyrics.status === "ready" ? nook.lyricRow.current || LYRIC_UNAVAILABLE : lyricNotice(nook)}
       </span>
     );
   }
@@ -535,7 +842,7 @@ function PinnedColumn({
               {widget !== "calendar" && (
                 <span className="notch-pin-label">{WIDGET_LABEL[widget]}</span>
               )}
-              <PinnedPopover widget={widget} lyricIndex={nook.lyricIndex} />
+              <PinnedPopover widget={widget} nook={nook} />
             </motion.div>
           );
         })}

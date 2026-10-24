@@ -68,6 +68,40 @@ body,
   font-variant-numeric: tabular-nums;
 }
 
+/* The playing badge in the closed bar: three bars that keep time beside the
+   clock, so the notch says "sound is playing" without opening. */
+.notch-clock-media {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.notch-clock-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 11px;
+}
+
+.notch-clock-bar {
+  width: 2px;
+  height: 11px;
+  border-radius: 1px;
+  background: currentColor;
+  transform-origin: 50% 100%;
+  animation: notch-clock-bar 1.1s ease-in-out infinite alternate;
+}
+
+@keyframes notch-clock-bar {
+  from {
+    transform: scaleY(0.3);
+  }
+
+  to {
+    transform: scaleY(1);
+  }
+}
+
 /* ---------------------------------------------------------------------------
    The open panel: four tabs. The body is 520x236 wide; padding 12/22/16 (the
    spec's body padding) frames a nav bar above a 165px content area. Nothing in
@@ -762,6 +796,8 @@ body,
 /* Media ------------------------------------------------------------------ */
 
 .notch-media {
+  --media-accent: #f5f5f5;
+  position: relative;
   display: flex;
   flex: none;
   flex-direction: column;
@@ -773,11 +809,69 @@ body,
   background: rgb(255 255 255 / 0.07);
 }
 
+/* The speaker sits in the corner rather than taking a row of its own: the card
+   is only 149px tall and the transport needs that space more. */
+.notch-media-volume {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #9ca3af;
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 140ms ease, color 140ms ease;
+}
+
+.notch-media:hover .notch-media-volume,
+.notch-media-volume:focus-visible,
+.notch-media-volume[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.notch-media-volume:hover {
+  color: #f5f5f5;
+}
+
 .notch-media-head {
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
+}
+
+/* Scrolling text: only the inner span moves, and only when it overflows. */
+.notch-marquee {
+  display: block;
+  overflow: hidden;
+  max-width: 100%;
+  white-space: nowrap;
+}
+
+.notch-marquee-inner {
+  display: inline-block;
+  will-change: transform;
+}
+
+.notch-marquee-inner[data-scroll="true"] {
+  animation: notch-marquee var(--marquee-duration, 6s) ease-in-out infinite alternate;
+}
+
+@keyframes notch-marquee {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(var(--marquee-shift, 0));
+  }
 }
 
 .notch-media-cover {
@@ -812,15 +906,9 @@ body,
 .notch-media-text {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
-}
-
-.notch-media-title,
-.notch-media-artist {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  max-width: 106px;
 }
 
 .notch-media-title {
@@ -834,25 +922,83 @@ body,
   color: #9ca3af;
 }
 
+.notch-media-album {
+  font-size: 10px;
+  color: #6b7280;
+}
+
 .notch-media-progress {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
+/* The visual rail is 4px, the hit area is 12px: a seek target the size of a
+   hairline is not a target at all. */
 .notch-media-track {
+  position: relative;
   display: block;
-  height: 4px;
-  overflow: hidden;
+  height: 12px;
+  border-radius: 999px;
+  outline: none;
+}
+
+.notch-media-track::before {
+  content: "";
+  position: absolute;
+  inset: 4px 0;
   border-radius: 999px;
   background: rgb(255 255 255 / 0.14);
+  transition: inset 120ms ease, background 120ms ease;
+}
+
+.notch-media-track[data-interactive="true"] {
+  cursor: pointer;
+}
+
+.notch-media-track[data-interactive="true"]:hover::before {
+  inset: 3px 0;
+  background: rgb(255 255 255 / 0.22);
+}
+
+.notch-media-track:focus-visible::before {
+  box-shadow: 0 0 0 2px rgb(255 255 255 / 0.4);
+}
+
+.notch-media-track[data-failed="true"]::before {
+  background: rgb(248 113 113 / 0.45);
 }
 
 .notch-media-fill {
+  position: absolute;
+  left: 0;
+  top: 4px;
   display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: #f5f5f5;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--media-accent);
+  transition: top 120ms ease, height 120ms ease, width 320ms linear;
+}
+
+.notch-media-track[data-interactive="true"]:hover .notch-media-fill {
+  top: 3px;
+  height: 6px;
+}
+
+.notch-media-hover {
+  position: absolute;
+  bottom: 15px;
+  z-index: 6;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgb(8 8 12 / 0.92);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 0.45);
+  color: #f5f5f5;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  transform: translateX(-50%);
+  pointer-events: none;
 }
 
 .notch-media-times {
@@ -863,12 +1009,20 @@ body,
   font-variant-numeric: tabular-nums;
 }
 
+.notch-media-times [data-notice="true"] {
+  color: #fca5a5;
+}
+
 .notch-media-controls {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 14px;
+  gap: 12px;
   margin-top: auto;
+}
+
+.notch-media-controls[data-wide="true"] {
+  gap: 5px;
 }
 
 .notch-media-button {
@@ -894,6 +1048,76 @@ body,
 .notch-media-play {
   background: #fff;
   color: #000;
+}
+
+.notch-media-toggle {
+  position: relative;
+  color: #6b7280;
+}
+
+.notch-media-toggle[data-on="true"] {
+  color: var(--media-accent);
+}
+
+.notch-media-repeat-one {
+  position: absolute;
+  right: 0;
+  bottom: 1px;
+  padding: 0 2px;
+  border-radius: 999px;
+  background: var(--media-accent);
+  color: #0b0b0f;
+  font-size: 7px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+/* Volume ----------------------------------------------------------------- */
+
+.notch-volume {
+  position: absolute;
+  inset: 5px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 13px;
+  background: rgb(14 14 18 / 0.97);
+  box-shadow: 0 12px 28px rgb(0 0 0 / 0.55);
+}
+
+.notch-volume-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #d1d5db;
+}
+
+.notch-volume-value {
+  color: #f5f5f5;
+  font-variant-numeric: tabular-nums;
+}
+
+/* No render endpoint (or a refused call): say so rather than show a slider
+   that cannot move anything. */
+.notch-volume-note {
+  margin: auto;
+  color: #9ca3af;
+  font-size: 11px;
+  text-align: center;
+}
+
+.notch-volume-range {
+  width: 100%;
+  accent-color: var(--media-accent);
+  cursor: pointer;
+}
+
+.notch-volume-mute {
+  align-self: flex-start;
+  margin-top: auto;
 }
 
 /* Widget stack ----------------------------------------------------------- */
@@ -1126,6 +1350,28 @@ body,
 
 .notch-lyric-line[data-current="true"] {
   font-weight: 600;
+}
+
+/* The line above is context, not content: it stays legible but recedes. */
+.notch-lyric-line[data-role="previous"] {
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.notch-lyric-line[data-role="next"] {
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.notch-lyric-line[data-placeholder="true"] {
+  color: #9ca3af;
+  font-size: 12px;
+  font-weight: 400;
+  white-space: normal;
+}
+
+.notch-lyric-line[data-status="failed"] {
+  color: #fca5a5;
 }
 
 /* Weather ---------------------------------------------------------------- */

@@ -16,6 +16,7 @@ import type { UsbPayload, UsbState, UsbPhase } from "./usb";
 import { UsbContent } from "./UsbContent";
 import { BluetoothContent } from "./BluetoothContent";
 import { Panel } from "./Panel";
+import { useMediaPlaying } from "./useMediaPlaying";
 import { BT_CONNECTING_MS, BT_CONNECTED_MS, foldBluetooth, isBluetoothKind } from "./bluetooth";
 import type { BluetoothPayload, BluetoothState } from "./bluetooth";
 
@@ -800,6 +801,8 @@ function NetworkContent({
 export default function App() {
   const [open, setOpen] = useState(false);
   const [time, setTime] = useState(() => formatClock(new Date()));
+  // The closed bar only needs to know that sound is playing, not what it is.
+  const mediaPlaying = useMediaPlaying();
   // True while a foreground window covers the collapsed notch (native monitors
   // it, see the autohide module in lib.rs). Autohide never applies to the open
   // panel, so hidden and open are mutually exclusive in practice.
@@ -1323,7 +1326,18 @@ export default function App() {
                   exit={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
                   transition={{ duration: 0.18, ease: "easeOut" }}
                 >
-                  {time}
+                  {mediaPlaying && !open ? (
+                    <span className="notch-clock-media" aria-label="Sedang memutar media">
+                      <span className="notch-clock-bars" aria-hidden="true">
+                        {[0, 1, 2].map((bar) => (
+                          <span key={bar} className="notch-clock-bar" style={{ animationDelay: `${bar * 0.16}s` }} />
+                        ))}
+                      </span>
+                      {time}
+                    </span>
+                  ) : (
+                    time
+                  )}
                 </motion.div>
               )}
             </AnimatePresence>

@@ -16,18 +16,36 @@ component state and each scenario assumes a fresh Nook start.
 
 ## Nook (media, widgets, pins)
 
-`bun test tests/nook.test.ts` covers the media formatting/artwork merge, stack
-rotation and slots, the pin limits and reordering, the Monday-first calendar,
-the lyric window and the Pomodoro clock.
+`bun test tests/nook.test.ts` covers the media formatting/artwork merge, the
+seek geometry and the shuffle/repeat cycle, the stack rotation and slots, the
+pin limits and reordering, the Monday-first calendar, and the Pomodoro clock.
+`bun test tests/lyrics.test.ts` covers LRCLIB parsing, choosing between
+performances of the same song, and the fetch cache.
 
 `src-tauri/src/media.rs` is the real Windows media session
 (`GlobalSystemMediaTransportControlsSessionManager`): it polls whichever app
-Windows considers current, emits `media-state` (including album art once per
-track) and executes previous/toggle/next on the same thread. The passive probe,
-which does not start or control playback, is:
+Windows considers current, reads the timeline position from Windows' own
+`LastUpdatedTime`, verifies seeks against the session they were sent to (with
+the pause/seek/resume fallback), and emits `media-state` plus `media-seek`. The
+passive probe, which does not start or control playback, is:
 
 ```sh
 cargo test --lib media_windows_probe -- --ignored --nocapture
+```
+
+The seek path - direct change, verification, and the pause/seek/resume fallback -
+can be checked against the current player; it moves playback five seconds ahead:
+
+```sh
+cargo test --lib media_seek_probe -- --ignored --nocapture
+```
+
+`src-tauri/src/volume.rs` drives the default render endpoint through Core
+Audio, so the speaker in the media card is the same volume the Windows flyout
+changes:
+
+```sh
+cargo test --lib volume_windows_probe -- --ignored --nocapture
 ```
 
 For the animated layout, open `http://localhost:1420/tests/nook-ui.html` at
@@ -38,7 +56,12 @@ For the animated layout, open `http://localhost:1420/tests/nook-ui.html` at
 - `pinlimit` — two pins split the column, third pin disabled, drag reorder.
 - `timer` — Pomodoro runs across tabs, pinned click pauses/resumes, border.
 - `menu` — Escape/outside, Shift+F10, ContextMenu key, native menu untouched.
-- `collapsed` — wide panel closes to 200×34 and reopens at 520 without pins.
+- `collapsed` — wide panel closes to 200×34, shows the playing badge, and reopens at 520 without pins.
+- `seek` — drag preview, one seek per release, optimistic hold, rejection notice.
+- `shuffle` — shuffle/repeat commands, player-reported state, hidden controls.
+- `lyrics` — synced rows from a stubbed LRCLIB answer, advancing with position.
+- `volume` — reads the endpoint, sets the level, mutes, toggles from the speaker,
+  and reports a missing endpoint instead of a slider that cannot move.
 
 `showcase0`, `showcase`, `showcase2`, `showcase3` leave the panel in a state
 worth screenshotting (media only, one pin, two pins with a running Pomodoro,
@@ -46,9 +69,10 @@ open pin menu). `media` is exercised by emitting `media-state`, so the browser
 fixture never needs a real player; the widget text, timing and pin state are
 the production components.
 
-Lyrics have no source in the Windows media session, so the app shows
-"Lirik belum tersedia" (the three-line motion is kept behind
-`LYRIC_SOURCE_AVAILABLE` for a future source). Weather remains sample data.
+Lyrics are fetched from LRCLIB in the webview (the service sends
+`access-control-allow-origin: *`), so the widget shows timed words when the
+service has them and says "Lirik belum tersedia" when it does not. The `lyrics`
+scenario stubs `fetch`, so it does not depend on the network.
 
 Run `bun test tests/usb.test.ts` for the pure queue/capacity tests, and
 `cargo test --lib` in `src-tauri` for the native transition tests.

@@ -1,11 +1,19 @@
 import { expect, test } from "bun:test";
-import { keepArtwork, mediaCaption, mediaPercent, mediaTime } from "../src/media";
+import {
+  appName,
+  keepArtwork,
+  mediaCaption,
+  mediaPercent,
+  mediaTime,
+  nextRepeat,
+  seekRatio,
+  seekSettled,
+  seekTarget,
+} from "../src/media";
 import type { MediaState } from "../src/media";
 import {
   calendarTitle,
   compactMonth,
-  LYRIC_LINES,
-  lyricWindow,
   MAX_PINNED,
   POMODORO_SECONDS,
   pinVerdict,
@@ -42,12 +50,15 @@ test("mediaPercent clamps and survives an unknown length", () => {
 });
 
 test("keepArtwork holds the cover while the track is unchanged", () => {
-  const first = { title: "A", artist: "B", thumbnail: "data:image/png;base64,xx" };
-  const sameTrack = { title: "A", artist: "B" };
-  const newTrack = { title: "C", artist: "D" };
+  const first = { title: "A", artist: "B", album: "C", thumbnail: "data:image/png;base64,xx" };
+  const sameTrack = { title: "A", artist: "B", album: "C" };
+  const newTrack = { title: "D", artist: "E", album: "F" };
+  // Same title and artist, different album: a different recording.
+  const otherAlbum = { title: "A", artist: "B", album: "D" };
 
   expect(keepArtwork(first, sameTrack)).toEqual({ ...sameTrack, thumbnail: first.thumbnail });
   expect(keepArtwork(first, newTrack)).toEqual(newTrack);
+  expect(keepArtwork(first, otherAlbum)).toEqual(otherAlbum);
   expect(keepArtwork(first, { ...sameTrack, thumbnail: "data:new" })).toEqual({
     ...sameTrack,
     thumbnail: "data:new",
@@ -57,7 +68,7 @@ test("keepArtwork holds the cover while the track is unchanged", () => {
 });
 
 test("mediaCaption says there is no media instead of inventing a song", () => {
-  expect(mediaCaption(null)).toEqual({ title: "Tidak ada media", artist: "" });
+  expect(mediaCaption(null)).toEqual({ title: "Tidak ada media", artist: "", album: "" });
 
   const track = {
     title: "  ",
@@ -66,12 +77,55 @@ test("mediaCaption says there is no media instead of inventing a song", () => {
     playing: false,
     positionMs: 0,
     durationMs: 0,
+    hasTimeline: false,
     canPrevious: false,
     canNext: false,
     canToggle: false,
+    canSeek: false,
+    shuffle: false,
+    shuffleSupported: false,
+    repeat: "none",
+    repeatSupported: false,
     source: "Spotify.exe",
   } satisfies NonNullable<MediaState>;
-  expect(mediaCaption(track)).toEqual({ title: "Album", artist: "Spotify.exe" });
+  expect(mediaCaption(track)).toEqual({ title: "Album", artist: "Spotify", album: "" });
+});
+
+test("an app name is readable from an executable or a packaged-app id", () => {
+  expect(appName("Spotify.exe")).toBe("Spotify");
+  expect(appName("C:\\Program Files\\Mozilla Firefox\\firefox.exe")).toBe("firefox");
+  expect(appName("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify")).toBe("Spotify");
+  expect(appName("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic")).toBe("ZuneMusic");
+  expect(appName("")).toBe("");
+});
+
+test("a seek target follows the pointer and stays inside the track", () => {
+  expect(seekTarget(0.25, 180_000)).toBe(45_000);
+  expect(seekTarget(0.75, 180_000)).toBe(135_000);
+  expect(seekTarget(-1, 180_000)).toBe(0);
+  expect(seekTarget(2, 180_000)).toBe(180_000);
+  // A live stream has no length to seek inside.
+  expect(seekTarget(0.5, 0)).toBe(0);
+  expect(seekTarget(Number.NaN, 180_000)).toBe(0);
+});
+
+test("the pointer position is a clamped ratio of the bar", () => {
+  expect(seekRatio(150, 100, 200)).toBe(0.25);
+  expect(seekRatio(90, 100, 200)).toBe(0);
+  expect(seekRatio(400, 100, 200)).toBe(1);
+  expect(seekRatio(150, 100, 0)).toBe(0);
+});
+
+test("a seek settles only when the player came close to the target", () => {
+  expect(seekSettled(60_000, 60_400)).toBe(true);
+  expect(seekSettled(60_000, 61_400)).toBe(true);
+  expect(seekSettled(60_000, 63_000)).toBe(false);
+});
+
+test("repeat cycles off, all, one", () => {
+  expect(nextRepeat("none")).toBe("list");
+  expect(nextRepeat("list")).toBe("track");
+  expect(nextRepeat("track")).toBe("none");
 });
 
 // ---------------------------------------------------------------------------
@@ -149,15 +203,8 @@ test("a Monday week does not reach into the previous month", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Lyrics and Pomodoro
+// Pomodoro
 // ---------------------------------------------------------------------------
-
-test("the lyric window wraps around the placeholder verses", () => {
-  expect(lyricWindow(0).current).toBe(LYRIC_LINES[0]);
-  expect(lyricWindow(0).previous).toBe(LYRIC_LINES[LYRIC_LINES.length - 1]);
-  expect(lyricWindow(0).next).toBe(LYRIC_LINES[1]);
-  expect(lyricWindow(LYRIC_LINES.length).current).toBe(LYRIC_LINES[0]);
-});
 
 test("the Pomodoro clock, fraction, and status labels", () => {
   expect(POMODORO_SECONDS).toBe(1500);

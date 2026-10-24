@@ -2,6 +2,8 @@
  * What the native media worker emits. `null` means Windows has no session at
  * all, which the panel shows as "Tidak ada media" rather than as an empty song.
  */
+export type MediaRepeat = "none" | "list" | "track";
+
 export type MediaState = {
   title: string;
   artist: string;
@@ -9,14 +11,23 @@ export type MediaState = {
   playing: boolean;
   positionMs: number;
   durationMs: number;
+  hasTimeline: boolean;
   thumbnail?: string;
   canPrevious: boolean;
   canNext: boolean;
   canToggle: boolean;
+  canSeek: boolean;
+  shuffle: boolean;
+  shuffleSupported: boolean;
+  repeat: MediaRepeat;
+  repeatSupported: boolean;
   source: string;
 } | null;
 
 export type MediaCommand = "previous" | "toggle" | "next";
+
+/** What the worker reports after it has verified a seek with the player. */
+export type SeekOutcome = { applied: boolean; positionMs: number };
 
 /** `m:ss`, or `h:mm:ss` for the rare long track. */
 export function mediaTime(ms: number): string {
@@ -35,12 +46,25 @@ export function mediaPercent(positionMs: number, durationMs: number): number {
   return Math.min(100, Math.max(0, (positionMs / durationMs) * 100));
 }
 
+/** Where a pointer at `ratio` of the bar lands, in milliseconds. */
+export function seekTarget(ratio: number, durationMs: number): number {
+  if (!Number.isFinite(ratio) || !Number.isFinite(durationMs) || durationMs <= 0) return 0;
+  return Math.round(Math.min(1, Math.max(0, ratio)) * durationMs);
+}
+
+/** Pointer position inside the bar as a 0–1 ratio, clamped at both ends. */
+export function seekRatio(clientX: number, left: number, width: number): number {
+  if (!Number.isFinite(width) || width <= 0) return 0;
+  return Math.min(1, Math.max(0, (clientX - left) / width));
+}
+
 /**
- * The worker sends album art only when the track changes, because the data URL
- * dwarfs the rest of the payload. Keep the previous image while the title and
- * artist match, and drop it the moment they don't.
+ * The worker sends album art only when the track changes or when the panel
+ * opens, because the data URL dwarfs the rest of the payload. Keep the
+ * previous image while the title, artist and album match, and drop it the
+ * moment they don't.
  */
-export function keepArtwork<T extends { title: string; artist: string; thumbnail?: string }>(
+export function keepArtwork<T extends { title: string; artist: string; album: string; thumbnail?: string }>(
   previous: T | null,
   next: T | null,
 ): T | null {
@@ -49,7 +73,8 @@ export function keepArtwork<T extends { title: string; artist: string; thumbnail
   if (
     previous?.thumbnail &&
     previous.title === next.title &&
-    previous.artist === next.artist
+    previous.artist === next.artist &&
+    previous.album === next.album
   ) {
     return { ...next, thumbnail: previous.thumbnail };
   }
@@ -59,13 +84,53 @@ export function keepArtwork<T extends { title: string; artist: string; thumbnail
 /** Windows' own transport state, as the panel's two icon states. */
 export const isPlaying = (media: MediaState): boolean => media?.playing === true;
 
+/** A readable app name from an executable name or a packaged-app AUMID. */
+export function appName(source: string): string {
+  const tail = source.split(/[\\/]/).at(-1) ?? "";
+  // Packaged apps report `Publisher.App_hash!EntryPoint`; the entry point is
+  // the recognisable part, and its last dotted segment the readable name.
+  const entry = tail.includes("!") ? (tail.split("!").at(-1) ?? "") : tail;
+  const bare = entry.replace(/\.exe$/i, "");
+  return bare.split(".").at(-1) || bare;
+}
+
 /** A session can exist while a player is stopped; the panel still shows it. */
-export function mediaCaption(media: MediaState): { title: string; artist: string } {
-  if (!media) return { title: "Tidak ada media", artist: "" };
+export function mediaCaption(media: MediaState): {
+  title: string;
+  artist: string;
+  album: string;
+} {
+  if (!media) return { title: "Tidak ada media", artist: "", album: "" };
   const album = media.album.trim();
   const title = media.title.trim() || album || "Media";
   // Avoid repeating the album as both lines; the app name is more useful
   // than an empty second line, and says where the sound comes from.
-  const artist = media.artist.trim() || (album && album !== title ? album : "") || media.source.split(/[\\/]/).at(-1) || "";
-  return { title, artist };
+  const artist = media.artist.trim() || appName(media.source);
+  return { title, artist, album: album === title ? "" : album };
+}
+
+export const REPEAT_LABEL: Record<MediaRepeat, string> = {
+  none: "Repeat mati",
+  list: "Repeat semua",
+  track: "Repeat satu",
+};
+
+export const REPEAT_BADGE: Record<MediaRepeat, string> = {
+  none: "",
+  list: "Semua",
+  track: "Satu",
+};
+
+/** Off -> all -> one -> off, the order every player's repeat button uses. */
+export function nextRepeat(mode: MediaRepeat): MediaRepeat {
+  return mode === "none" ? "list" : mode === "list" ? "track" : "none";
+}
+
+/**
+ * A seek is optimistic: the bar jumps to the target immediately and holds
+ * there until the player confirms it, because a poll in between would drag the
+ * thumb back to the old position and make the drag look ignored.
+ */
+export function seekSettled(targetMs: number, incomingMs: number): boolean {
+  return Math.abs(incomingMs - targetMs) < 1500;
 }
