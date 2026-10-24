@@ -44,6 +44,10 @@ windows = { version = "0.57", features = [
     "Media",
     "Media_Control",
     "Storage_Streams",
+    # System volume slider through Core Audio.
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
 ] }
 
 # See https://tauri.app/concept/size/#cargo-configuration

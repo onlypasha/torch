@@ -58,6 +58,9 @@ mod activity;
 mod media;
 
 #[cfg(target_os = "windows")]
+mod volume;
+
+#[cfg(target_os = "windows")]
 mod win {
     pub use platform_impl::*;
 
@@ -575,11 +578,90 @@ fn media_control(control: tauri::State<'_, media::Control>, action: String) -> R
     media::command(&control, &action)
 }
 
+/// A seek is a *request*: the panel shows it optimistically, and the worker
+/// verifies it against the player before reporting back on `media-seek`.
+#[tauri::command]
+fn media_seek(control: tauri::State<'_, media::Control>, position_ms: u64) -> Result<(), String> {
+    media::seek(&control, position_ms)
+}
+
+#[tauri::command]
+fn media_shuffle(control: tauri::State<'_, media::Control>, active: bool) {
+    media::shuffle(&control, active);
+}
+
+#[tauri::command]
+fn media_repeat(control: tauri::State<'_, media::Control>) {
+    media::repeat(&control, true);
+}
+
+/// "The panel just opened": send the whole state, artwork included, instead of
+/// waiting for the next poll to notice a change.
+#[tauri::command]
+fn media_snapshot(control: tauri::State<'_, media::Control>) {
+    media::snapshot(&control);
+}
+
+#[tauri::command]
+fn media_polling(control: tauri::State<'_, media::Control>, active: bool) {
+    media::set_polling(&control, active);
+}
+
+#[tauri::command]
+fn volume_get() -> Result<volume::Volume, String> {
+    volume::get()
+}
+
+#[tauri::command]
+fn volume_set(level: f32, muted: bool) -> Result<(), String> {
+    volume::set(level, muted)
+}
+
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
 fn media_control(action: String) -> Result<(), String> {
     let _ = action;
     Err("media control is Windows-only".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn media_seek(position_ms: u64) -> Result<(), String> {
+    let _ = position_ms;
+    Err("media seek is Windows-only".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn media_shuffle(active: bool) {
+    let _ = active;
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn media_repeat() {}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn media_snapshot() {}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn media_polling(active: bool) {
+    let _ = active;
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn volume_get() -> Result<(), String> {
+    Err("volume is Windows-only".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn volume_set(level: f32, muted: bool) -> Result<(), String> {
+    let _ = (level, muted);
+    Err("volume is Windows-only".into())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -625,6 +707,13 @@ pub fn run() {
             set_panel_open,
             set_notch_hidden,
             media_control,
+            media_seek,
+            media_shuffle,
+            media_repeat,
+            media_snapshot,
+            media_polling,
+            volume_get,
+            volume_set,
             show_notch_menu
         ])
         .run(tauri::generate_context!())
