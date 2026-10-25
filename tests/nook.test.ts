@@ -117,15 +117,18 @@ test("mediaPercent clamps and survives an unknown length", () => {
 });
 
 test("keepArtwork holds the cover while the track is unchanged", () => {
-  const first = { title: "A", artist: "B", album: "C", thumbnail: "data:image/png;base64,xx" };
-  const sameTrack = { title: "A", artist: "B", album: "C" };
-  const newTrack = { title: "D", artist: "E", album: "F" };
+  const first = { title: "A", artist: "B", album: "C", source: "Spotify.exe", thumbnail: "data:image/png;base64,xx" };
+  const sameTrack = { title: "A", artist: "B", album: "C", source: "Spotify.exe" };
+  const newTrack = { title: "D", artist: "E", album: "F", source: "Spotify.exe" };
   // Same title and artist, different album: a different recording.
-  const otherAlbum = { title: "A", artist: "B", album: "D" };
+  const otherAlbum = { title: "A", artist: "B", album: "D", source: "Spotify.exe" };
+  // Same metadata from another player: another session, another sleeve.
+  const otherSource = { title: "A", artist: "B", album: "C", source: "MusicBee.exe" };
 
   expect(keepArtwork(first, sameTrack)).toEqual({ ...sameTrack, thumbnail: first.thumbnail });
   expect(keepArtwork(first, newTrack)).toEqual(newTrack);
   expect(keepArtwork(first, otherAlbum)).toEqual(otherAlbum);
+  expect(keepArtwork(first, otherSource)).toEqual(otherSource);
   expect(keepArtwork(first, { ...sameTrack, thumbnail: "data:new" })).toEqual({
     ...sameTrack,
     thumbnail: "data:new",

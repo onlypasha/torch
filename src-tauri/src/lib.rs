@@ -582,8 +582,13 @@ fn media_control(control: tauri::State<'_, media::Control>, action: String) -> R
 /// A seek is a *request*: the panel shows it optimistically, and the worker
 /// verifies it against the player before reporting back on `media-seek`.
 #[tauri::command]
-fn media_seek(control: tauri::State<'_, media::Control>, position_ms: u64) -> Result<(), String> {
-    media::seek(&control, position_ms)
+fn media_seek(
+    control: tauri::State<'_, media::Control>,
+    position_ms: u64,
+    token: Option<u64>,
+    expected: Option<media::ExpectedTrack>,
+) -> Result<(), String> {
+    media::seek(&control, position_ms, token, expected)
 }
 
 #[tauri::command]
@@ -667,8 +672,12 @@ fn media_control(action: String) -> Result<(), String> {
 
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
-fn media_seek(position_ms: u64) -> Result<(), String> {
-    let _ = position_ms;
+fn media_seek(
+    position_ms: u64,
+    token: Option<u64>,
+    expected: Option<serde::de::IgnoredAny>,
+) -> Result<(), String> {
+    let _ = (position_ms, token, expected);
     Err("media seek is Windows-only".into())
 }
 

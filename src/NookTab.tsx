@@ -234,7 +234,7 @@ function MediaPanel({ nook }: { nook: NookModel }) {
   // current line; this one is the always-visible karaoke strip.
   const lyric = !media
     ? ""
-    : nook.lyrics.status === "ready"
+    : nook.lyrics.status === "ready" || nook.lyrics.status === "plain"
       ? nook.lyricRow.current || LYRIC_UNAVAILABLE
       : lyricNotice(nook);
 
@@ -480,6 +480,14 @@ function lyricNotice(nook: NookModel): string {
 }
 
 function LyricRows({ nook }: { nook: NookModel }) {
+  if (nook.lyrics.status === "plain") {
+    return (
+      <div className="notch-lyrics notch-lyrics-plain" data-status="plain">
+        <span className="notch-lyric-plain-text">{nook.lyrics.plain}</span>
+      </div>
+    );
+  }
+
   if (nook.lyrics.status !== "ready") {
     return (
       <div className="notch-lyrics">

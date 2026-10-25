@@ -22,14 +22,40 @@ export type MediaState = {
   repeat: MediaRepeat;
   repeatSupported: boolean;
   source: string;
+  /** Windows' publication stamp for this timeline sample. */
   timelineUpdatedMs?: number;
   playbackRate?: number;
+  /** Epoch millis when the worker measured `positionMs`. */
+  sampledAtMs?: number;
 } | null;
 
 export type MediaCommand = "previous" | "toggle" | "next";
 
 /** What the worker reports after it has verified a seek with the player. */
-export type SeekOutcome = { applied: boolean; positionMs: number };
+export type SeekOutcome = {
+  applied: boolean;
+  positionMs: number;
+  /** Echo of our request id, so a late answer for another drag is ignored. */
+  token?: number;
+  /** Epoch millis when the worker read `positionMs`. */
+  sampledAtMs?: number;
+  /** `track-changed` or `no-session` when nothing was sent at all. */
+  rejected?: string;
+};
+
+/**
+ * Everything that has to match for two payloads to describe the same thing:
+ * the app, not just the metadata. Two players can show the same song, and a
+ * leftover cover or seek confirmation from one must not land on the other.
+ */
+export function trackIdentity(media: {
+  title: string;
+  artist: string;
+  album: string;
+  source: string;
+}): string {
+  return [media.source, media.title, media.artist, media.album].join("\u0000");
+}
 
 /** `m:ss`, or `h:mm:ss` for the rare long track. */
 export function mediaTime(ms: number): string {
@@ -93,6 +119,10 @@ export function mergeMediaState(
     merged.canSeek = previous.canSeek;
     if (merged.positionMs <= 0 && previous.positionMs > 0) {
       merged.positionMs = previous.positionMs;
+      // The retained position was measured with the old sample, so keep its
+      // clock too; a fresh `sampledAtMs` would age the wrong number.
+      merged.sampledAtMs = previous.sampledAtMs;
+      merged.timelineUpdatedMs = previous.timelineUpdatedMs;
     }
   }
 
@@ -118,26 +148,64 @@ export type PlayheadAnchor = {
   durationMs: number;
   trackKey: string;
   playbackRate: number;
+  /**
+   * Windows' publication stamp adopted with `baseMs`. A newer publication is
+   * news - a seek, a repeat, a fresh sample - and outranks the zero guard.
+   */
+  sampleStampMs: number | null;
 };
+
+/**
+ * How much flight time may be added to a payload before it is treated as a
+ * clock problem rather than latency. Beyond this the next poll is closer.
+ */
+export const MAX_SAMPLE_AGE_MS = 2_000;
+
+/** Where a payload's own sample stands now, after its trip through IPC. */
+export function projectSample(
+  media: NonNullable<MediaState>,
+  receivedAtMs: number,
+): number {
+  const rate = media.playbackRate && media.playbackRate > 0 ? media.playbackRate : 1;
+  const age = media.sampledAtMs
+    ? Math.min(MAX_SAMPLE_AGE_MS, Math.max(0, receivedAtMs - media.sampledAtMs))
+    : 0;
+  const projected = media.positionMs + (media.playing ? age * rate : 0);
+  return media.durationMs > 0 ? Math.min(media.durationMs, projected) : projected;
+}
 
 export function nextPlayheadAnchor(
   previous: PlayheadAnchor,
   media: NonNullable<MediaState>,
   now: number,
+  receivedAtMs: number = Date.now(),
 ): PlayheadAnchor {
-  const trackKey = `${media.title}\n${media.artist}\n${media.album}`;
+  const trackKey = trackIdentity(media);
   const sameTrack = previous.trackKey === trackKey && previous.durationMs > 0;
   const playbackRate = media.playbackRate && media.playbackRate > 0 ? media.playbackRate : 1;
+  const stamp = media.timelineUpdatedMs ?? null;
+  const newerPublication =
+    stamp !== null && previous.sampleStampMs !== null && stamp > previous.sampleStampMs;
+
+  // Background web players sometimes publish a zeroed timeline while their
+  // audio keeps going. Only an *unchanged* publication can be that bogus zero:
+  // a repeat, a seek to the start or a fresh sample is real news.
   const staleZero =
-    sameTrack && previous.playing && media.playing && media.positionMs === 0 && previous.baseMs > 0;
+    sameTrack &&
+    previous.playing &&
+    media.playing &&
+    media.positionMs === 0 &&
+    previous.baseMs > 0 &&
+    !newerPublication;
 
   return {
-    baseMs: staleZero ? previous.baseMs : media.positionMs,
+    baseMs: staleZero ? previous.baseMs : projectSample(media, receivedAtMs),
     at: staleZero ? previous.at : now,
     playing: media.playing,
     durationMs: media.durationMs,
     trackKey,
     playbackRate,
+    sampleStampMs: staleZero ? previous.sampleStampMs : stamp,
   };
 }
 
@@ -151,10 +219,16 @@ export function playheadAt(anchor: PlayheadAnchor, now: number): number {
 /**
  * The worker sends album art only when the track changes or when the panel
  * opens, because the data URL dwarfs the rest of the payload. Keep the
- * previous image while the title, artist and album match, and drop it the
- * moment they don't.
+ * previous image while the app and the title, artist and album match, and drop
+ * it the moment they don't.
  */
-export function keepArtwork<T extends { title: string; artist: string; album: string; thumbnail?: string }>(
+export function keepArtwork<T extends {
+  title: string;
+  artist: string;
+  album: string;
+  source: string;
+  thumbnail?: string;
+}>(
   previous: T | null,
   next: T | null,
 ): T | null {
@@ -164,7 +238,8 @@ export function keepArtwork<T extends { title: string; artist: string; album: st
     previous?.thumbnail &&
     previous.title === next.title &&
     previous.artist === next.artist &&
-    previous.album === next.album
+    previous.album === next.album &&
+    previous.source === next.source
   ) {
     return { ...next, thumbnail: previous.thumbnail };
   }

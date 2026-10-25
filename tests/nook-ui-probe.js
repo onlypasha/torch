@@ -94,6 +94,8 @@ function state() {
       current: row.dataset.current === "true",
       status: row.dataset.status ?? "",
     })),
+    plainBlock: lyricCard?.querySelector(".notch-lyrics-plain")?.dataset.status ?? "",
+    plainLyrics: lyricCard?.querySelector(".notch-lyric-plain-text")?.textContent ?? "",
     stackTime: stackPomodoro?.querySelector(".notch-pomodoro-time")?.textContent ?? "",
     stackStart: stackPomodoro?.querySelector(".notch-pill-light")?.textContent ?? "",
     timerMode: stackPomodoro?.querySelector(".notch-pomodoro-mode")?.textContent.trim() ?? "",
@@ -983,6 +985,91 @@ export async function runNookScenario(scenario = "media") {
     await openPanel();
     check(sample().current === "1:03", "reopening restores real playback, not an abandoned drag preview");
     check(!window.__notchCommands.some((entry) => entry.command === "media_seek"), "closing a drag does not submit an unintended seek");
+  }
+
+  if (scenario === "seek-guard") {
+    await openPanel();
+    await emit("media-state", TRACK);
+    await wait(250);
+    const bar = notch().querySelector(".notch-media-track");
+    const rect = bar.getBoundingClientRect();
+    const seeks = () => window.__notchCommands.filter((entry) => entry.command === "media_seek");
+
+    pointer(bar, "pointerdown", rect.left + rect.width * 0.75);
+    pointer(bar, "pointerup", rect.left + rect.width * 0.75);
+    await wait(150);
+
+    const first = seeks().at(-1)?.args;
+    check(typeof first?.token === "number", `a seek carries a request token, got ${JSON.stringify(first)}`);
+    check(
+      first?.expected?.title === TRACK.title
+        && first?.expected?.artist === TRACK.artist
+        && first?.expected?.album === TRACK.album
+        && first?.expected?.source === TRACK.source,
+      `a seek names the track it was built for, got ${JSON.stringify(first?.expected)}`,
+    );
+
+    // An answer for an older drag must not move this bar.
+    await emit("media-seek", { applied: true, positionMs: 20_000, token: first.token - 1 });
+    await wait(150);
+    check(sample().current === "2:15", `a stale seek answer is ignored, got "${sample().current}"`);
+
+    await emit("media-seek", { applied: true, positionMs: 135_000, token: first.token });
+    await wait(150);
+    check(sample().current === "2:15" && sample().notice === "", "the matching answer settles the seek");
+
+    // Second drag: the first answer arriving again must not settle it.
+    pointer(bar, "pointerdown", rect.left + rect.width * 0.1);
+    pointer(bar, "pointerup", rect.left + rect.width * 0.1);
+    await wait(150);
+    const second = seeks().at(-1)?.args;
+    check(typeof second?.token === "number" && second.token !== first.token, "a re-drag gets a new token");
+    await emit("media-seek", { applied: true, positionMs: 135_000, token: first.token });
+    await wait(150);
+    check(sample().current === "0:18", `the older answer leaves the new preview alone, got "${sample().current}"`);
+
+    // A track change drops the held target instead of pinning the new song.
+    await emit("media-state", { ...TRACK, title: "Lagu Baru", artist: "", album: "", positionMs: 5_000 });
+    await wait(200);
+    check(sample().current === "0:05", `a new track replaces the held seek target, got "${sample().current}"`);
+  }
+
+  if (scenario === "lyrics-plain") {
+    const original = window.fetch;
+    let calls = 0;
+    window.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        plainLyrics: "Baris pertama tanpa waktu\nBaris kedua tanpa waktu",
+        duration: 180,
+        trackName: "Malam Ini",
+        artistName: "Contoh Band",
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      await openPanel();
+      check(await selectWidget("lyric") === "lyric", "the lyric widget is reachable through the stack");
+
+      // Looked up first without a duration, then again once the player reports one.
+      await emit("media-state", { ...TRACK, durationMs: 0, positionMs: 61_000 });
+      await wait(300);
+      const before = calls;
+      check(before > 0, `the sheet is asked for without a duration, got ${calls} calls`);
+      await emit("media-state", { ...TRACK, durationMs: 180_000, positionMs: 61_000 });
+      await wait(600);
+      check(calls > before, `a known duration asks again, got ${calls} calls after ${before}`);
+
+      const now = sample();
+      check(now.plainBlock === "plain", `the plain block reports its status, got "${now.plainBlock}"`);
+      check(
+        now.plainLyrics.includes("Baris pertama") && now.plainLyrics.includes("Baris kedua"),
+        "both untimed lines are shown as a block",
+      );
+      check(now.lyrics.length === 0, "untimed words are not rendered as timed rows");
+      check(now.lyric.startsWith("Baris pertama"), `the media strip shows the first plain line, got "${now.lyric}"`);
+    } finally {
+      window.fetch = original;
+    }
   }
 
   if (scenario === "showcase0") {

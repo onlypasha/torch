@@ -6,6 +6,7 @@ import {
   lyricWindow,
   parseLrc,
   pickBest,
+  pickSheet,
 } from "../src/lyrics";
 
 // ---------------------------------------------------------------------------
@@ -110,6 +111,30 @@ test("an unknown duration still picks a synced answer", () => {
   expect(picked?.[0].text).toBe("Satu");
 });
 
+test("untimed words are a plain sheet, never a timed one", () => {
+  const sheet = pickSheet([{ plainLyrics: "  Baris satu\n\nBaris dua  ", duration: 180 }], 180_000);
+  expect(sheet).toEqual({ lines: [], plain: "Baris satu\nBaris dua" });
+  // The seekbar/clock must not be handed a fake timeline for them.
+  expect(pickBest([{ plainLyrics: "Baris satu", duration: 180 }], 180_000)).toBeNull();
+});
+
+test("a live recording gets the live words, not the studio ones", () => {
+  const candidates = [
+    { syncedLyrics: synced("Studio"), duration: 180, trackName: "Lagu", albumName: "Album" },
+    { syncedLyrics: synced("Live"), duration: 180, trackName: "Lagu", albumName: "Live at Wembley" },
+  ];
+  expect(pickSheet(candidates, 180_000, "Lagu - Live at Wembley")?.lines[0].text).toBe("Live");
+  expect(pickSheet(candidates, 180_000, "Lagu")?.lines[0].text).toBe("Studio");
+});
+
+test("a mismatched performance falls back to plain words instead of wrong timing", () => {
+  const candidates = [
+    { syncedLyrics: synced("Extended"), duration: 240, trackName: "Lagu", albumName: "Extended" },
+    { plainLyrics: "Kata biasa", duration: 180, trackName: "Lagu", albumName: "Album" },
+  ];
+  expect(pickSheet(candidates, 180_000, "Lagu")).toEqual({ lines: [], plain: "Kata biasa" });
+});
+
 test("bracketed noise is removed before asking the service", () => {
   expect(cleanTrackTitle("Lagu (feat. Orang)")).toBe("Lagu");
   expect(cleanTrackTitle("Lagu [Remastered 2011]")).toBe("Lagu [Remastered 2011]");
@@ -140,6 +165,30 @@ test("a fetched sheet is cached and asked for once", async () => {
     expect(first?.[0].text).toBe("Halo");
     expect(second).toEqual(first);
     expect(calls).toBe(1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("a sheet found without a duration is looked up again once it is known", async () => {
+  clearLyricsCache();
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response(
+      JSON.stringify({ syncedLyrics: "[00:00.00]Halo", duration: 180 }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+
+  try {
+    const { fetchLyricsSheet } = await import("../src/lyrics");
+    const unknown = await fetchLyricsSheet({ title: "Judul Uji", artist: "Artis Uji", durationMs: 0 });
+    const known = await fetchLyricsSheet({ title: "Judul Uji", artist: "Artis Uji", durationMs: 180_000 });
+    expect(unknown?.lines[0].text).toBe("Halo");
+    expect(known?.lines[0].text).toBe("Halo");
+    expect(calls).toBe(2);
   } finally {
     globalThis.fetch = original;
   }

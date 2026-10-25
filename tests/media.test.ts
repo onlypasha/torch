@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import { nextPlayheadAnchor, playheadAt } from "../src/media";
+import {
+  MAX_SAMPLE_AGE_MS,
+  nextPlayheadAnchor,
+  playheadAt,
+  projectSample,
+  trackIdentity,
+} from "../src/media";
 import type { MediaState, PlayheadAnchor } from "../src/media";
 
 // ---------------------------------------------------------------------------
@@ -36,8 +42,9 @@ const anchorAt = (baseMs: number, at = 1_000, overrides: Partial<PlayheadAnchor>
   at,
   playing: true,
   durationMs: 180_000,
-  trackKey: "Lagu\nPenyanyi\nAlbum",
+  trackKey: trackIdentity(track()),
   playbackRate: 1,
+  sampleStampMs: null,
   ...overrides,
 });
 
@@ -84,7 +91,7 @@ test("a new track may start at zero even after a long previous one", () => {
   );
   expect(next.baseMs).toBe(0);
   expect(next.at).toBe(2_000);
-  expect(next.trackKey).toBe("Lain\nPenyanyi\nAlbum");
+  expect(next.trackKey).toBe(trackIdentity(track({ title: "Lain", positionMs: 0 })));
 });
 
 test("the projection follows the playback rate", () => {
@@ -102,4 +109,78 @@ test("a zero or missing rate falls back to normal speed", () => {
   expect(zero.playbackRate).toBe(1);
   const missing = nextPlayheadAnchor(anchorAt(0), track({ positionMs: 1_000, playbackRate: undefined }), 2_000);
   expect(missing.playbackRate).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// When the sample was taken
+// ---------------------------------------------------------------------------
+
+test("the flight time of a payload is added exactly once", () => {
+  // Native already projected the player's LastUpdatedTime to `sampledAtMs`;
+  // the webview only adds the IPC hop after that instant.
+  const media = track({ positionMs: 10_000, sampledAtMs: 1_000 });
+
+  expect(projectSample(media, 1_500)).toBe(10_500);
+  expect(projectSample({ ...media, playing: false }, 1_500)).toBe(10_000);
+  expect(projectSample({ ...media, playbackRate: 2 }, 1_500)).toBe(11_000);
+});
+
+test("an absurdly old sample is not projected into the future", () => {
+  const media = track({ positionMs: 10_000, sampledAtMs: 1_000 });
+  expect(projectSample(media, 1_000 + MAX_SAMPLE_AGE_MS * 5)).toBe(10_000 + MAX_SAMPLE_AGE_MS);
+  // A clock that went backwards adds nothing rather than rewinding the bar.
+  expect(projectSample(media, 500)).toBe(10_000);
+});
+
+test("the anchor adopts the sample's own timestamp", () => {
+  const next = nextPlayheadAnchor(
+    anchorAt(30_000, 1_000),
+    track({ positionMs: 30_000, sampledAtMs: 2_000 }),
+    3_000,
+    2_500,
+  );
+  expect(next.baseMs).toBe(30_500);
+  expect(next.at).toBe(3_000);
+  expect(playheadAt(next, 3_000)).toBe(30_500);
+});
+
+// ---------------------------------------------------------------------------
+// Publication identity, and the same metadata from two players
+// ---------------------------------------------------------------------------
+
+test("the same song from another app is another track", () => {
+  const spotify = track();
+  const musicBee = track({ source: "MusicBee.exe" });
+  expect(trackIdentity(spotify)).not.toBe(trackIdentity(musicBee));
+
+  const next = nextPlayheadAnchor(anchorAt(30_000), { ...musicBee, positionMs: 0 }, 2_000);
+  expect(next.baseMs).toBe(0);
+  expect(next.at).toBe(2_000);
+});
+
+test("a newer publication is real news even when it says zero", () => {
+  // A repeat or a seek to the start publishes zero *with* a new stamp; the
+  // stale-zero guard must not swallow that.
+  const previous = anchorAt(30_000, 1_000, { sampleStampMs: 1_000 });
+  const next = nextPlayheadAnchor(
+    previous,
+    track({ positionMs: 0, timelineUpdatedMs: 1_500 }),
+    2_000,
+  );
+  expect(next.baseMs).toBe(0);
+  expect(next.at).toBe(2_000);
+  expect(next.sampleStampMs).toBe(1_500);
+});
+
+test("an unchanged publication cannot rewind a playing track", () => {
+  const previous = anchorAt(30_000, 1_000, { sampleStampMs: 1_000 });
+  const next = nextPlayheadAnchor(
+    previous,
+    track({ positionMs: 0, timelineUpdatedMs: 1_000 }),
+    2_000,
+  );
+  expect(next.baseMs).toBe(30_000);
+  expect(next.at).toBe(1_000);
+  expect(playheadAt(next, 2_000)).toBe(31_000);
+  expect(next.sampleStampMs).toBe(1_000);
 });

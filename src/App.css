@@ -1561,6 +1561,29 @@ body,
   color: #fca5a5;
 }
 
+/* Untimed words are one block: there is no clock to move them, so the card
+   scrolls instead of pretending a line is "current". */
+.notch-lyrics-plain {
+  display: block;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-width: none;
+}
+
+.notch-lyrics-plain::-webkit-scrollbar {
+  display: none;
+}
+
+.notch-lyric-plain-text {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 16px;
+  color: #cbd5e1;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
 /* Weather ---------------------------------------------------------------- */
 
 .notch-weather {

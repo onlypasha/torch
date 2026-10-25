@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { mergeMediaState, nextPlayheadAnchor, playheadAt, seekSettled, seekTarget } from "./media";
+import {
+  MAX_SAMPLE_AGE_MS,
+  mergeMediaState,
+  nextPlayheadAnchor,
+  playheadAt,
+  seekSettled,
+  seekTarget,
+  trackIdentity,
+} from "./media";
 import type { MediaCommand, MediaState, PlayheadAnchor, SeekOutcome } from "./media";
-import { fetchLyrics, lyricWindow } from "./lyrics";
+import { fetchLyricsSheet, lyricWindow } from "./lyrics";
 import type { LyricLine, LyricsState, LyricsStatus } from "./lyrics";
 import {
   pinVerdict,
@@ -74,7 +82,11 @@ export function useNook(open: boolean): NookModel {
   const [seekPending, setSeekPending] = useState<number | null>(null);
   const [seekPreviewMs, setSeekPreviewMs] = useState<number | null>(null);
   const [seekFailed, setSeekFailed] = useState(false);
-  const pendingRef = useRef<{ targetMs: number; at: number } | null>(null);
+  // The request id is the only way to tell an answer for the drag just
+  // released from one for a drag that was abandoned or aimed at another song.
+  const seekTokenRef = useRef(0);
+  const pendingRef = useRef<{ token: number; targetMs: number; at: number } | null>(null);
+  const trackKeyRef = useRef("");
 
   // A panel can disappear during a drag. Keep real playback/requests, not an
   // abandoned preview that would otherwise cover the timeline on reopening.
@@ -92,14 +104,27 @@ export function useNook(open: boolean): NookModel {
     durationMs: 0,
     trackKey: "",
     playbackRate: 1.0,
+    sampleStampMs: null,
   });
 
   useEffect(() => {
     let disposed = false;
     let stop: (() => void) | undefined;
     listen<MediaState>("media-state", (event) => {
+      // The payload was measured at `sampledAtMs`; this is when it landed.
+      const receivedAtMs = Date.now();
       const merged = mergeMediaState(artwork.current, event.payload);
       artwork.current = merged;
+
+      // A seek belongs to the track it was aimed at. Once the source moves on,
+      // its pending target must not keep drawing the new song's bar.
+      const nextKey = merged ? trackIdentity(merged) : "";
+      if (nextKey !== trackKeyRef.current) {
+        trackKeyRef.current = nextKey;
+        pendingRef.current = null;
+        setSeekPending(null);
+        setSeekPreviewMs(null);
+      }
 
       const pending = pendingRef.current;
       if (pending) {
@@ -114,8 +139,9 @@ export function useNook(open: boolean): NookModel {
       if (merged) {
         const now = performance.now();
         // The source wins on every update, with the single stale-zero guard
-        // documented on `nextPlayheadAnchor`.
-        const anchor = nextPlayheadAnchor(anchorRef.current, merged, now);
+        // documented on `nextPlayheadAnchor`. The flight time of this payload
+        // is added on top of the position native already projected.
+        const anchor = nextPlayheadAnchor(anchorRef.current, merged, now, receivedAtMs);
         anchorRef.current = anchor;
         setLocalClockMs(Math.round(playheadAt(anchor, now)));
       }
@@ -160,21 +186,37 @@ export function useNook(open: boolean): NookModel {
     let disposed = false;
     let stop: (() => void) | undefined;
     listen<SeekOutcome>("media-seek", (event) => {
+      const outcome = event.payload;
+      // Late answers for an older drag (or a probe without a token) must not
+      // move a bar that now belongs to a different request. Untokened events
+      // are still accepted, which keeps the plain worker/UI contract usable.
+      if (outcome.token !== undefined && outcome.token !== seekTokenRef.current) return;
+
       // Whatever the player answered, the preview must not stay on screen once
       // the worker has finished verifying: a rejected seek snaps back.
       pendingRef.current = null;
       setSeekPending(null);
       setSeekPreviewMs(null);
-      setSeekFailed(!event.payload.applied);
-      if (event.payload.applied) {
+      setSeekFailed(!outcome.applied);
+      if (outcome.applied) {
         // Hold the verified position until the next timeline sample arrives,
         // like the WPF commit does, so the bar does not flash the old spot.
+        // The worker read it at `sampledAtMs`, so only the trip since then is
+        // added - the player's own projection is already in `positionMs`.
+        const rate = anchorRef.current.playbackRate;
+        const age = outcome.sampledAtMs
+          ? Math.min(MAX_SAMPLE_AGE_MS, Math.max(0, Date.now() - outcome.sampledAtMs))
+          : 0;
+        const base = outcome.positionMs + (anchorRef.current.playing ? age * rate : 0);
         anchorRef.current = {
           ...anchorRef.current,
-          baseMs: event.payload.positionMs,
+          baseMs: base,
           at: performance.now(),
+          // Keep the last publication stamp: the next payload carrying a newer
+          // one is real news, while a repeat of the old stamp is still suspect.
+          sampleStampMs: anchorRef.current.sampleStampMs,
         };
-        setLocalClockMs(event.payload.positionMs);
+        setLocalClockMs(Math.round(base));
       }
     }).then((unlisten) => {
       if (disposed) unlisten();
@@ -207,15 +249,29 @@ export function useNook(open: boolean): NookModel {
   }, []);
 
   const commitSeek = useCallback((ratio: number) => {
-    const duration = artwork.current?.durationMs ?? 0;
+    const current = artwork.current;
+    const duration = current?.durationMs ?? 0;
     setSeekPreviewMs(null);
-    if (duration <= 0) return;
+    if (!current || duration <= 0) return;
     const targetMs = seekTarget(ratio, duration);
-    pendingRef.current = { targetMs, at: performance.now() };
+    const token = ++seekTokenRef.current;
+    pendingRef.current = { token, targetMs, at: performance.now() };
     setSeekPending(targetMs);
     setSeekFailed(false);
-    void invoke("media_seek", { positionMs: targetMs }).catch((error) => {
+    void invoke("media_seek", {
+      positionMs: targetMs,
+      token,
+      // The worker refuses this if the source moved on while the pointer was
+      // down, instead of dropping the next song at the old track's position.
+      expected: {
+        title: current.title,
+        artist: current.artist,
+        album: current.album,
+        source: current.source,
+      },
+    }).catch((error) => {
       console.error("media_seek failed:", error);
+      if (pendingRef.current?.token !== token) return;
       pendingRef.current = null;
       setSeekPending(null);
       setSeekFailed(true);
@@ -321,6 +377,7 @@ export function useNook(open: boolean): NookModel {
 
   const [lyricStatus, setLyricStatus] = useState<LyricsStatus>("idle");
   const [lyricLines, setLyricLines] = useState<LyricLine[]>([]);
+  const [lyricPlain, setLyricPlain] = useState("");
   // Position/artwork polls create new media objects. Only a change of song may
   // cancel the sheet being fetched, not the next playback tick.
   const lyricTitle = media?.title.trim() ?? "";
@@ -335,38 +392,55 @@ export function useNook(open: boolean): NookModel {
     return localClockMs;
   }, [localClockMs, seekPending, seekPreviewMs]);
 
-  // Track identity for lyrics: do not trigger re-fetches if duration momentarily drops
+  // One identity for the clock, the artwork and the words: title/artist/album
+  // plus the app, so two players showing the same song still count as two.
   const currentSongKey = useMemo(() => {
-    if (!hasMedia || !lyricTitle || !lyricArtist) return "";
-    return `${lyricTitle}\n${lyricArtist}\n${lyricAlbum}`;
-  }, [hasMedia, lyricTitle, lyricArtist, lyricAlbum]);
+    if (!media || !lyricTitle || !lyricArtist) return "";
+    return trackIdentity(media);
+  }, [media, lyricTitle, lyricArtist]);
+
+  // A duration that arrives a moment after the metadata is a reason to ask
+  // again: the first lookup may have been sent without one. It never goes back
+  // to unknown, so a momentary zero cannot start a request loop.
+  const lastDurationRef = useRef(0);
+  if (lyricDuration > 0) lastDurationRef.current = lyricDuration;
+  const lyricFetchSeconds = lyricDuration > 0 ? lyricDuration : lastDurationRef.current;
+  const lyricDurationReady = lyricFetchSeconds > 0;
 
   useEffect(() => {
     if (!hasMedia) {
       setLyricStatus("idle");
       setLyricLines([]);
+      setLyricPlain("");
       return;
     }
     if (!lyricTitle || !lyricArtist) {
       setLyricStatus("unavailable");
       setLyricLines([]);
+      setLyricPlain("");
       return;
     }
     const controller = new AbortController();
     setLyricStatus("loading");
     setLyricLines([]);
-    void fetchLyrics({
+    setLyricPlain("");
+    void fetchLyricsSheet({
       title: lyricTitle,
       artist: lyricArtist,
       album: lyricAlbum,
-      durationMs: lyricDuration * 1000,
+      durationMs: lyricFetchSeconds * 1000,
       signal: controller.signal,
     })
-      .then((lines) => {
+      .then((sheet) => {
         if (controller.signal.aborted) return;
-        if (lines && lines.length > 0) {
-          setLyricLines(lines);
+        if (sheet && sheet.lines.length > 0) {
+          setLyricLines(sheet.lines);
           setLyricStatus("ready");
+        } else if (sheet && sheet.plain) {
+          // Untimed words are still words. They are shown as a block instead
+          // of being advanced by a clock that has nothing to align them to.
+          setLyricPlain(sheet.plain);
+          setLyricStatus("plain");
         } else {
           setLyricStatus("unavailable");
         }
@@ -378,7 +452,9 @@ export function useNook(open: boolean): NookModel {
         setLyricStatus("failed");
       });
     return () => controller.abort();
-  }, [currentSongKey]);
+    // The duration only matters as "known or not": a sheet found without one
+    // is looked up again when the player finally reports it.
+  }, [currentSongKey, lyricDurationReady, hasMedia]);
 
   // The row follows the displayed position, which includes a seek preview, so
   // the words move with the thumb instead of waiting for the player's answer.
@@ -386,6 +462,10 @@ export function useNook(open: boolean): NookModel {
   const lyricRow = useMemo(
     () => lyricWindow(lyricLines, positionMs),
     [lyricLines, positionMs],
+  );
+  const plainFirstLine = useMemo(
+    () => lyricPlain.split("\n").find((line) => line.trim()) ?? "",
+    [lyricPlain],
   );
 
   return {
@@ -412,7 +492,10 @@ export function useNook(open: boolean): NookModel {
     togglePomodoro,
     resetPomodoro,
     cyclePomodoroMode,
-    lyrics: { status: lyricStatus, lines: lyricLines },
-    lyricRow: { previous: lyricRow.previous, current: lyricRow.current, next: lyricRow.next },
+    lyrics: { status: lyricStatus, lines: lyricLines, plain: lyricPlain },
+    lyricRow:
+      lyricStatus === "plain"
+        ? { previous: "", current: plainFirstLine, next: "" }
+        : { previous: lyricRow.previous, current: lyricRow.current, next: lyricRow.next },
   };
 }

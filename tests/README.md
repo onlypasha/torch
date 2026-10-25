@@ -31,14 +31,16 @@ catch-up, pause/resume/reset/restart, and the three-second completion feedback.
 seek geometry and the shuffle/repeat cycle, the stack rotation and slots, the
 pin limits and reordering, the Monday-first calendar, and the Pomodoro clock.
 `bun test tests/lyrics.test.ts` covers LRCLIB parsing, choosing between
-performances of the same song, and the fetch cache.
+performances of the same song, preferring a version that matches a `live`/
+`acoustic` title, plain-only answers, and the fetch cache.
 
 `src-tauri/src/media.rs` is the real Windows media session
 (`GlobalSystemMediaTransportControlsSessionManager`): it polls whichever app
 Windows considers current, reads the timeline position from Windows' own
-`LastUpdatedTime`, verifies seeks against the session they were sent to (with
-the pause/seek/resume fallback), and emits `media-state` plus `media-seek`. The
-passive probe, which does not start or control playback, is:
+`LastUpdatedTime`, stamps the payload with `sampledAtMs`, verifies seeks against
+the session and track they were sent to (with the pause/seek/resume fallback),
+and emits `media-state` plus `media-seek`. The passive probe, which does not
+start or control playback, is:
 
 ```sh
 cargo test --lib media_windows_probe -- --ignored --nocapture
@@ -76,8 +78,10 @@ For the animated layout, open `http://localhost:1420/tests/nook-ui.html` at
 - `collapsed` — wide panel closes to 200×34, shows the playing badge, and reopens directly at 752 with its pins and active widget retained.
 - `seek` — drag preview, one seek per release, optimistic hold, rejection notice.
 - `seek-close` — collapse during a preview discards the abandoned drag without seeking; reopening displays the player's real position.
+- `seek-guard` — a seek carries a request token and the track it was built for; an older answer is ignored, and a track change drops the held target.
 - `shuffle` — shuffle/repeat commands, player-reported state, hidden controls.
 - `lyrics` — delayed LRCLIB answer survives position polls, rows advance, temporary missing metadata recovers, old-song answers are ignored.
+- `lyrics-plain` — untimed words render as one static block (never as timed rows), and a duration arriving after the first lookup asks the service again.
 - `lyrics-timeout` — a stalled request reports failure after seven seconds instead of staying in loading.
 - `lyrics-layout` — long active lines wrap to two compact lines; fixed slots stay inside 252×148 during transitions; pinned lyrics fit with two pins. `lyrics-layout-showcase` leaves the full lyric card visible for screenshots.
 

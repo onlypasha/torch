@@ -84,10 +84,16 @@ pub struct MediaPayload {
     pub repeat: String,
     pub repeat_supported: bool,
     pub source: String,
-    /// Monotonic timestamp (epoch millis) when this timeline sample was updated/measured by Windows
+    /// Epoch millis when Windows last published this timeline. It is the
+    /// publication's identity, not an age to add again: the position above is
+    /// already projected to `sampled_at_ms`.
     pub timeline_updated_ms: Option<u64>,
     /// Playback rate (e.g. 1.0 = normal, 1.5 = 1.5x)
     pub playback_rate: f64,
+    /// Epoch millis when `position_ms` was measured here. The webview advances
+    /// the bar by the time the payload spent in flight, so a slow IPC hop or a
+    /// busy frame cannot leave the words behind the voice.
+    pub sampled_at_ms: u64,
 }
 
 /// Maximum time to latch missing timeline properties for the same song before
@@ -104,18 +110,43 @@ struct LatchedTimeline {
     updated_at: Option<Instant>,
 }
 
+/// The track a seek was meant for. The webview sends the identity it computed
+/// its target from, so a drag released just as the song changes is refused
+/// instead of dropping the next song at the old one's position.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpectedTrack {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub source: String,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeekOutcome {
+    /// Echo of the request id, so an answer for an abandoned drag is ignored
+    /// instead of moving the bar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<u64>,
     pub applied: bool,
     pub position_ms: u64,
+    /// Epoch millis when `position_ms` was read.
+    pub sampled_at_ms: u64,
+    /// Why nothing was sent, when the worker refused the request outright.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
 }
 
 pub enum Action {
     Previous,
     Toggle,
     Next,
-    Seek(u64),
+    Seek {
+        token: Option<u64>,
+        position_ms: u64,
+        expected: Option<ExpectedTrack>,
+    },
     SetShuffle(bool),
     SetRepeat(bool),
     /// "The panel just opened": publish everything, artwork included.
@@ -301,6 +332,7 @@ fn read_session(
     session: &GlobalSystemMediaTransportControlsSession,
     props: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
     now: i64,
+    sampled_at_ms: u64,
     latched: &mut LatchedTimeline,
     last_playing: Option<bool>,
 ) -> Reading {
@@ -472,6 +504,7 @@ fn read_session(
             source,
             timeline_updated_ms,
             playback_rate,
+            sampled_at_ms,
         },
         art_reference: props.Thumbnail().ok(),
     }
@@ -480,6 +513,35 @@ fn read_session(
 // ---------------------------------------------------------------------------
 // Seek
 // ---------------------------------------------------------------------------
+
+/// Epoch milliseconds, the unit the webview compares its own `Date.now()` to.
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether the player still shows the track the seek was built for. Metadata
+/// that cannot be read right now is treated as "unchanged": refusing every seek
+/// on a slow read would be worse than sending one to a session that moved on.
+fn session_matches(
+    session: &GlobalSystemMediaTransportControlsSession,
+    want: &ExpectedTrack,
+) -> bool {
+    let Ok(props) = session
+        .TryGetMediaPropertiesAsync()
+        .and_then(|operation| operation.get())
+    else {
+        return true;
+    };
+    let (title, artist, album) = track_key(&props);
+    let source = session
+        .SourceAppUserModelId()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    title == want.title && artist == want.artist && album == want.album && source == want.source
+}
 
 fn playback_status(session: &GlobalSystemMediaTransportControlsSession) -> bool {
     session
@@ -546,10 +608,13 @@ fn settled(session: &GlobalSystemMediaTransportControlsSession, target_ms: u64) 
 /// Direct seeks work on most players; a few only accept a position while
 /// paused. The fallback resumes only after pausing the session itself, so a
 /// track the user had paused is never started behind their back.
+///
+/// Returns the player's own answer (applied, position). The worker attaches
+/// the request token, so this stays a pure question about one session.
 fn perform_seek(
     session: &GlobalSystemMediaTransportControlsSession,
     target_ms: u64,
-) -> SeekOutcome {
+) -> (bool, u64) {
     let duration = session
         .GetTimelineProperties()
         .ok()
@@ -562,10 +627,10 @@ fn perform_seek(
     let target = clamp_position(target_ms, duration);
 
     if send_seek(session, target) && settled(session, target) {
-        return SeekOutcome {
-            applied: true,
-            position_ms: read_position(session, now_filetime_ticks()).unwrap_or(target),
-        };
+        return (
+            true,
+            read_position(session, now_filetime_ticks()).unwrap_or(target),
+        );
     }
 
     let was_playing = playback_status(session);
@@ -586,10 +651,10 @@ fn perform_seek(
     }
 
     let applied = accepted && settled(session, target);
-    SeekOutcome {
+    (
         applied,
-        position_ms: read_position(session, now_filetime_ticks()).unwrap_or(target),
-    }
+        read_position(session, now_filetime_ticks()).unwrap_or(target),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -664,7 +729,9 @@ impl Emitted {
 /// increments whenever new bytes arrive so the emitter knows to include them.
 #[derive(Default)]
 struct Artwork {
-    key: Option<(String, String, String)>,
+    /// Source included: two players showing the same song must not share a
+    /// cover, or switching apps would keep the wrong sleeve for a moment.
+    key: Option<(String, String, String, String)>,
     data: Option<String>,
     generation: u64,
     attempts: u32,
@@ -675,7 +742,7 @@ impl Artwork {
     /// this is a new track or the previous read came back empty too early.
     fn resolve(
         &mut self,
-        key: (String, String, String),
+        key: (String, String, String, String),
         reference: Option<&IRandomAccessStreamReference>,
         force: bool,
     ) -> bool {
@@ -855,11 +922,45 @@ fn watch(app: AppHandle, commands: Receiver<Action>, wake: Sender<Action>) {
                 }
                 force_poll = true;
             }
-            Ok(Action::Seek(position_ms)) => {
-                if let Some(session) = pick_session(&manager) {
-                    let outcome = perform_seek(&session, position_ms);
-                    let _ = app.emit(SEEK_EVENT, outcome);
-                }
+            Ok(Action::Seek {
+                token,
+                position_ms,
+                expected,
+            }) => {
+                let requested_at_ms = now_epoch_ms();
+                let outcome = match pick_session(&manager) {
+                    Some(session)
+                        if expected
+                            .as_ref()
+                            .map_or(true, |want| session_matches(&session, want)) =>
+                    {
+                        let (applied, position_ms) = perform_seek(&session, position_ms);
+                        SeekOutcome {
+                            token,
+                            applied,
+                            position_ms,
+                            sampled_at_ms: now_epoch_ms(),
+                            rejected: None,
+                        }
+                    }
+                    // The song changed while the user was dragging. Report it
+                    // rather than dropping the next track at the old position.
+                    Some(session) => SeekOutcome {
+                        token,
+                        applied: false,
+                        position_ms: read_position(&session, now_filetime_ticks()).unwrap_or(0),
+                        sampled_at_ms: requested_at_ms,
+                        rejected: Some("track-changed".into()),
+                    },
+                    None => SeekOutcome {
+                        token,
+                        applied: false,
+                        position_ms: 0,
+                        sampled_at_ms: requested_at_ms,
+                        rejected: Some("no-session".into()),
+                    },
+                };
+                let _ = app.emit(SEEK_EVENT, outcome);
                 force_poll = true;
             }
             Ok(Action::SetShuffle(active)) => {
@@ -919,6 +1020,7 @@ fn watch(app: AppHandle, commands: Receiver<Action>, wake: Sender<Action>) {
         }
 
         let now = now_filetime_ticks();
+        let sampled_at_ms = now_epoch_ms();
         let session = pick_session(&manager);
         // Hook before reading so the next change cannot slip between the read
         // and the subscription.
@@ -932,12 +1034,20 @@ fn watch(app: AppHandle, commands: Receiver<Action>, wake: Sender<Action>) {
 
         match (session.as_ref(), props.as_ref()) {
             (Some(session), Some(props)) => {
-                let mut reading = read_session(session, props, now, &mut latched, last_playing);
+                let mut reading = read_session(
+                    session,
+                    props,
+                    now,
+                    sampled_at_ms,
+                    &mut latched,
+                    last_playing,
+                );
                 last_playing = Some(reading.payload.playing);
                 let key = (
                     reading.payload.title.clone(),
                     reading.payload.artist.clone(),
                     reading.payload.album.clone(),
+                    reading.payload.source.clone(),
                 );
                 let has_art = art.resolve(key, reading.art_reference.as_ref(), force_art);
                 // A track with art but not yet delivered must not let the panel
@@ -1013,11 +1123,20 @@ pub fn command(control: &Control, action: &str) -> Result<(), String> {
     }
 }
 
-pub fn seek(control: &Control, position_ms: u64) -> Result<(), String> {
+pub fn seek(
+    control: &Control,
+    position_ms: u64,
+    token: Option<u64>,
+    expected: Option<ExpectedTrack>,
+) -> Result<(), String> {
     if position_ms > 24 * 60 * 60 * 1000 {
         return Err("seek target is out of range".into());
     }
-    control.send(Action::Seek(position_ms));
+    control.send(Action::Seek {
+        token,
+        position_ms,
+        expected,
+    });
     Ok(())
 }
 
@@ -1124,6 +1243,7 @@ mod tests {
             source: "Spotify.exe".into(),
             timeline_updated_ms: None,
             playback_rate: 1.0,
+            sampled_at_ms: 1_700_000_000_000,
         };
         let mut emitted = Emitted::default();
         assert!(!emitted.matches(&payload, 1));
@@ -1162,8 +1282,16 @@ mod tests {
                     .and_then(|op| op.get())
                     .expect("media properties");
                 let mut latched = LatchedTimeline::default();
-                let reading = read_session(&session, &props, now_filetime_ticks(), &mut latched, None);
+                let reading = read_session(
+                    &session,
+                    &props,
+                    now_filetime_ticks(),
+                    now_epoch_ms(),
+                    &mut latched,
+                    None,
+                );
                 let thumb = reading.art_reference.as_ref().and_then(album_art);
+                let sample_age_ms = now_epoch_ms().saturating_sub(reading.payload.sampled_at_ms);
                 println!(
                     "title={:?} artist={:?} playing={} {}/{}ms art={} seek={} shuffle={}/{} repeat={}/{} source={}",
                     reading.payload.title,
@@ -1178,6 +1306,12 @@ mod tests {
                     reading.payload.repeat,
                     reading.payload.repeat_supported,
                     reading.payload.source
+                );
+                println!(
+                    "sampled_at_ms={} sample_age_ms={sample_age_ms} timeline_updated_ms={:?} playback_rate={}",
+                    reading.payload.sampled_at_ms,
+                    reading.payload.timeline_updated_ms,
+                    reading.payload.playback_rate
                 );
             }
             None => println!("no current session"),
@@ -1195,13 +1329,12 @@ mod tests {
         let session = pick_session(&manager).expect("media session");
         let before = read_position(&session, now_filetime_ticks()).expect("timeline");
         let target = before.saturating_add(5_000);
-        let outcome = perform_seek(&session, target);
+        let (applied, reported) = perform_seek(&session, target);
         let after = read_position(&session, now_filetime_ticks()).expect("timeline");
         println!(
-            "before={before} target={target} applied={} reported={} after={after}",
-            outcome.applied, outcome.position_ms
+            "before={before} target={target} applied={applied} reported={reported} after={after}"
         );
-        assert!(outcome.applied, "the player rejected the seek");
+        assert!(applied, "the player rejected the seek");
         assert!(
             after.abs_diff(target) < 1_500,
             "the position did not move to the target"
