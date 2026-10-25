@@ -4,9 +4,16 @@
 //! volume flyout uses: whichever app Windows itself considers to be playing is
 //! the session shown here, so no player is special-cased and nothing is scraped.
 //!
-//! One worker thread owns the WinRT objects and polls them; every *command*
-//! (transport, seek, shuffle, repeat) is sent to that same thread, because the
-//! session object is only touched from the apartment it was created in.
+//! One worker thread owns the WinRT objects; every *command* (transport, seek,
+//! shuffle, repeat) is sent to that same thread, because the session object is
+//! only touched from the apartment it was created in.
+//!
+//! Like the WPF original, the worker subscribes to the session's own
+//! `MediaPropertiesChanged`, `PlaybackInfoChanged` and
+//! `TimelinePropertiesChanged` events and to the manager's
+//! `CurrentSessionChanged`, so a play/pause, a seek or a track change wakes it
+//! immediately instead of waiting for the next poll. The 500 ms poll stays as a
+//! safety net for players that never raise those events.
 //!
 //! Three things keep the panel honest:
 //!
@@ -22,14 +29,17 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
-use windows::Foundation::DateTime;
+use windows::Foundation::{DateTime, EventRegistrationToken, TypedEventHandler};
 use windows::Media::Control::{
-    GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
-    GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    CurrentSessionChangedEventArgs, GlobalSystemMediaTransportControlsSession,
+    GlobalSystemMediaTransportControlsSessionManager,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus, MediaPropertiesChangedEventArgs,
+    PlaybackInfoChangedEventArgs, TimelinePropertiesChangedEventArgs,
 };
 use windows::Media::MediaPlaybackAutoRepeatMode;
 use windows::Storage::Streams::{DataReader, IRandomAccessStreamReference};
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+use windows::core::Interface;
 
 pub const MEDIA_EVENT: &str = "media-state";
 /// Emitted once per seek, whatever the outcome, so the bar can stop holding a
@@ -41,6 +51,9 @@ const POLL_OPEN: Duration = Duration::from_millis(500);
 /// While the panel is closed only the collapsed indicator needs the state; a
 /// sleeping machine is not polled any faster than it has to be.
 const POLL_CLOSED: Duration = Duration::from_millis(1500);
+/// Event-driven refreshes are collapsed: a player that publishes its timeline
+/// on every progress tick must not turn into a hot polling loop.
+const MIN_REFRESH_GAP: Duration = Duration::from_millis(120);
 /// Album art above this is refused rather than copied into a data URL; Windows
 /// thumbnails are normally tens of kilobytes.
 const MAX_ART_BYTES: u64 = 4 * 1024 * 1024;
@@ -71,6 +84,24 @@ pub struct MediaPayload {
     pub repeat: String,
     pub repeat_supported: bool,
     pub source: String,
+    /// Monotonic timestamp (epoch millis) when this timeline sample was updated/measured by Windows
+    pub timeline_updated_ms: Option<u64>,
+    /// Playback rate (e.g. 1.0 = normal, 1.5 = 1.5x)
+    pub playback_rate: f64,
+}
+
+/// Maximum time to latch missing timeline properties for the same song before
+/// accepting that the track truly has no timeline (e.g. infinite live streams).
+const TIMELINE_LATCH_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LatchedTimeline {
+    key: (String, String, String, String),
+    duration_ms: u64,
+    last_position_ms: u64,
+    can_seek: bool,
+    has_timeline: bool,
+    updated_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -91,6 +122,8 @@ pub enum Action {
     Snapshot,
     /// Position polling is only useful while the bar is on screen.
     SetPolling(bool),
+    /// A WinRT session/manager event says something changed right now.
+    Refresh,
 }
 
 pub struct Control(Sender<Action>);
@@ -127,8 +160,13 @@ fn now_filetime_ticks() -> i64 {
 /// displayed position is that value plus real elapsed time. A stale or absurd
 /// timestamp (sleep, clock change) contributes nothing rather than jumping the
 /// bar to the end of the track.
-fn advance_position(position_ms: u64, updated: DateTime, playing: bool, now_ticks: i64) -> u64 {
+fn advance_position(position_ms: u64, updated: DateTime, playing: bool, rate: f64, now_ticks: i64) -> u64 {
     if !playing {
+        return position_ms;
+    }
+    // If updated timestamp is zero or default (common in browsers/local players when backgrounded),
+    // we cannot calculate elapsed time from it, return base position.
+    if updated.UniversalTime <= 0 {
         return position_ms;
     }
     let elapsed_ticks = now_ticks.saturating_sub(updated.UniversalTime);
@@ -140,7 +178,9 @@ fn advance_position(position_ms: u64, updated: DateTime, playing: bool, now_tick
     if elapsed_ms >= 86_400_000 {
         return position_ms;
     }
-    position_ms.saturating_add(elapsed_ms)
+    let effective_rate = if rate > 0.0 && rate <= 16.0 { rate } else { 1.0 };
+    let scaled_elapsed = ((elapsed_ms as f64) * effective_rate).round() as u64;
+    position_ms.saturating_add(scaled_elapsed)
 }
 
 fn clamp_position(position_ms: u64, duration_ms: u64) -> u64 {
@@ -261,18 +301,26 @@ fn read_session(
     session: &GlobalSystemMediaTransportControlsSession,
     props: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
     now: i64,
+    latched: &mut LatchedTimeline,
+    last_playing: Option<bool>,
 ) -> Reading {
     let (title, artist, album) = track_key(props);
+    let source = session
+        .SourceAppUserModelId()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    let key = (title.clone(), artist.clone(), album.clone(), source.clone());
 
     // One PlaybackInfo call answers the status, the three transport buttons,
     // shuffle, repeat and whether the bar may be dragged at all.
     let playback = session.GetPlaybackInfo().ok();
-    let playing = playback
+    let playing_res = playback
         .as_ref()
-        .and_then(|info| info.PlaybackStatus().ok())
-        .is_some_and(|status| {
-            status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
-        });
+        .and_then(|info| info.PlaybackStatus().ok());
+    let playing = match playing_res {
+        Some(status) => status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing,
+        None => last_playing.unwrap_or(false),
+    };
 
     let shuffle_reference = playback
         .as_ref()
@@ -321,7 +369,14 @@ fn read_session(
         })
         .unwrap_or((true, true, true, false));
 
+    let playback_rate = playback
+        .as_ref()
+        .and_then(|info| info.PlaybackRate().ok())
+        .and_then(|val| val.Value().ok())
+        .unwrap_or(1.0);
+
     let (mut position_ms, mut duration_ms, mut has_timeline) = (0u64, 0u64, false);
+    let mut timeline_updated_ms = None;
     if let Ok(timeline) = session.GetTimelineProperties() {
         let start = timeline.StartTime().map(|t| t.Duration).unwrap_or_default();
         let end = timeline.EndTime().map(|t| t.Duration).unwrap_or_default();
@@ -329,16 +384,72 @@ fn read_session(
         if end > start {
             duration_ms = ticks_to_ms(end - start);
             let base = ticks_to_ms(position.saturating_sub(start));
+            let updated = timeline.LastUpdatedTime().unwrap_or_default();
+            if updated.UniversalTime > 0 {
+                // Convert Windows FileTime ticks (since 1601) to Unix Epoch millis
+                const EPOCH_DIFF_MS: u64 = 11_644_473_600_000;
+                let updated_ms = ticks_to_ms(updated.UniversalTime);
+                if updated_ms >= EPOCH_DIFF_MS {
+                    timeline_updated_ms = Some(updated_ms - EPOCH_DIFF_MS);
+                }
+            }
             position_ms = advance_position(
                 base,
-                timeline.LastUpdatedTime().unwrap_or_default(),
+                updated,
                 playing,
+                playback_rate,
                 now,
             );
             position_ms = clamp_position(position_ms, duration_ms);
             has_timeline = true;
         }
     }
+
+    if has_timeline && duration_ms > 0 {
+        latched.key = key;
+        latched.duration_ms = duration_ms;
+        latched.last_position_ms = position_ms;
+        latched.can_seek = can_position;
+        latched.has_timeline = true;
+        latched.updated_at = Some(Instant::now());
+    } else if latched.key == key && latched.duration_ms > 0 {
+        let within_ttl = latched
+            .updated_at
+            .is_some_and(|t| t.elapsed() < TIMELINE_LATCH_TTL);
+        if within_ttl {
+            let elapsed_since_latch = latched
+                .updated_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            duration_ms = latched.duration_ms;
+            has_timeline = latched.has_timeline;
+            position_ms = if playing {
+                clamp_position(
+                    latched.last_position_ms.saturating_add(elapsed_since_latch),
+                    duration_ms,
+                )
+            } else {
+                latched.last_position_ms
+            };
+        } else {
+            // TTL expired: accept true zero duration / stream without timeline
+            *latched = LatchedTimeline {
+                key,
+                ..Default::default()
+            };
+        }
+    } else if latched.key != key {
+        *latched = LatchedTimeline {
+            key,
+            ..Default::default()
+        };
+    }
+
+    let final_can_seek = if has_timeline {
+        can_position || (latched.duration_ms > 0 && latched.can_seek)
+    } else {
+        false
+    };
 
     Reading {
         payload: MediaPayload {
@@ -353,15 +464,14 @@ fn read_session(
             can_previous,
             can_next,
             can_toggle,
-            can_seek: can_position && has_timeline,
+            can_seek: final_can_seek,
             shuffle,
             shuffle_supported,
             repeat: repeat_mode.to_string(),
             repeat_supported,
-            source: session
-                .SourceAppUserModelId()
-                .map(|value| value.to_string_lossy())
-                .unwrap_or_default(),
+            source,
+            timeline_updated_ms,
+            playback_rate,
         },
         art_reference: props.Thumbnail().ok(),
     }
@@ -392,10 +502,17 @@ fn read_position(session: &GlobalSystemMediaTransportControlsSession, now: i64) 
     }
     let position = timeline.Position().ok()?.Duration;
     let playing = playback_status(session);
+    let rate = session
+        .GetPlaybackInfo()
+        .ok()
+        .and_then(|info| info.PlaybackRate().ok())
+        .and_then(|val| val.Value().ok())
+        .unwrap_or(1.0);
     let advanced = advance_position(
         ticks_to_ms(position.saturating_sub(start)),
         timeline.LastUpdatedTime().unwrap_or_default(),
         playing,
+        rate,
         now,
     );
     Some(clamp_position(advanced, ticks_to_ms(end - start)))
@@ -591,7 +708,95 @@ impl Artwork {
     }
 }
 
-fn watch(app: AppHandle, commands: Receiver<Action>) {
+/// The session currently watched for change events. WPF hooks the same three
+/// events; without them the panel only learns about a pause or a seek on the
+/// next poll, which is what made the bar and the lyrics lag behind the player.
+#[derive(Default)]
+struct SessionHook {
+    session: Option<GlobalSystemMediaTransportControlsSession>,
+    properties: Option<EventRegistrationToken>,
+    playback: Option<EventRegistrationToken>,
+    timeline: Option<EventRegistrationToken>,
+}
+
+impl SessionHook {
+    fn attach(
+        &mut self,
+        session: Option<&GlobalSystemMediaTransportControlsSession>,
+        wake: &Sender<Action>,
+    ) {
+        // `GetCurrentSession` hands out a fresh wrapper for the same COM object,
+        // so compare the underlying pointers instead of the Rust values.
+        let unchanged = match (&self.session, session) {
+            (Some(current), Some(next)) => std::ptr::addr_eq(current.as_raw(), next.as_raw()),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+
+        self.detach();
+        let Some(session) = session else { return };
+
+        let handler = |wake: &Sender<Action>| {
+            let wake = wake.clone();
+            TypedEventHandler::<GlobalSystemMediaTransportControlsSession, MediaPropertiesChangedEventArgs>::new(
+                move |_, _| {
+                    let _ = wake.send(Action::Refresh);
+                    Ok(())
+                },
+            )
+        };
+        if let Ok(token) = session.MediaPropertiesChanged(&handler(wake)) {
+            self.properties = Some(token);
+        }
+
+        let handler = |wake: &Sender<Action>| {
+            let wake = wake.clone();
+            TypedEventHandler::<GlobalSystemMediaTransportControlsSession, PlaybackInfoChangedEventArgs>::new(
+                move |_, _| {
+                    let _ = wake.send(Action::Refresh);
+                    Ok(())
+                },
+            )
+        };
+        if let Ok(token) = session.PlaybackInfoChanged(&handler(wake)) {
+            self.playback = Some(token);
+        }
+
+        let handler = |wake: &Sender<Action>| {
+            let wake = wake.clone();
+            TypedEventHandler::<GlobalSystemMediaTransportControlsSession, TimelinePropertiesChangedEventArgs>::new(
+                move |_, _| {
+                    let _ = wake.send(Action::Refresh);
+                    Ok(())
+                },
+            )
+        };
+        if let Ok(token) = session.TimelinePropertiesChanged(&handler(wake)) {
+            self.timeline = Some(token);
+        }
+
+        self.session = Some(session.clone());
+    }
+
+    fn detach(&mut self) {
+        if let Some(session) = self.session.take() {
+            if let Some(token) = self.properties.take() {
+                let _ = session.RemoveMediaPropertiesChanged(token);
+            }
+            if let Some(token) = self.playback.take() {
+                let _ = session.RemovePlaybackInfoChanged(token);
+            }
+            if let Some(token) = self.timeline.take() {
+                let _ = session.RemoveTimelinePropertiesChanged(token);
+            }
+        }
+    }
+}
+
+fn watch(app: AppHandle, commands: Receiver<Action>, wake: Sender<Action>) {
     if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
         eprintln!("media WinRT initialization failed: {error}");
         return;
@@ -604,10 +809,26 @@ fn watch(app: AppHandle, commands: Receiver<Action>) {
         return;
     };
 
+    // A new current session (player opened, track switched apps) must be
+    // re-hooked; the manager tells us immediately, like WPF's
+    // `CurrentSessionChanged` handler.
+    let manager_wake = wake.clone();
+    let _manager_hook = manager.CurrentSessionChanged(&TypedEventHandler::<
+        GlobalSystemMediaTransportControlsSessionManager,
+        CurrentSessionChangedEventArgs,
+    >::new(move |_, _| {
+        let _ = manager_wake.send(Action::Refresh);
+        Ok(())
+    }));
+
     let mut art = Artwork::default();
     let mut emitted = Emitted::default();
+    let mut latched = LatchedTimeline::default();
+    let mut hook = SessionHook::default();
+    let mut last_playing: Option<bool> = None;
     let mut polling = false;
     let mut next_poll = Instant::now();
+    let mut last_poll = Instant::now() - MIN_REFRESH_GAP;
     // Set after a command so the next read reflects the press immediately.
     let mut force_poll = true;
     let mut force_art = false;
@@ -672,10 +893,22 @@ fn watch(app: AppHandle, commands: Receiver<Action>) {
             Ok(Action::Snapshot) => {
                 force_poll = true;
                 force_art = true;
+                // Clear emitted cache on explicit snapshot request so fresh media state
+                // and true current playback timeline are guaranteed to be published immediately.
+                emitted = Emitted::default();
             }
             Ok(Action::SetPolling(active)) => {
                 polling = active;
                 force_poll = true;
+            }
+            Ok(Action::Refresh) => {
+                // Collapse bursts of WinRT events: refresh now when the last read
+                // is old enough, otherwise as soon as the gap allows.
+                if last_poll.elapsed() >= MIN_REFRESH_GAP {
+                    force_poll = true;
+                } else {
+                    next_poll = next_poll.min(last_poll + MIN_REFRESH_GAP);
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -687,6 +920,9 @@ fn watch(app: AppHandle, commands: Receiver<Action>) {
 
         let now = now_filetime_ticks();
         let session = pick_session(&manager);
+        // Hook before reading so the next change cannot slip between the read
+        // and the subscription.
+        hook.attach(session.as_ref(), &wake);
         let props = session.as_ref().and_then(|session| {
             session
                 .TryGetMediaPropertiesAsync()
@@ -696,7 +932,8 @@ fn watch(app: AppHandle, commands: Receiver<Action>) {
 
         match (session.as_ref(), props.as_ref()) {
             (Some(session), Some(props)) => {
-                let mut reading = read_session(session, props, now);
+                let mut reading = read_session(session, props, now, &mut latched, last_playing);
+                last_playing = Some(reading.payload.playing);
                 let key = (
                     reading.payload.title.clone(),
                     reading.payload.artist.clone(),
@@ -723,6 +960,8 @@ fn watch(app: AppHandle, commands: Receiver<Action>) {
             // No session at all: that is a fact worth reporting once.
             (None, _) => {
                 art.forget();
+                latched = LatchedTimeline::default();
+                last_playing = None;
                 if emitted.key.take().is_some() {
                     emitted = Emitted::default();
                     publish(&app, None);
@@ -735,19 +974,22 @@ fn watch(app: AppHandle, commands: Receiver<Action>) {
 
         force_poll = false;
         force_art = false;
-        next_poll = Instant::now() + if polling { POLL_OPEN } else { POLL_CLOSED };
+        last_poll = Instant::now();
+        next_poll = last_poll + if polling { POLL_OPEN } else { POLL_CLOSED };
     }
 
+    hook.detach();
     unsafe { RoUninitialize() };
 }
 
 /// Starts the worker and returns the handle commands are sent through.
 pub fn install(app: AppHandle) -> Control {
     let (tx, rx) = channel();
+    let control = Control(tx.clone());
     let _ = std::thread::Builder::new()
         .name("media-session".into())
-        .spawn(move || watch(app, rx));
-    Control(tx)
+        .spawn(move || watch(app, rx, tx));
+    control
 }
 
 fn parse_action(action: &str) -> Option<Action> {
@@ -815,9 +1057,10 @@ mod tests {
         let two_seconds_ago = DateTime {
             UniversalTime: now - 20_000_000,
         };
-        assert_eq!(advance_position(30_000, two_seconds_ago, true, now), 32_000);
+        assert_eq!(advance_position(30_000, two_seconds_ago, true, 1.0, now), 32_000);
+        assert_eq!(advance_position(30_000, two_seconds_ago, true, 1.5, now), 33_000);
         assert_eq!(
-            advance_position(30_000, two_seconds_ago, false, now),
+            advance_position(30_000, two_seconds_ago, false, 1.0, now),
             30_000
         );
 
@@ -825,13 +1068,13 @@ mod tests {
         let in_the_future = DateTime {
             UniversalTime: now + 5_000_000,
         };
-        assert_eq!(advance_position(30_000, in_the_future, true, now), 30_000);
+        assert_eq!(advance_position(30_000, in_the_future, true, 1.0, now), 30_000);
 
         // Coming back from sleep must not land the bar past the track.
         let yesterday = DateTime {
             UniversalTime: now - 864_000_000_000,
         };
-        assert_eq!(advance_position(30_000, yesterday, true, now), 30_000);
+        assert_eq!(advance_position(30_000, yesterday, true, 1.0, now), 30_000);
     }
 
     #[test]
@@ -879,6 +1122,8 @@ mod tests {
             repeat: "none".into(),
             repeat_supported: true,
             source: "Spotify.exe".into(),
+            timeline_updated_ms: None,
+            playback_rate: 1.0,
         };
         let mut emitted = Emitted::default();
         assert!(!emitted.matches(&payload, 1));
@@ -916,7 +1161,8 @@ mod tests {
                     .TryGetMediaPropertiesAsync()
                     .and_then(|op| op.get())
                     .expect("media properties");
-                let reading = read_session(&session, &props, now_filetime_ticks());
+                let mut latched = LatchedTimeline::default();
+                let reading = read_session(&session, &props, now_filetime_ticks(), &mut latched, None);
                 let thumb = reading.art_reference.as_ref().and_then(album_art);
                 println!(
                     "title={:?} artist={:?} playing={} {}/{}ms art={} seek={} shuffle={}/{} repeat={}/{} source={}",

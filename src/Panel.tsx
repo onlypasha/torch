@@ -5,7 +5,7 @@ import type { Variants } from "framer-motion";
 import { TAB_PILL_SPRING, TAB_SLIDE_PX, TAB_SWITCH_MS, TABS, tabDirection } from "./tabs";
 import type { TabId } from "./tabs";
 import { Nook } from "./NookTab";
-import { useNook } from "./useNook";
+import type { NookModel } from "./useNook";
 
 /**
  * The open panel's body: a nav bar of four tabs on top and one empty tab panel
@@ -75,17 +75,12 @@ const TAB_SWITCH: Variants = {
   }),
 };
 
-export function Panel({ onWide }: { onWide: (wide: boolean) => void }) {
-  const [active, setActive] = useState<TabId>("nook");
+export function Panel({ active, onTab, nook }: {
+  active: TabId;
+  onTab: (tab: TabId) => void;
+  nook: NookModel;
+}) {
   const [direction, setDirection] = useState(0);
-  // The Nook's state is created here, not inside the tab body, so the media,
-  // the Pomodoro, the lyric line and the pins survive tab switches.
-  const nook = useNook();
-  const wide = active === "nook" && nook.pinned.length > 0;
-
-  useEffect(() => {
-    onWide(wide);
-  }, [wide, onWide]);
 
   // Roving focus: arrows move selection, and the newly active tab receives the
   // focus so the next Tab press travels from its place in the bar.
@@ -98,7 +93,7 @@ export function Panel({ onWide }: { onWide: (wide: boolean) => void }) {
   const switchTab = (to: TabId) => {
     if (to === active) return;
     setDirection(tabDirection(active, to));
-    setActive(to);
+    onTab(to);
   };
 
   const onTablistKeyDown = (event: React.KeyboardEvent) => {
@@ -132,8 +127,10 @@ export function Panel({ onWide }: { onWide: (wide: boolean) => void }) {
             tabIndex={active === id ? 0 : -1}
             data-tab-id={id}
             className="notch-tab"
+            aria-label={label}
+            title={label}
           >
-            {/* One shared pill slides under the label of whichever tab is on
+            {/* One shared pill slides under the icon of whichever tab is on
                 top; it is rendered by the single active button and layout took
                 care of the flight between buttons. */}
             {active === id && (
@@ -143,8 +140,7 @@ export function Panel({ onWide }: { onWide: (wide: boolean) => void }) {
                 transition={TAB_PILL_SPRING}
               />
             )}
-            <TabIcon tab={id} size={16} />
-            <span className="notch-tab-label">{label}</span>
+            <TabIcon tab={id} size={15} />
           </motion.button>
         ))}
       </div>

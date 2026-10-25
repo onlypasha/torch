@@ -5,6 +5,7 @@ import {
   mediaCaption,
   mediaPercent,
   mediaTime,
+  mergeMediaState,
   nextRepeat,
   seekRatio,
   seekSettled,
@@ -29,7 +30,73 @@ import {
   unpinWidget,
   weekOf,
   weekdayLong,
+  WidgetWheelNavigator,
 } from "../src/nook";
+
+test("a touchpad swipe advances immediately and consumes a long decaying tail", () => {
+  const wheel = new WidgetWheelNavigator();
+  expect(wheel.step(120, 0, 0)).toBe(1);
+  let magnitude = 120;
+  for (let time = 16; time < 2000; time += 16) {
+    magnitude *= 0.95;
+    expect(wheel.step(magnitude, 0, time)).toBe(0);
+  }
+  expect(wheel.step(8, 0, 2300)).toBe(1);
+});
+
+test("a fresh push during momentum responds without waiting for silence", () => {
+  const wheel = new WidgetWheelNavigator();
+  const trace = [40, 80, 60, 40, 24, 14, 8, 4, 2];
+  expect(trace.map((delta, i) => wheel.step(delta, 0, i * 30))).toEqual([1, 0, 0, 0, 0, 0, 0, 0, 0]);
+  expect(wheel.step(8, 0, 270)).toBe(0);
+  expect(wheel.step(18, 0, 300)).toBe(1);
+  expect(wheel.step(30, 0, 330)).toBe(0);
+  expect(wheel.step(20, 0, 360)).toBe(0);
+});
+
+test("tiny reversed tails are ignored but a deliberate opposite swipe responds", () => {
+  const wheel = new WidgetWheelNavigator();
+  expect(wheel.step(40, 0, 0)).toBe(1);
+  for (const [time, delta] of [[40, 24], [80, 12], [120, 6], [160, 2], [200, -0.5], [240, -1]]) {
+    expect(wheel.step(delta, 0, time)).toBe(0);
+  }
+  expect(wheel.step(-20, 0, 270)).toBe(-1);
+  expect(wheel.step(-12, 0, 300)).toBe(0);
+});
+
+test("an isolated noisy momentum spike does not look like a fresh push", () => {
+  const wheel = new WidgetWheelNavigator();
+  const trace = [60, 40, 25, 12, 6, 3, 10, 4, 3, 2];
+  expect(trace.map((delta, i) => wheel.step(delta, 0, i * 50))).toEqual([1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+});
+
+test("a long flat touchpad stream cannot advance on cooldown alone", () => {
+  const wheel = new WidgetWheelNavigator();
+  expect(wheel.step(8, 0, 0)).toBe(1);
+  for (let time = 80; time <= 1600; time += 80) expect(wheel.step(8, 0, time)).toBe(0);
+});
+
+test("line and page wheel input retains the WPF throttle", () => {
+  const wheel = new WidgetWheelNavigator();
+  expect(wheel.step(3, 0, 0, 1)).toBe(1);
+  expect(wheel.step(3, 0, 140, 1)).toBe(0);
+  expect(wheel.step(3, 0, 350, 1)).toBe(1);
+  expect(wheel.step(-1, 0, 700, 2)).toBe(-1);
+});
+
+test("small deltas respond immediately without an accumulation threshold", () => {
+  expect(new WidgetWheelNavigator().step(0.5, 0, 0)).toBe(1);
+  expect(new WidgetWheelNavigator().step(-0.5, 0, 0)).toBe(-1);
+});
+
+test("horizontal input and invalid deltas cannot rotate the stack", () => {
+  const wheel = new WidgetWheelNavigator();
+  expect(wheel.step(10, 100, 0)).toBe(0);
+  expect(wheel.step(Number.NaN, 0, 30)).toBe(0);
+  expect(wheel.step(Number.POSITIVE_INFINITY, 0, 60)).toBe(0);
+  expect(wheel.step(0, 0, 90)).toBe(0);
+  expect(wheel.step(-24, 0, 120)).toBe(-1);
+});
 
 // ---------------------------------------------------------------------------
 // Media
@@ -65,6 +132,54 @@ test("keepArtwork holds the cover while the track is unchanged", () => {
   });
   expect(keepArtwork(first, null)).toBeNull();
   expect(keepArtwork(null, sameTrack)).toEqual(sameTrack);
+});
+
+test("mergeMediaState latches transient zero timeline dropouts for the same song", () => {
+  const full = {
+    title: "Malam",
+    artist: "Band",
+    album: "Demo",
+    playing: true,
+    positionMs: 45_000,
+    durationMs: 180_000,
+    hasTimeline: true,
+    canPrevious: true,
+    canNext: true,
+    canToggle: true,
+    canSeek: true,
+    shuffle: false,
+    shuffleSupported: true,
+    repeat: "none" as const,
+    repeatSupported: true,
+    source: "Spotify.exe",
+    thumbnail: "data:art",
+  };
+  const dropped = {
+    ...full,
+    positionMs: 0,
+    durationMs: 0,
+    hasTimeline: false,
+    canSeek: false,
+    thumbnail: undefined,
+  };
+
+  const merged = mergeMediaState(full, dropped);
+  expect(merged?.durationMs).toBe(180_000);
+  expect(merged?.positionMs).toBe(45_000);
+  expect(merged?.hasTimeline).toBe(true);
+  expect(merged?.canSeek).toBe(true);
+  expect(merged?.thumbnail).toBe("data:art");
+
+  // Track change should not latch old duration
+  const newTrack = {
+    ...dropped,
+    title: "Lagu Baru",
+    durationMs: 200_000,
+  };
+  const switched = mergeMediaState(full, newTrack);
+  expect(switched?.title).toBe("Lagu Baru");
+  expect(switched?.durationMs).toBe(200_000);
+  expect(switched?.thumbnail).toBeUndefined();
 });
 
 test("mediaCaption says there is no media instead of inventing a song", () => {
@@ -133,37 +248,56 @@ test("repeat cycles off, all, one", () => {
 // ---------------------------------------------------------------------------
 
 test("the stack keeps its order and drops pinned widgets", () => {
-  expect(stackWidgets([])).toEqual(["calendar", "pomodoro", "lyric", "weather"]);
-  expect(stackWidgets(["pomodoro", "weather"])).toEqual(["calendar", "lyric"]);
+  expect(stackWidgets([])).toEqual([
+    "quicksettings",
+    "sysmon",
+    "calendar",
+    "pomodoro",
+    "lyric",
+    "weather",
+  ]);
+  expect(stackWidgets(["pomodoro", "weather"])).toEqual([
+    "quicksettings",
+    "sysmon",
+    "calendar",
+    "lyric",
+  ]);
 });
 
 test("rotation wraps in both directions", () => {
   const list = stackWidgets([]);
-  expect(rotate(list, "calendar", 1)).toBe("pomodoro");
-  expect(rotate(list, "weather", 1)).toBe("calendar");
-  expect(rotate(list, "calendar", -1)).toBe("weather");
-  expect(rotate(list, "lyric", -1)).toBe("pomodoro");
+  expect(rotate(list, "quicksettings", 1)).toBe("sysmon");
+  expect(rotate(list, "weather", 1)).toBe("quicksettings");
+  expect(rotate(list, "quicksettings", -1)).toBe("weather");
+  expect(rotate(list, "sysmon", -1)).toBe("quicksettings");
 });
 
 test("a card's slot follows its distance from the active one", () => {
   const list = stackWidgets([]);
-  expect(stackSlot(stackOffset(list, "calendar", "calendar"), list.length)).toBe("active");
-  expect(stackSlot(stackOffset(list, "calendar", "pomodoro"), list.length)).toBe("next");
-  expect(stackSlot(stackOffset(list, "calendar", "lyric"), list.length)).toBe("further");
-  expect(stackSlot(stackOffset(list, "calendar", "weather"), list.length)).toBe("previous");
+  expect(stackSlot(stackOffset(list, "quicksettings", "quicksettings"), list.length)).toBe("active");
+  expect(stackSlot(stackOffset(list, "quicksettings", "sysmon"), list.length)).toBe("next");
+  expect(stackSlot(stackOffset(list, "quicksettings", "calendar"), list.length)).toBe("further");
+  expect(stackSlot(stackOffset(list, "quicksettings", "weather"), list.length)).toBe("previous");
 });
 
 // ---------------------------------------------------------------------------
 // Pins
 // ---------------------------------------------------------------------------
 
-test("pinning appends, refuses duplicates, and stops at two", () => {
+test("pinning appends, refuses duplicates, respects pinnable whitelist, and stops at two", () => {
+  expect(pinVerdict([], "quicksettings")).toBe("not-pinnable");
+  expect(pinVerdict([], "sysmon")).toBe("not-pinnable");
+  expect(pinVerdict([], "lyric")).toBe("not-pinnable");
+  expect(pinWidget([], "quicksettings")).toEqual([]);
+  expect(pinWidget([], "sysmon")).toEqual([]);
+  expect(pinWidget([], "lyric")).toEqual([]);
+
   expect(pinVerdict([], "calendar")).toBe("pin");
   expect(pinWidget([], "calendar")).toEqual(["calendar"]);
   expect(pinWidget(["calendar"], "pomodoro")).toEqual(["calendar", "pomodoro"]);
   expect(pinWidget(["calendar"], "calendar")).toEqual(["calendar"]);
-  expect(pinVerdict(["calendar", "pomodoro"], "lyric")).toBe("full");
-  expect(pinWidget(["calendar", "pomodoro"], "lyric")).toEqual(["calendar", "pomodoro"]);
+  expect(pinVerdict(["calendar", "pomodoro"], "weather")).toBe("full");
+  expect(pinWidget(["calendar", "pomodoro"], "weather")).toEqual(["calendar", "pomodoro"]);
   expect(MAX_PINNED).toBe(2);
 });
 
@@ -214,6 +348,10 @@ test("the Pomodoro clock, fraction, and status labels", () => {
   expect(pomodoroFraction(1500)).toBe(1);
   expect(pomodoroFraction(750)).toBe(0.5);
   expect(pomodoroFraction(0)).toBe(0);
+  expect(pomodoroFraction(150, 300)).toBe(0.5);
+  expect(pomodoroFraction(450, 900)).toBe(0.5);
+  expect(pomodoroFraction(300, 300)).toBe(1);
+  expect(pomodoroFraction(1, 0)).toBe(0);
   expect(pomodoroPhase(true, false)).toBe("running");
   expect(pomodoroPhase(false, false)).toBe("paused");
   expect(pomodoroPhase(false, true)).toBe("finished");

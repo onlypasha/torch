@@ -1,15 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CSSProperties, RefObject } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import type { CSSProperties } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import type { PanInfo, Transition } from "framer-motion";
-import { useCoverAccent } from "./accent";
 import { mediaCaption, mediaPercent, mediaTime, seekRatio, seekTarget, REPEAT_LABEL } from "./media";
 import { LYRIC_FAILED, LYRIC_LOADING, LYRIC_UNAVAILABLE } from "./lyrics";
 import {
   calendarTitle,
   compactMonth,
-  POMODORO_SESSION,
   POMODORO_STATUS,
   pomodoroClock,
   pomodoroFraction,
@@ -20,28 +17,29 @@ import {
   weekdayLong,
   WIDGET_LABEL,
   WEATHER,
+  WidgetWheelNavigator,
 } from "./nook";
-import type { WidgetId } from "./nook";
+import type { PinVerdict, WidgetId } from "./nook";
 import type { NookModel } from "./useNook";
+import { QuickSettingsWidget, SystemMonitorWidget } from "./QuickSettingsWidgets";
 
 /**
  * The Nook tab: fixed media panel, the rotating widget stack and (when any
  * widget is pinned) the compact column that widens the whole notch.
  *
- * The three parts never resize with the shell: the panel grows 520 -> 642 by
- * adding the pinned column beside them, so the stack keeps its full 276px.
+ * The three parts never resize with the shell: the panel grows 640 -> 752 by
+ * adding the pinned column beside them, so the stack keeps its full 252px.
  */
 
 const STACK_SPRING: Transition = { type: "spring", stiffness: 420, damping: 34 };
 const REORDER_SPRING: Transition = { type: "spring", stiffness: 500, damping: 36 };
-const LYRIC_SPRING: Transition = { type: "spring", stiffness: 400, damping: 32 };
+const LYRIC_TRANSITION: Transition = { duration: 0.18, ease: "easeOut" };
 const RING_SPRING: Transition = { duration: 0.4, ease: "easeOut" };
 const PIN_IN: Transition = { type: "spring", stiffness: 420, damping: 32, delay: 0.1 };
 const PIN_OUT: Transition = { duration: 0.15 };
 
 const MENU_WIDTH = 180;
 const MENU_HEIGHT = 50;
-const WHEEL_COOLDOWN = 320;
 const DRAG_DISTANCE = 36;
 const DRAG_VELOCITY = 400;
 /** Keyboard seek step, matching what a player's arrow keys do. */
@@ -144,6 +142,13 @@ function SeekBar({ nook }: { nook: NookModel }) {
     setHover(null);
   };
 
+  const cancelSeek = () => {
+    if (!dragging.current) return;
+    dragging.current = false;
+    setHover(null);
+    nook.commitSeek(positionMs / (duration || 1));
+  };
+
   const step = (deltaMs: number) => {
     if (!canSeek) return;
     const target = Math.min(duration, Math.max(0, positionMs + deltaMs));
@@ -183,7 +188,7 @@ function SeekBar({ nook }: { nook: NookModel }) {
           else if (canSeek) setHover(ratio);
         }}
         onPointerUp={(event) => finish(event.clientX)}
-        onPointerCancel={(event) => finish(event.clientX)}
+        onPointerCancel={() => cancelSeek()}
         onPointerLeave={() => setHover(null)}
         onKeyDown={(event) => {
           if (!canSeek) return;
@@ -219,226 +224,156 @@ function SeekBar({ nook }: { nook: NookModel }) {
   );
 }
 
-type Volume = { level: number; muted: boolean };
-
-/** System volume, which is what the Windows flyout changes too. */
-function VolumePanel({
-  anchor,
-  onClose,
-}: {
-  /** The speaker that opened the panel; pressing it again must close, not reopen. */
-  anchor: RefObject<HTMLButtonElement | null>;
-  onClose: () => void;
-}) {
-  const [volume, setVolume] = useState<Volume | null>(null);
-  const [failed, setFailed] = useState(false);
-  const card = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    let disposed = false;
-    void invoke<Volume>("volume_get")
-      .then((value) => {
-        if (!disposed) setVolume(value);
-      })
-      .catch(() => {
-        if (!disposed) setFailed(true);
-      });
-    return () => {
-      disposed = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    const onPointer = (event: PointerEvent) => {
-      const target = event.target as Node;
-      // The speaker's own click toggles the panel; treating it as "outside"
-      // would close and immediately reopen it.
-      if (card.current?.contains(target) || anchor.current?.contains(target)) return;
-      onClose();
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("pointerdown", onPointer, true);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("pointerdown", onPointer, true);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [anchor, onClose]);
-
-  const publish = useCallback((next: Volume) => {
-    setVolume(next);
-    void invoke("volume_set", { level: next.level, muted: next.muted }).catch(() => {
-      setFailed(true);
-    });
-  }, []);
-
-  const level = volume?.level ?? 0;
-  const muted = volume?.muted ?? false;
-
-  return (
-    <motion.div
-      ref={card}
-      className="notch-volume"
-      role="group"
-      aria-label="Volume sistem"
-      initial={{ opacity: 0, y: 6, scale: 0.96 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, y: 6, scale: 0.96 }}
-      transition={{ duration: 0.14, ease: "easeOut" }}
-    >
-      {failed ? (
-        <p className="notch-volume-note">Volume sistem tidak tersedia</p>
-      ) : (
-        <>
-          <div className="notch-volume-head">
-            <span>{muted ? "Senyap" : "Volume"}</span>
-            <span className="notch-volume-value">{volume ? `${Math.round(level * 100)}%` : "…"}</span>
-          </div>
-          <input
-            className="notch-volume-range"
-            type="range"
-            min={0}
-            max={100}
-            step={1}
-            value={Math.round(level * 100)}
-            disabled={!volume}
-            aria-label="Tingkat volume"
-            onChange={(event) => publish({ level: Number(event.target.value) / 100, muted: false })}
-          />
-          <button
-            type="button"
-            className="notch-pill-ghost notch-volume-mute"
-            disabled={!volume}
-            onClick={() => publish({ level, muted: !muted })}
-          >
-            {muted ? "Bunyikan" : "Senyapkan"}
-          </button>
-        </>
-      )}
-    </motion.div>
-  );
-}
-
 function MediaPanel({ nook }: { nook: NookModel }) {
   const { media } = nook;
   const caption = mediaCaption(media);
   const playing = media?.playing === true;
-  const accent = useCoverAccent(media?.thumbnail);
-  const [volumeOpen, setVolumeOpen] = useState(false);
-  const volumeButton = useRef<HTMLButtonElement>(null);
 
-  const style = accent ? ({ "--media-accent": accent } as CSSProperties) : undefined;
+  // One line, exactly like the reference's lyric row under the artist. The
+  // rotating lyric widget still exists for people who want context around the
+  // current line; this one is the always-visible karaoke strip.
+  const lyric = !media
+    ? ""
+    : nook.lyrics.status === "ready"
+      ? nook.lyricRow.current || LYRIC_UNAVAILABLE
+      : lyricNotice(nook);
 
   return (
-    <section className="notch-media" aria-label="Media" style={style}>
-      <button
-        ref={volumeButton}
-        type="button"
-        className="notch-media-volume"
-        aria-label={volumeOpen ? "Tutup volume" : "Volume sistem"}
-        aria-expanded={volumeOpen}
-        onClick={() => setVolumeOpen((open) => !open)}
-      >
-        <TransportIcon path="M3 6.3h2L8.2 3.6v8.8L5 9.7H3ZM10.6 6.1a2.7 2.7 0 0 1 0 3.8M12.4 4.4a5 5 0 0 1 0 7.2" size={13} />
-      </button>
-
-      <AnimatePresence>
-        {volumeOpen && <VolumePanel anchor={volumeButton} onClose={() => setVolumeOpen(false)} />}
-      </AnimatePresence>
-
-      <div className="notch-media-head">
+    <section
+      className="notch-media"
+      aria-label="Media"
+      data-playing={playing ? "true" : "false"}
+    >
+      {/* The sleeve's own colours, blurred behind the card the way Boring
+          Notch lights the notch from the album art. */}
+      {media?.thumbnail && (
         <div
-          className="notch-media-cover"
-          data-art={media?.thumbnail ? "true" : "false"}
-          style={media?.thumbnail ? { backgroundImage: `url(${media.thumbnail})` } : undefined}
+          className="notch-media-aura"
+          style={{ backgroundImage: `url(${media.thumbnail})` }}
           aria-hidden="true"
-        >
-          <span className="notch-media-eq">
-            {[0, 1, 2, 3].map((bar) => (
-              <motion.span
-                key={bar}
-                className="notch-media-eq-bar"
-                initial={false}
-                animate={playing ? { scaleY: [0.3, 1, 0.45, 0.9, 0.3] } : { scaleY: 0.25 }}
-                transition={
-                  playing
-                    ? { duration: 1.1, delay: bar * 0.12, ease: "easeInOut", repeat: Infinity }
-                    : { duration: 0.2 }
-                }
-              />
-            ))}
-          </span>
-        </div>
-        <div className="notch-media-text">
+        />
+      )}
+
+      <motion.div
+        className="notch-media-cover"
+        data-art={media?.thumbnail ? "true" : "false"}
+        style={media?.thumbnail ? { backgroundImage: `url(${media.thumbnail})` } : undefined}
+        aria-hidden="true"
+        initial={{ opacity: 0, scale: 0.9 }}
+        animate={{ opacity: 1, scale: playing ? 1 : 0.94 }}
+        transition={{ type: "spring", stiffness: 300, damping: 26 }}
+      >
+        {!media?.thumbnail && (
+          <svg className="notch-media-note" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 18V5l10-2v13" />
+            <circle cx="6" cy="18" r="3" />
+            <circle cx="16" cy="16" r="3" />
+          </svg>
+        )}
+        <span className="notch-media-eq">
+          {[0, 1, 2, 3].map((bar) => (
+            <motion.span
+              key={bar}
+              className="notch-media-eq-bar"
+              initial={false}
+              animate={playing ? { scaleY: [0.3, 1, 0.45, 0.9, 0.3] } : { scaleY: 0.25 }}
+              transition={
+                playing
+                  ? { duration: 1.1, delay: bar * 0.12, ease: "easeInOut", repeat: Infinity }
+                  : { duration: 0.2 }
+              }
+            />
+          ))}
+        </span>
+      </motion.div>
+
+      <div className="notch-media-info">
+        <div className="notch-media-meta">
           <Marquee text={caption.title} className="notch-media-title" />
           <Marquee text={caption.artist} className="notch-media-artist" />
-          {caption.album && <Marquee text={caption.album} className="notch-media-album" />}
         </div>
-      </div>
 
-      <SeekBar nook={nook} />
+        <div className="notch-media-lyric" data-status={nook.lyrics.status} data-empty={lyric ? undefined : "true"}>
+          <AnimatePresence mode="wait" initial={false}>
+            {lyric && (
+              <motion.span
+                key={lyric}
+                className="notch-media-lyric-line"
+                title={lyric}
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                transition={{ duration: 0.16, ease: "easeOut" }}
+              >
+                {lyric}
+              </motion.span>
+            )}
+          </AnimatePresence>
+        </div>
 
-      <div className="notch-media-controls" data-wide={media?.shuffleSupported || media?.repeatSupported ? "true" : "false"}>
-        {media?.shuffleSupported && (
+        <SeekBar nook={nook} />
+
+        <div className="notch-media-controls" data-wide={media?.shuffleSupported || media?.repeatSupported ? "true" : "false"}>
+          {media?.shuffleSupported && (
+            <motion.button
+              type="button"
+              className="notch-media-button notch-media-toggle"
+              data-on={media.shuffle ? "true" : "false"}
+              whileTap={{ scale: 0.85 }}
+              onClick={nook.toggleShuffle}
+              aria-pressed={media.shuffle}
+              aria-label="Acak lagu"
+              title={media.shuffle ? "Acak: aktif" : "Acak: mati"}
+            >
+              <TransportIcon path={SHUFFLE} size={14} />
+            </motion.button>
+          )}
           <motion.button
             type="button"
-            className="notch-media-button notch-media-toggle"
-            data-on={media.shuffle ? "true" : "false"}
+            className="notch-media-button"
             whileTap={{ scale: 0.85 }}
-            onClick={nook.toggleShuffle}
-            aria-pressed={media.shuffle}
-            aria-label="Acak lagu"
-            title={media.shuffle ? "Acak: aktif" : "Acak: mati"}
+            disabled={!media?.canPrevious}
+            onClick={() => nook.mediaControl("previous")}
+            aria-label="Lagu sebelumnya"
           >
-            <TransportIcon path={SHUFFLE} size={14} />
+            <TransportIcon path={PREVIOUS} />
           </motion.button>
-        )}
-        <motion.button
-          type="button"
-          className="notch-media-button"
-          whileTap={{ scale: 0.85 }}
-          disabled={!media?.canPrevious}
-          onClick={() => nook.mediaControl("previous")}
-          aria-label="Lagu sebelumnya"
-        >
-          <TransportIcon path={PREVIOUS} />
-        </motion.button>
-        <motion.button
-          type="button"
-          className="notch-media-button notch-media-play"
-          whileTap={{ scale: 0.85 }}
-          disabled={!media?.canToggle}
-          onClick={() => nook.mediaControl("toggle")}
-          aria-label={playing ? "Jeda" : "Putar"}
-        >
-          <TransportIcon path={playing ? PAUSE : PLAY} filled={!playing} />
-        </motion.button>
-        <motion.button
-          type="button"
-          className="notch-media-button"
-          whileTap={{ scale: 0.85 }}
-          disabled={!media?.canNext}
-          onClick={() => nook.mediaControl("next")}
-          aria-label="Lagu berikutnya"
-        >
-          <TransportIcon path={NEXT} />
-        </motion.button>
-        {media?.repeatSupported && (
           <motion.button
             type="button"
-            className="notch-media-button notch-media-toggle"
-            data-on={media.repeat !== "none" ? "true" : "false"}
+            className="notch-media-button notch-media-play"
             whileTap={{ scale: 0.85 }}
-            onClick={nook.cycleRepeat}
-            aria-label={REPEAT_LABEL[media.repeat]}
-            title={REPEAT_LABEL[media.repeat]}
+            disabled={!media?.canToggle}
+            onClick={() => nook.mediaControl("toggle")}
+            aria-label={playing ? "Jeda" : "Putar"}
           >
-            <TransportIcon path={REPEAT} size={14} />
-            {media.repeat === "track" && <span className="notch-media-repeat-one">1</span>}
+            <TransportIcon path={playing ? PAUSE : PLAY} filled={!playing} size={19} />
           </motion.button>
-        )}
+          <motion.button
+            type="button"
+            className="notch-media-button"
+            whileTap={{ scale: 0.85 }}
+            disabled={!media?.canNext}
+            onClick={() => nook.mediaControl("next")}
+            aria-label="Lagu berikutnya"
+          >
+            <TransportIcon path={NEXT} />
+          </motion.button>
+          {media?.repeatSupported && (
+            <motion.button
+              type="button"
+              className="notch-media-button notch-media-toggle"
+              data-on={media.repeat !== "none" ? "true" : "false"}
+              whileTap={{ scale: 0.85 }}
+              onClick={nook.cycleRepeat}
+              aria-label={REPEAT_LABEL[media.repeat]}
+              title={REPEAT_LABEL[media.repeat]}
+            >
+              <TransportIcon path={REPEAT} size={14} />
+              {media.repeat === "track" && <span className="notch-media-repeat-one">1</span>}
+            </motion.button>
+          )}
+        </div>
       </div>
     </section>
   );
@@ -484,7 +419,7 @@ function CalendarWidget({ compact }: { compact?: boolean }) {
 }
 
 function PomodoroStack({ nook }: { nook: NookModel }) {
-  const fraction = pomodoroFraction(nook.pomodoro.remaining);
+  const fraction = pomodoroFraction(nook.pomodoro.remaining, nook.pomodoro.mode.seconds);
   const phase = nook.pomodoroPhase;
   return (
     <div className="notch-pomodoro">
@@ -505,9 +440,14 @@ function PomodoroStack({ nook }: { nook: NookModel }) {
             transition={RING_SPRING}
           />
         </svg>
-        <span className="notch-pomodoro-session">{POMODORO_SESSION}</span>
+        <button type="button" className="notch-pomodoro-mode" onClick={nook.cyclePomodoroMode}
+          aria-label={`Ganti mode Pomodoro, saat ini ${nook.pomodoro.mode.label}, ${nook.pomodoro.mode.seconds / 60} menit`}
+          title="Ganti mode: fokus, istirahat singkat, istirahat panjang">
+          {nook.pomodoro.mode.seconds / 60} mnt
+        </button>
       </div>
       <div className="notch-pomodoro-side">
+        <span className="notch-pomodoro-mode-label">{nook.pomodoro.mode.label}</span>
         <span className="notch-pomodoro-time" data-phase={phase}>{pomodoroClock(nook.pomodoro.remaining)}</span>
         <div className="notch-pomodoro-actions">
           <motion.button
@@ -516,7 +456,7 @@ function PomodoroStack({ nook }: { nook: NookModel }) {
             whileTap={{ scale: 0.94 }}
             onClick={nook.togglePomodoro}
           >
-            {phase === "running" ? "Jeda" : "Mulai"}
+            {phase === "running" ? "Jeda" : phase === "finished" ? "Ulangi" : "Mulai"}
           </motion.button>
           <motion.button
             type="button"
@@ -561,26 +501,31 @@ function LyricRows({ nook }: { nook: NookModel }) {
     { role: "previous", text: nook.lyricRow.previous, current: false },
     { role: "current", text: nook.lyricRow.current, current: true },
     { role: "next", text: nook.lyricRow.next, current: false },
-  ].filter((row) => row.text.length > 0);
+  ];
 
   return (
     <div className="notch-lyrics">
-      <AnimatePresence initial={false} mode="popLayout">
-        {rows.map((row) => (
-          <motion.span
-            key={`${row.role}:${row.text}`}
-            className="notch-lyric-line"
-            data-role={row.role}
-            data-current={row.current ? "true" : "false"}
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: row.current ? 1 : 0.35, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            transition={LYRIC_SPRING}
-          >
-            {row.text}
-          </motion.span>
-        ))}
-      </AnimatePresence>
+      {rows.map((row) => (
+        <div key={row.role} className="notch-lyric-slot" data-slot-role={row.role}>
+          <AnimatePresence initial={false}>
+            {row.text && (
+              <motion.span
+                key={row.text}
+                className="notch-lyric-line"
+                data-role={row.role}
+                data-current={row.current ? "true" : "false"}
+                title={row.text}
+                initial={{ opacity: 0, y: 5 }}
+                animate={{ opacity: row.current ? 1 : 0.8, y: 0 }}
+                exit={{ opacity: 0, y: -5 }}
+                transition={LYRIC_TRANSITION}
+              >
+                {row.text}
+              </motion.span>
+            )}
+          </AnimatePresence>
+        </div>
+      ))}
     </div>
   );
 }
@@ -616,6 +561,8 @@ function WidgetBody({ widget, nook }: { widget: WidgetId; nook: NookModel }) {
   return (
     <div className="notch-widget" data-widget={widget}>
       <span className="notch-widget-label">{WIDGET_LABEL[widget]}</span>
+      {widget === "quicksettings" && <QuickSettingsWidget />}
+      {widget === "sysmon" && <SystemMonitorWidget />}
       {widget === "calendar" && <CalendarWidget />}
       {widget === "pomodoro" && <PomodoroStack nook={nook} />}
       {widget === "lyric" && <LyricRows nook={nook} />}
@@ -635,23 +582,45 @@ function WidgetStack({
   nook: NookModel;
   onMenu: (widget: WidgetId, target: HTMLElement) => void;
 }) {
-  const lastWheel = useRef(0);
+  const wheelNavigator = useRef(new WidgetWheelNavigator());
   const stack = useRef<HTMLDivElement>(null);
 
-  const onWheel = (event: React.WheelEvent) => {
-    if (Math.abs(event.deltaY) < 4) return;
-    const now = performance.now();
-    if (now - lastWheel.current < WHEEL_COOLDOWN) return;
-    lastWheel.current = now;
-    nook.step(event.deltaY > 0 ? 1 : -1);
-  };
+  useEffect(() => {
+    const host = stack.current;
+    if (!host) return;
+    const onWheel = (event: WheelEvent) => {
+      if (event.ctrlKey || !Number.isFinite(event.deltaY) || event.deltaY === 0 || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+      // WPF lets a nested ScrollViewer consume input until its directional
+      // edge. Only then does wheel input advance the widget carousel.
+      let element = event.target instanceof Element ? event.target : null;
+      while (element && element !== host) {
+        const overflow = getComputedStyle(element).overflowY;
+        if ((overflow === "auto" || overflow === "scroll") && element.scrollHeight - element.clientHeight > 0.5) {
+          const atTop = element.scrollTop <= 0.5;
+          const atBottom = element.scrollTop >= element.scrollHeight - element.clientHeight - 0.5;
+          if (event.deltaY < 0 ? !atTop : !atBottom) return;
+        }
+        element = element.parentElement;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const direction = wheelNavigator.current.step(event.deltaY, event.deltaX, performance.now(), event.deltaMode);
+      if (direction) nook.step(direction);
+    };
+    // React's wheel listener is passive. Use a non-passive capture listener so
+    // handled input cannot also scroll the page, matching PreviewMouseWheel.
+    host.addEventListener("wheel", onWheel, { capture: true, passive: false });
+    return () => host.removeEventListener("wheel", onWheel, true);
+  }, [nook.step]);
 
   const onKeyDown = (event: React.KeyboardEvent) => {
     if (event.key === "ArrowDown") {
       event.preventDefault();
+      stack.current?.focus({ preventScroll: true });
       nook.step(1);
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
+      stack.current?.focus({ preventScroll: true });
       nook.step(-1);
     } else if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
       event.preventDefault();
@@ -666,7 +635,6 @@ function WidgetStack({
       role="group"
       aria-label="Tumpukan widget"
       tabIndex={0}
-      onWheel={onWheel}
       onKeyDown={onKeyDown}
       onContextMenu={(event) => {
         // The visible card's own handler opens the widget menu; anywhere else
@@ -685,6 +653,8 @@ function WidgetStack({
             className="notch-stack-card"
             data-widget={widget}
             data-slot={slot}
+            inert={!active}
+            aria-hidden={!active}
             style={{ zIndex: active ? 10 : slot === "next" ? 5 : 1 }}
             initial={false}
             animate={STACK_POSITION[slot]}
@@ -730,7 +700,12 @@ function PinBadge() {
   );
 }
 
-function PinnedPopover({ widget, nook }: { widget: WidgetId; nook: NookModel }) {
+/**
+ * The body of a pinned card. Only Calendar, Pomodoro and Weather can reach the
+ * column (`PINNABLE_WIDGETS`); Pomodoro renders its own button, so this covers
+ * the two plain bodies and returns nothing for anything else.
+ */
+function PinnedBody({ widget }: { widget: WidgetId }) {
   const today = new Date();
   if (widget === "calendar") {
     return (
@@ -739,13 +714,6 @@ function PinnedPopover({ widget, nook }: { widget: WidgetId; nook: NookModel }) 
         <span className="notch-pin-month">{compactMonth(today)}</span>
         <span className="notch-pin-weekday">{weekdayLong(today)}</span>
       </div>
-    );
-  }
-  if (widget === "lyric") {
-    return (
-      <span className="notch-pin-lyric" data-status={nook.lyrics.status}>
-        {nook.lyrics.status === "ready" ? nook.lyricRow.current || LYRIC_UNAVAILABLE : lyricNotice(nook)}
-      </span>
     );
   }
   if (widget === "weather") {
@@ -825,12 +793,12 @@ function PinnedColumn({
                 <span
                   className="notch-pin-progress"
                   aria-hidden="true"
-                  style={{ "--fill": pomodoroFraction(nook.pomodoro.remaining) } as CSSProperties}
+                  style={{ "--fill": pomodoroFraction(nook.pomodoro.remaining, nook.pomodoro.mode.seconds) } as CSSProperties}
                 />
                 <PinBadge />
                 <span className="notch-pin-label">Pomodoro</span>
                 <span className="notch-pin-time">{pomodoroClock(nook.pomodoro.remaining)}</span>
-                <span className="notch-pin-status">{POMODORO_STATUS[nook.pomodoroPhase]}</span>
+                <span className="notch-pin-status" title={nook.pomodoro.mode.label}>{nook.pomodoro.running ? nook.pomodoro.mode.label : POMODORO_STATUS[nook.pomodoroPhase]}</span>
               </motion.button>
             );
           }
@@ -842,7 +810,7 @@ function PinnedColumn({
               {widget !== "calendar" && (
                 <span className="notch-pin-label">{WIDGET_LABEL[widget]}</span>
               )}
-              <PinnedPopover widget={widget} nook={nook} />
+              <PinnedBody widget={widget} />
             </motion.div>
           );
         })}
@@ -857,7 +825,8 @@ function PinnedColumn({
 
 type MenuState = { widget: WidgetId; x: number; y: number };
 
-function pinMenuLabel(verdict: "pin" | "unpin" | "full" | "last-in-stack"): string {
+function pinMenuLabel(verdict: PinVerdict): string {
+  if (verdict === "not-pinnable") return "Tidak bisa di-pin";
   if (verdict === "full" || verdict === "last-in-stack") return "Pin penuh (maks. 2)";
   return verdict === "unpin" ? "Unpin widget" : "Pin widget";
 }
@@ -934,7 +903,7 @@ export function Nook({ nook }: { nook: NookModel }) {
               type="button"
               role="menuitem"
               className="notch-menu-item"
-              disabled={verdict === "full" || verdict === "last-in-stack"}
+              disabled={verdict === "full" || verdict === "last-in-stack" || verdict === "not-pinnable"}
               onClick={() => {
                 if (verdict === "pin") nook.pin(anchor.widget);
                 else if (verdict === "unpin") nook.unpin(anchor.widget);

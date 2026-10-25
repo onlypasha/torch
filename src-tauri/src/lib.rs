@@ -34,14 +34,13 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::{Manager, WebviewWindow};
 
 /// The window is deliberately larger than the widest panel: the opening
-/// spring overshoots by ~4.5% of its travel - the 520x236 tab panel peaks near
-/// 543, and the Nook's pinned column will widen it to 642 (~671 at the peak) -
-/// and the window is never resized mid-animation, so that room has to exist
-/// from the start. The margins are transparent and, while the panel is open,
-/// they are what the hook treats as "outside". Sized once for the 642 panel
-/// (700 logical) so no later step needs a resize and the blinking surface
-/// re-creation it would cause.
-const INITIAL_WIDTH: f64 = 700.0;
+/// spring overshoots by a few percent of its travel - the compact tab panel is
+/// now 640x200, and the Nook's pinned column widens it to 752 - and the window
+/// is never resized mid-animation, so that room has to exist from the start.
+/// The margins are transparent and, while the panel is open, they are what the
+/// hook treats as "outside". Keep the reserved 800 logical width so no later
+/// step needs a resize and the blinking surface re-creation it would cause.
+const INITIAL_WIDTH: f64 = 800.0;
 const INITIAL_HEIGHT: f64 = 320.0;
 
 /// Startup silhouette: must match COLLAPSED in src/App.tsx. The frontend
@@ -56,6 +55,8 @@ mod activity;
 
 #[cfg(target_os = "windows")]
 mod media;
+
+mod sysinfo;
 
 #[cfg(target_os = "windows")]
 mod volume;
@@ -608,6 +609,46 @@ fn media_polling(control: tauri::State<'_, media::Control>, active: bool) {
 }
 
 #[tauri::command]
+fn sysinfo_stats() -> sysinfo::SystemStats {
+    sysinfo::get_stats()
+}
+
+#[tauri::command]
+fn quicksettings_get() -> sysinfo::QuickSettingsState {
+    sysinfo::get_quick_settings()
+}
+
+#[tauri::command]
+fn brightness_set(value: i32) {
+    sysinfo::set_brightness(value);
+}
+
+#[tauri::command]
+fn dnd_toggle() -> bool {
+    sysinfo::toggle_dnd()
+}
+
+#[tauri::command]
+fn system_lock() -> Result<(), String> {
+    sysinfo::action_lock()
+}
+
+#[tauri::command]
+fn system_sleep() -> Result<(), String> {
+    sysinfo::action_sleep()
+}
+
+#[tauri::command]
+fn system_hibernate() -> Result<(), String> {
+    sysinfo::action_hibernate()
+}
+
+#[tauri::command]
+fn system_shutdown() -> Result<(), String> {
+    sysinfo::action_shutdown()
+}
+
+#[tauri::command]
 fn volume_get() -> Result<volume::Volume, String> {
     volume::get()
 }
@@ -714,6 +755,14 @@ pub fn run() {
             media_polling,
             volume_get,
             volume_set,
+            sysinfo_stats,
+            quicksettings_get,
+            brightness_set,
+            dnd_toggle,
+            system_lock,
+            system_sleep,
+            system_hibernate,
+            system_shutdown,
             show_notch_menu
         ])
         .run(tauri::generate_context!())

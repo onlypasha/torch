@@ -37,16 +37,29 @@ export function cleanTrackTitle(title: string): string {
 }
 
 /**
- * LRC is a pile of `[mm:ss.xx]` prefixes, sometimes several on one line. Lines
- * without a timestamp (metadata tags such as `[ar:…]`) are metadata, not words,
- * and are dropped.
+ * LRC is a pile of `[mm:ss.xx]` prefixes, sometimes several on one line.
+ * Lines without a timestamp (metadata tags such as `[ar:…]`) are metadata,
+ * but global `[offset:+-ms]` shifts the entire lyric timeline.
  */
 export function parseLrc(text: string): LyricLine[] {
   const lines: LyricLine[] = [];
   const stamp = /\[(\d+):(\d+(?:[.:]\d+)?)\]/g;
+  const offsetRegex = /\[offset:\s*([+-]?\d+)\s*\]/i;
+  let globalOffsetMs = 0;
+
   for (const raw of text.split(/\r?\n/)) {
     const trimmed = raw.trim();
     if (!trimmed) continue;
+
+    const offsetMatch = offsetRegex.exec(trimmed);
+    if (offsetMatch) {
+      const parsedOffset = Number(offsetMatch[1]);
+      if (Number.isFinite(parsedOffset)) {
+        globalOffsetMs = parsedOffset;
+      }
+      continue;
+    }
+
     const times: number[] = [];
     let match: RegExpExecArray | null;
     stamp.lastIndex = 0;
@@ -60,20 +73,28 @@ export function parseLrc(text: string): LyricLine[] {
     if (times.length === 0) continue;
     const words = trimmed.replace(stamp, "").trim();
     if (!words) continue;
-    for (const timeMs of times) lines.push({ timeMs, text: words });
+    for (const timeMs of times) {
+      // In standard LRC, positive offset means lyric plays later: effective time is stamp - offset
+      lines.push({ timeMs: Math.max(0, timeMs - globalOffsetMs), text: words });
+    }
   }
   return lines.sort((a, b) => a.timeMs - b.timeMs);
 }
 
 /** Index of the line being sung, or -1 before the first one starts. */
-export function activeLyricIndex(lines: readonly LyricLine[], positionMs: number): number {
+export function activeLyricIndex(
+  lines: readonly LyricLine[],
+  positionMs: number,
+  leadMs: number = 0,
+): number {
   if (lines.length === 0) return -1;
+  const effectiveMs = positionMs + leadMs;
   let low = 0;
   let high = lines.length - 1;
   let found = -1;
   while (low <= high) {
     const mid = (low + high) >> 1;
-    if (lines[mid].timeMs <= positionMs) {
+    if (lines[mid].timeMs <= effectiveMs) {
       found = mid;
       low = mid + 1;
     } else {
@@ -90,11 +111,12 @@ export function activeLyricIndex(lines: readonly LyricLine[], positionMs: number
 export function lyricWindow(
   lines: readonly LyricLine[],
   positionMs: number,
+  leadMs: number = 0,
 ): { index: number; previous: string; current: string; next: string } {
   if (lines.length === 0) {
     return { index: -1, previous: "", current: "", next: "" };
   }
-  const index = activeLyricIndex(lines, positionMs);
+  const index = activeLyricIndex(lines, positionMs, leadMs);
   const at = index < 0 ? 0 : index;
   return {
     index,
@@ -110,13 +132,18 @@ type Candidate = {
   duration?: number | null;
   trackName?: string;
   artistName?: string;
+  albumName?: string;
 };
 
 /**
  * The search endpoint returns several performances of the same song. Prefer a
  * synced one, then the recording whose length matches the player's - a live
  * version with the same title would otherwise scroll the wrong words.
+ * Rejects candidates whose duration difference exceeds MAX_DURATION_DIFF_SEC (2s)
+ * when player duration is known.
  */
+export const MAX_DURATION_DIFF_SEC = 2.0;
+
 export function pickBest(candidates: readonly Candidate[], durationMs: number): LyricLine[] | null {
   const synced = candidates.filter(
     (item): item is Candidate & { syncedLyrics: string } =>
@@ -129,6 +156,12 @@ export function pickBest(candidates: readonly Candidate[], durationMs: number): 
     return Math.abs(item.duration - target);
   };
   const best = [...synced].sort((a, b) => score(a) - score(b))[0];
+  if (target > 0 && typeof best.duration === "number" && best.duration > 0) {
+    if (Math.abs(best.duration - target) > MAX_DURATION_DIFF_SEC) {
+      // Version mismatch (e.g. extended, live vs studio, or different radio edit)
+      return null;
+    }
+  }
   const lines = parseLrc(best.syncedLyrics);
   return lines.length > 0 ? lines : null;
 }
@@ -151,32 +184,42 @@ async function request(path: string, signal: AbortSignal): Promise<Response> {
 export type LyricsRequest = {
   title: string;
   artist: string;
+  album?: string;
   durationMs: number;
   signal?: AbortSignal;
 };
 
 /**
  * Exact match first (cheap and precise), then a search. Both answers are
- * cached by cleaned title/artist/length so a repeated poll costs nothing.
+ * cached by cleaned title/artist/album/length so a repeated poll costs nothing.
  */
 export async function fetchLyrics({
   title,
   artist,
+  album,
   durationMs,
   signal,
 }: LyricsRequest): Promise<LyricLine[] | null> {
+  signal?.throwIfAborted();
   const clean = cleanTrackTitle(title);
   if (!clean || !artist.trim()) return null;
-  const key = `${clean.toLowerCase()}|${artist.trim().toLowerCase()}|${Math.round(durationMs / 1000)}`;
+  const albumPart = album?.trim().toLowerCase() ?? "";
+  const key = `${clean.toLowerCase()}|${artist.trim().toLowerCase()}|${albumPart}|${Math.round(durationMs / 1000)}`;
   if (cache.has(key)) return cache.get(key) ?? null;
 
   const timeout = new AbortController();
-  const timer = setTimeout(() => timeout.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => timeout.abort(new DOMException("Lyrics request timed out", "TimeoutError")), TIMEOUT_MS);
   const abort = () => timeout.abort();
   signal?.addEventListener("abort", abort, { once: true });
 
   try {
-    const query = `?track_name=${encodeURIComponent(clean)}&artist_name=${encodeURIComponent(artist.trim())}`;
+    let query = `?track_name=${encodeURIComponent(clean)}&artist_name=${encodeURIComponent(artist.trim())}`;
+    if (album?.trim()) {
+      query += `&album_name=${encodeURIComponent(album.trim())}`;
+    }
+    if (durationMs > 0) {
+      query += `&duration=${Math.round(durationMs / 1000)}`;
+    }
     const exact = await request(`/get${query}`, timeout.signal);
     if (exact.ok) {
       const body = (await exact.json()) as Candidate;
@@ -187,8 +230,11 @@ export async function fetchLyrics({
       }
     }
 
+    const searchQuery = album?.trim()
+      ? `${clean} ${artist.trim()} ${album.trim()}`
+      : `${clean} ${artist.trim()}`;
     const search = await request(
-      `/search?q=${encodeURIComponent(`${clean} ${artist.trim()}`)}`,
+      `/search?q=${encodeURIComponent(searchQuery)}`,
       timeout.signal,
     );
     if (search.ok) {

@@ -16,9 +16,12 @@ import type { UsbPayload, UsbState, UsbPhase } from "./usb";
 import { UsbContent } from "./UsbContent";
 import { BluetoothContent } from "./BluetoothContent";
 import { Panel } from "./Panel";
-import { useMediaPlaying } from "./useMediaPlaying";
+import { useNook } from "./useNook";
+import { CollapsedClock } from "./CollapsedClock";
+import type { TabId } from "./tabs";
 import { BT_CONNECTING_MS, BT_CONNECTED_MS, foldBluetooth, isBluetoothKind } from "./bluetooth";
 import type { BluetoothPayload, BluetoothState } from "./bluetooth";
+import { useCoverAccent } from "./accent";
 
 /**
  * Foundation prototype: a notch that opens, closes and settles cleanly.
@@ -35,12 +38,16 @@ const COLLAPSED = { width: 200, height: 34, radius: 14, ear: 6 };
  */
 const TALL = { width: 300, height: 52, radius: 24, ear: 14 };
 /**
- * The open panel: four tabs (see `Panel.tsx`). The Nook widens it by exactly
- * the pinned column (112) plus its gap (10) once a widget is pinned there; the
- * tab bar and the other tabs keep the 520 shape.
+ * The open panel follows Boring Notch's proportions: a 640px-wide black slab
+ * with a 24px bottom corner, a slim header row and one 148px content band. The
+ * media block keeps the reference's 352px so the artwork has room to breathe;
+ * the widget stack keeps its fixed 252px.
+ *
+ * Pinning a widget widens the shell by the compact column (100) and its gap
+ * (12), exactly as before, so the stack itself never resizes.
  */
-const EXPANDED = { width: 520, height: 236, radius: 28, ear: 14 };
-const EXPANDED_WIDE = { width: 642, height: 236, radius: 28, ear: 14 };
+const EXPANDED = { width: 640, height: 200, radius: 24, ear: 14 };
+const EXPANDED_WIDE = { width: 752, height: 200, radius: 24, ear: 14 };
 
 /**
  * The three shapes the bar can be in. The destination is what picks the spring -
@@ -55,25 +62,22 @@ const BAR_SIZES: Record<Bar, typeof COLLAPSED> = {
 };
 
 /**
- * Spring Expand / Spring Collapse from the spec.
+ * Boring Notch's springs, expressed for Motion. Opening is close to the
+ * reference's interactive spring (response ~0.36s, damping fraction ~0.8):
+ * quick enough to feel pressed, with a whisper of overshoot instead of a
+ * bounce. Closing is the same shape, critically damped, so the slab settles
+ * flat.
  *
- * Spring Expand (stiffness 380, damping 26, mass 0.9) is underdamped - damping
- * ratio ~0.70 - so it overshoots by about 4.5% of the distance travelled:
- * opening measures 420 wide at rest but peaks near 430, and 160 tall peaking
- * near 166. That overshoot is why the window keeps transparent margins.
- *
- * Spring Collapse (stiffness 500, damping 40) has a ratio of ~0.89, i.e. the
- * damping table's "almost no bounce". Measured, the close settles flat with no
- * visible springback. That is what the spec asked for; if a livelier close is
- * ever wanted, damping 26-30 on this spring is the knob.
+ * The window keeps transparent margins because the spring overshoots by a few
+ * percent of the distance travelled.
  */
 const SPRING_OPEN: Transition = {
   type: "spring",
-  stiffness: 380,
-  damping: 26,
-  mass: 0.9,
+  stiffness: 300,
+  damping: 28,
+  mass: 1,
 };
-const SPRING_CLOSE: Transition = { type: "spring", stiffness: 500, damping: 40 };
+const SPRING_CLOSE: Transition = { type: "spring", stiffness: 320, damping: 36 };
 
 /**
  * Content Blur Fade-In / Content Blur Fade-Out. The fade-in starts 80ms after
@@ -83,11 +87,11 @@ const SPRING_CLOSE: Transition = { type: "spring", stiffness: 500, damping: 40 }
 const CONTENT_ENTER: Transition = { duration: 0.25, delay: 0.08, ease: "easeOut" };
 
 /**
- * The open panel's own body follows the tabs spec: a slightly later, slightly
- * smaller entrance than the indicators' (delay 0.1s, scale 0.97) and the same
- * quick blurred exit.
+ * The body fades and rises into place after the slab has begun to open, which
+ * is the reference's `.scale(anchor: .top) + opacity` entrance. It is slower
+ * than the shell so the content lands rather than snaps.
  */
-const PANEL_ENTER: Transition = { duration: 0.25, delay: 0.1, ease: "easeOut" };
+const PANEL_ENTER: Transition = { duration: 0.32, delay: 0.05, ease: "easeOut" };
 const PANEL_EXIT: Transition = { duration: 0.12 };
 
 /**
@@ -801,8 +805,11 @@ function NetworkContent({
 export default function App() {
   const [open, setOpen] = useState(false);
   const [time, setTime] = useState(() => formatClock(new Date()));
-  // The closed bar only needs to know that sound is playing, not what it is.
-  const mediaPlaying = useMediaPlaying();
+  // Retain the model and last tab when the animated panel view unmounts.
+  const [activeTab, setActiveTab] = useState<TabId>("nook");
+  const nook = useNook(open);
+  const mediaPlaying = nook.media?.playing === true;
+  const coverAccent = useCoverAccent(nook.media?.thumbnail);
   // True while a foreground window covers the collapsed notch (native monitors
   // it, see the autohide module in lib.rs). Autohide never applies to the open
   // panel, so hidden and open are mutually exclusive in practice.
@@ -812,9 +819,9 @@ export default function App() {
   const nextActivityId = useRef(0);
   // Set between the charger's bar shrinking and the next indicator taking over.
   const [settling, setSettling] = useState(false);
-  // The Nook reports whether its pinned column is showing; the open panel's
-  // width follows it without ever resizing the native window.
-  const [wide, setWide] = useState(false);
+  // Derive width from retained state so reopening a pinned Nook grows directly
+  // to its wide silhouette, without an intermediate narrow frame/hit rectangle.
+  const wide = open && activeTab === "nook" && nook.pinned.length > 0;
   // `wanted` is the user's intent; `open` is the rendered state. They differ
   // only while a native call is in flight, which is what lets a fast reverse
   // cancel an open that has not started animating yet.
@@ -898,18 +905,8 @@ export default function App() {
     }
   }, []);
 
-  /**
-   * The Nook's pinned column changes the open panel's width from 520 to 642.
-   * The silhouette animates, and the native hit rect has to follow it or the
-   * column would look like "outside" to the mouse hook and close the panel.
-   */
-  const handlePanelWide = useCallback((next: boolean) => setWide(next), []);
-
   useEffect(() => {
-    if (!open) {
-      if (wide) setWide(false);
-      return;
-    }
+    if (!open) return;
     const size = wide ? EXPANDED_WIDE : EXPANDED;
     void invoke("set_notch_hit", {
       width: size.width,
@@ -922,15 +919,23 @@ export default function App() {
     wanted.current = true;
     // Stop passing clicks through before the notch starts growing, otherwise
     // the panel would be click-through while it animates in.
-    await setHitArea("panel");
+    const size = activeTab === "nook" && nook.pinned.length > 0 ? EXPANDED_WIDE : EXPANDED;
+    try {
+      await invoke("set_notch_hit", { width: size.width, height: size.height, clickThrough: false });
+    } catch (err) {
+      console.error("set_notch_hit failed:", err);
+    }
     if (!wanted.current) return; // reversed while the call was in flight
     setOpen(true);
-  }, [setHitArea]);
+  }, [activeTab, nook.pinned.length]);
 
   const closePanel = useCallback(() => {
     wanted.current = false;
     setOpen(false);
-  }, []);
+    // Immediately tell native that hit area is back to collapsed bar size
+    // so autohide check doesn't use the large expanded rectangle during collapse animation.
+    void setHitArea(bar === "tall" ? "tall" : "bar");
+  }, [setHitArea, bar]);
 
   /**
    * A press on the notch may only ever *open* it. Once the panel is open the
@@ -1292,17 +1297,34 @@ export default function App() {
           void showMenu();
         }}
         onKeyDown={(event) => {
+          // Enter/Space belong to focused child controls, not the shell.
+          if (event.target !== event.currentTarget) return;
           if (event.key !== "Enter" && event.key !== " ") return;
           event.preventDefault();
           pressNotch();
         }}
         className="notch-shell absolute top-0 left-1/2 -translate-x-1/2 outline-none focus-visible:ring-1 focus-visible:ring-white/40"
       >
-        <div className="notch-body">
+        <div
+          className="notch-body"
+          style={
+            open && coverAccent
+              ? ({
+                  "--cover-accent": coverAccent,
+                } as React.CSSProperties)
+              : undefined
+          }
+        >
+          {/* Ambient gradient layer based on media cover when expanded */}
+          <div
+            className="notch-cover-gradient pointer-events-none absolute inset-0"
+            data-active={open && !!coverAccent}
+            aria-hidden="true"
+          />
           {/* The clock and the content are separate layers: neither can push the
               other around while one fades in and the other out, and the clock
-              sits at the same 8px/20px row the WPF original used. It fades into
-              the panel as it opens rather than overlapping it. */}
+              is vertically centred in the 34px bar. It fades into the panel as
+              it opens rather than overlapping it. */}
           <motion.div
             aria-hidden={open}
             initial={false}
@@ -1312,7 +1334,7 @@ export default function App() {
               scale: open ? 0.95 : 1,
             }}
             transition={open ? PANEL_EXIT : CONTENT_ENTER}
-            className="notch-clock pointer-events-none absolute inset-x-0 top-2 flex h-5 items-center justify-center px-3 text-sm text-white"
+            className="notch-clock pointer-events-none absolute inset-x-0"
           >
             {/* One indicator at a time takes the clock's place; the WPF original
                 kept the clock and put the activity beside it, but the clock is
@@ -1326,18 +1348,13 @@ export default function App() {
                   exit={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
                   transition={{ duration: 0.18, ease: "easeOut" }}
                 >
-                  {mediaPlaying && !open ? (
-                    <span className="notch-clock-media" aria-label="Sedang memutar media">
-                      <span className="notch-clock-bars" aria-hidden="true">
-                        {[0, 1, 2].map((bar) => (
-                          <span key={bar} className="notch-clock-bar" style={{ animationDelay: `${bar * 0.16}s` }} />
-                        ))}
-                      </span>
-                      {time}
-                    </span>
-                  ) : (
-                    time
-                  )}
+                  <CollapsedClock
+                    time={time}
+                    pomodoro={nook.pomodoro}
+                    playing={mediaPlaying}
+                    thumbnail={nook.media?.thumbnail}
+                    visible={!open}
+                  />
                 </motion.div>
               )}
             </AnimatePresence>
@@ -1433,13 +1450,13 @@ export default function App() {
           <AnimatePresence>
             {open && (
               <motion.div
-                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.97 }}
-                animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.92, y: -6 }}
+                animate={{ opacity: 1, filter: "blur(0px)", scale: 1, y: 0 }}
                 exit={{ opacity: 0, filter: "blur(6px)", transition: PANEL_EXIT }}
                 transition={PANEL_ENTER}
                 className="notch-panel"
               >
-                <Panel onWide={handlePanelWide} />
+                <Panel active={activeTab} onTab={setActiveTab} nook={nook} />
               </motion.div>
             )}
           </AnimatePresence>

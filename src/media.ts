@@ -22,6 +22,8 @@ export type MediaState = {
   repeat: MediaRepeat;
   repeatSupported: boolean;
   source: string;
+  timelineUpdatedMs?: number;
+  playbackRate?: number;
 } | null;
 
 export type MediaCommand = "previous" | "toggle" | "next";
@@ -56,6 +58,94 @@ export function seekTarget(ratio: number, durationMs: number): number {
 export function seekRatio(clientX: number, left: number, width: number): number {
   if (!Number.isFinite(width) || width <= 0) return 0;
   return Math.min(1, Math.max(0, (clientX - left) / width));
+}
+
+/**
+ * Merges previous and next state, preserving thumbnail, duration, and position
+ * if Windows reports a momentary dropout for the same song.
+ */
+export function mergeMediaState(
+  previous: MediaState,
+  next: MediaState,
+): MediaState {
+  if (!next) return null;
+  if (!previous) return next;
+
+  const sameSong =
+    previous.title === next.title &&
+    previous.artist === next.artist &&
+    previous.album === next.album &&
+    previous.source === next.source;
+
+  if (!sameSong) return next;
+
+  const merged = { ...next };
+
+  // Retain thumbnail
+  if (!merged.thumbnail && previous.thumbnail) {
+    merged.thumbnail = previous.thumbnail;
+  }
+
+  // If incoming timeline dropped to zero but previous had valid timeline, preserve previous
+  if (merged.durationMs <= 0 && previous.durationMs > 0) {
+    merged.durationMs = previous.durationMs;
+    merged.hasTimeline = previous.hasTimeline;
+    merged.canSeek = previous.canSeek;
+    if (merged.positionMs <= 0 && previous.positionMs > 0) {
+      merged.positionMs = previous.positionMs;
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * The one clock the progress bar and the lyrics both follow.
+ *
+ * The native worker projects Windows' timeline through its own
+ * `LastUpdatedTime`, so every sample already describes "now". The source is
+ * therefore adopted as-is on each update - exactly what the WPF original does
+ * in `ApplyMedia` - instead of being smoothed or held back. The sole exception
+ * is a zeroed timeline for the same playing track, which background web
+ * players sometimes publish while their audio keeps going; accepting it would
+ * rewind the bar and the words to the start.
+ */
+export type PlayheadAnchor = {
+  baseMs: number;
+  /** `performance.now()` when `baseMs` was measured. */
+  at: number;
+  playing: boolean;
+  durationMs: number;
+  trackKey: string;
+  playbackRate: number;
+};
+
+export function nextPlayheadAnchor(
+  previous: PlayheadAnchor,
+  media: NonNullable<MediaState>,
+  now: number,
+): PlayheadAnchor {
+  const trackKey = `${media.title}\n${media.artist}\n${media.album}`;
+  const sameTrack = previous.trackKey === trackKey && previous.durationMs > 0;
+  const playbackRate = media.playbackRate && media.playbackRate > 0 ? media.playbackRate : 1;
+  const staleZero =
+    sameTrack && previous.playing && media.playing && media.positionMs === 0 && previous.baseMs > 0;
+
+  return {
+    baseMs: staleZero ? previous.baseMs : media.positionMs,
+    at: staleZero ? previous.at : now,
+    playing: media.playing,
+    durationMs: media.durationMs,
+    trackKey,
+    playbackRate,
+  };
+}
+
+/** Where the anchor puts the playhead at `now`, respecting rate and length. */
+export function playheadAt(anchor: PlayheadAnchor, now: number): number {
+  const elapsed = anchor.playing ? Math.max(0, now - anchor.at) * anchor.playbackRate : 0;
+  const projected = anchor.baseMs + elapsed;
+  return anchor.durationMs > 0 ? Math.min(anchor.durationMs, projected) : projected;
 }
 
 /**

@@ -16,6 +16,20 @@ mockIPC((command, args) => {
     window.__notchVolume = { level: args.level, muted: args.muted };
     return null;
   }
+  // The system monitor widget renders percentages straight from this payload;
+  // answering null used to crash the whole fixture when that widget rotated in.
+  if (command === "sysinfo_stats") {
+    return {
+      cpuPercent: 34,
+      memPercent: 58,
+      memUsedGb: 9.4,
+      memTotalGb: 16,
+      diskPercent: 61,
+      diskUsedGb: 290,
+      diskTotalGb: 476,
+      diskLabel: "C:",
+    };
+  }
   return null;
 }, { shouldMockEvents: true });
 

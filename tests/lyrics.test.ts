@@ -167,3 +167,47 @@ async function fetchLyricsFor(title: string, artist: string) {
   const { fetchLyrics } = await import("../src/lyrics");
   return fetchLyrics({ title, artist, durationMs: 180_000 });
 }
+
+test("an already-aborted lyric request neither fetches nor returns cached data", async () => {
+  clearLyricsCache();
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ syncedLyrics: synced("Cache"), duration: 180 }));
+  }) as typeof fetch;
+  try {
+    await fetchLyricsFor("Cached", "Artist");
+    const controller = new AbortController();
+    controller.abort();
+    const { fetchLyrics } = await import("../src/lyrics");
+    await expect(fetchLyrics({ title: "Cached", artist: "Artist", durationMs: 180_000, signal: controller.signal })).rejects.toThrow();
+    expect(calls).toBe(1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("switching songs aborts an in-flight lyric request without caching failure", async () => {
+  clearLyricsCache();
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = ((_input, options) => {
+    calls += 1;
+    if (calls > 1) return Promise.resolve(new Response(JSON.stringify({ syncedLyrics: synced("Recovered"), duration: 180 })));
+    return new Promise((_resolve, reject) => {
+      options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+    });
+  }) as typeof fetch;
+  try {
+    const controller = new AbortController();
+    const { fetchLyrics } = await import("../src/lyrics");
+    const pending = fetchLyrics({ title: "Cancelled", artist: "Artist", durationMs: 180_000, signal: controller.signal });
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+    expect((await fetchLyricsFor("Cancelled", "Artist"))?.[0].text).toBe("Recovered");
+    expect(calls).toBe(2);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

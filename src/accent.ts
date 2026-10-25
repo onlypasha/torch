@@ -21,25 +21,69 @@ function remember(key: string, value: string | null): void {
   cache.set(key, value);
 }
 
-function average(data: Uint8ClampedArray): string | null {
-  let r = 0;
-  let g = 0;
-  let b = 0;
-  let count = 0;
+function extractDominant(data: Uint8ClampedArray): string | null {
+  // Bucket colorful pixels by hue and saturation
+  const buckets = new Map<number, { r: number; g: number; b: number; count: number }>();
+  let fallbackR = 0;
+  let fallbackG = 0;
+  let fallbackB = 0;
+  let fallbackCount = 0;
+
   for (let i = 0; i < data.length; i += 16) {
     const red = data[i];
     const green = data[i + 1];
     const blue = data[i + 2];
     const max = Math.max(red, green, blue);
     const min = Math.min(red, green, blue);
-    if (max < 40 || min > 215 || max - min < 24) continue;
-    r += red;
-    g += green;
-    b += blue;
-    count += 1;
+    const delta = max - min;
+
+    // Skip extreme darks, lights or purely neutral grays
+    if (max < 32 || min > 225) continue;
+
+    fallbackR += red;
+    fallbackG += green;
+    fallbackB += blue;
+    fallbackCount += 1;
+
+    if (delta < 20) continue;
+
+    // Simple 12-bin hue quantization
+    let hue = 0;
+    if (delta > 0) {
+      if (max === red) {
+        hue = ((green - blue) / delta) % 6;
+      } else if (max === green) {
+        hue = (blue - red) / delta + 2;
+      } else {
+        hue = (red - green) / delta + 4;
+      }
+      hue = Math.round(hue * 60);
+      if (hue < 0) hue += 360;
+    }
+    const bin = Math.floor(hue / 30);
+    const bucket = buckets.get(bin) ?? { r: 0, g: 0, b: 0, count: 0 };
+    bucket.r += red;
+    bucket.g += green;
+    bucket.b += blue;
+    bucket.count += 1;
+    buckets.set(bin, bucket);
   }
-  if (count === 0) return null;
-  return `rgb(${Math.round(r / count)} ${Math.round(g / count)} ${Math.round(b / count)})`;
+
+  // Find bucket with highest pixel count
+  let best: { r: number; g: number; b: number; count: number } | null = null;
+  for (const bucket of buckets.values()) {
+    if (!best || bucket.count > best.count) {
+      best = bucket;
+    }
+  }
+
+  if (best && best.count > 0) {
+    return `rgb(${Math.round(best.r / best.count)} ${Math.round(best.g / best.count)} ${Math.round(best.b / best.count)})`;
+  }
+  if (fallbackCount > 0) {
+    return `rgb(${Math.round(fallbackR / fallbackCount)} ${Math.round(fallbackG / fallbackCount)} ${Math.round(fallbackB / fallbackCount)})`;
+  }
+  return null;
 }
 
 export function useCoverAccent(url: string | undefined): string | null {
@@ -66,7 +110,7 @@ export function useCoverAccent(url: string | undefined): string | null {
         const context = canvas.getContext("2d", { willReadFrequently: true });
         if (!context) throw new Error("no 2d context");
         context.drawImage(image, 0, 0, 24, 24);
-        const value = average(context.getImageData(0, 0, 24, 24).data);
+        const value = extractDominant(context.getImageData(0, 0, 24, 24).data);
         remember(url, value);
         if (!disposed) setAccent(value);
       } catch {

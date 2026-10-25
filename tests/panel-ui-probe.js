@@ -1,9 +1,9 @@
 import { emit } from "@tauri-apps/api/event";
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-// Same logical viewport as the desktop window (700x320): the panel is 520 wide
-// and its opening spring peaks wider still, so a smaller viewport would clip
-// geometry the window was sized to hold.
+// Same logical viewport as the desktop window (800x320): the panel is 640 wide
+// (752 with a pinned column) and its opening spring peaks wider still, so a
+// smaller viewport would clip geometry the window was sized to hold.
 
 export async function runPanelScenario(scenario = "open") {
   const rows = [], errors = [];
@@ -28,7 +28,7 @@ export async function runPanelScenario(scenario = "open") {
       ear: getComputedStyle(notch).getPropertyValue("--ear-size").trim(),
       colour: getComputedStyle(body).getPropertyValue("--notch-color").replace(/\s/g, ""),
       tablist: notch.querySelectorAll("[role=tablist]").length,
-      tabs: tabs.map((tab) => ({ id: tab.dataset.tabId, label: tab.textContent, selected: tab.getAttribute("aria-selected") })),
+      tabs: tabs.map((tab) => ({ id: tab.dataset.tabId, label: tab.getAttribute("aria-label") ?? "", selected: tab.getAttribute("aria-selected") })),
       panelId: panel?.dataset.tabId ?? "",
       panels: notch.querySelectorAll("[role=tabpanel]").length,
       panel: style ? { x, opacity: Number(style.opacity), blur: style.filter, height: parseFloat(style.height) } : null,
@@ -51,9 +51,9 @@ export async function runPanelScenario(scenario = "open") {
   await wait(800);
   const settled = rows.at(-1);
   check(settled.open, "panel opens");
-  check(Math.abs(settled.width - 520) < 3, `open width 520, got ${settled.width.toFixed(1)}`);
-  check(Math.abs(settled.height - 236) < 3, `open height 236, got ${settled.height.toFixed(1)}`);
-  check(settled.radius === "28px", `open radius 28, got ${settled.radius}`);
+  check(Math.abs(settled.width - 640) < 3, `open width 640, got ${settled.width.toFixed(1)}`);
+  check(Math.abs(settled.height - 200) < 3, `open height 200, got ${settled.height.toFixed(1)}`);
+  check(settled.radius === "24px", `open radius 24, got ${settled.radius}`);
   check(settled.ear === "14px", `open ear 14, got ${settled.ear}`);
   check(settled.colour === "#000000", `notch colour #000, got ${settled.colour}`);
   check(!settled.hidden, "not re-hidden by autohide in the fixture");
@@ -69,7 +69,7 @@ export async function runPanelScenario(scenario = "open") {
   check(!settled.panel.blur.includes("8px") && !settled.panel.blur.includes("6px"), "panel body unblurred at rest");
   check(settled.emptyText.includes("Nook") || settled.hasNook, `Nook tab content mounted, got "${settled.emptyText}"`);
   check(!!settled.pill, "active pill rendered");
-  check(Math.abs(settled.pill.width) > 30, "pill covers the capsule");
+  check(Math.abs(settled.pill.width) > 24, "pill covers the icon capsule");
   const nookPillLeft = settled.pill.left;
 
   if (scenario === "next") {
@@ -83,16 +83,22 @@ export async function runPanelScenario(scenario = "open") {
     const arrived = rows.filter((s) => s.panelId === "sharing");
     check(arrived.some((s) => s.panel.x > 8), "new content enters from the right");
     const reached = rows.filter((s) => s.pill && s.pill.at === "sharing");
+    const targetLeft = document.querySelector('[role="tab"][data-tab-id="sharing"]').getBoundingClientRect().left;
     // The pill is mounted inside the target button from the first frame and
     // layout-animates from Nook's position to Sharing's.
     check(reached.some((s) => s.pill.left < nookPillLeft + 12) && reached.some((s) => s.pill.left > nookPillLeft + 40), "pill covers the distance to Sharing");
-    check(reached.every((s, i, all) => i === 0 || s.pill.left >= all[i - 1].pill.left - 1), `pill travels rightward, path ${reached.map((s) => s.pill.left.toFixed(0)).join("→")}`);
+    // A damped spring may cross its destination and settle back. Require
+    // rightward travel until the target, with only a small settling overshoot;
+    // strict per-frame monotonicity fails depending on the sampling cadence.
+    check(reached.every((s, i, all) => (i === 0 || s.pill.left >= Math.min(all[i - 1].pill.left, targetLeft) - 1)
+      && s.pill.left <= targetLeft + (targetLeft - nookPillLeft) * 0.04 + 1), `pill travels rightward with bounded spring settling, path ${reached.map((s) => s.pill.left.toFixed(0)).join("→")}`);
     check(rows.filter((s) => s.tabs.length === 4).every((s) => s.tabs.filter((tab) => tab.selected === "true").length === 1), "still exactly one selected while flying");
     await wait(400);
     const end = state();
     check(end.panelId === "sharing" && end.panel.opacity > 0.95 && Math.abs(end.panel.x) < 0.5 && !end.panel.blur.includes("6px"), "sharing content at rest");
     check(end.tabs[2].selected === "true", "aria-selected on Sharing");
     check(end.pill.at === "sharing", "pill rests under Sharing");
+    check(Math.abs(end.pill.left - targetLeft) < 1, "pill settles at the target, not at its overshoot");
   } else if (scenario === "prev") {
     clickTab("notification");
     await wait(320);
