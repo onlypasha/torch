@@ -1198,6 +1198,52 @@ export async function runNookScenario(scenario = "media") {
     sample();
   }
 
+  if (scenario === "hud") {
+    await emit("hud-volume", { level: 0.42, muted: false, limited: false, failed: false });
+    await wait(700);
+    let now = sample();
+    const hud = () => notch()?.querySelector(".notch-hud");
+    check(!!hud(), "volume HUD takes the bar");
+    check(Math.abs(now.width - 300) < 1 && Math.abs(now.height - 46) < 1, `HUD is 300x46, got ${now.width}x${now.height}`);
+    const shell = getComputedStyle(notch());
+    check(shell.borderBottomLeftRadius === "22px", `HUD bottom radius is 22px, got ${shell.borderBottomLeftRadius}`);
+    check(shell.getPropertyValue("--ear-size").trim() === "12px", `HUD ears are 12px, got ${shell.getPropertyValue("--ear-size")}`);
+    check(getComputedStyle(document.querySelector(".notch-glow")).opacity === "0", "the HUD casts no glow");
+    check(hud().querySelector(".notch-hud-value")?.textContent === "42%", "volume percentage");
+    check(hud().querySelector(".notch-hud-fill")?.style.width === "42%", "volume bar follows the level");
+    check(hud().querySelector("[role=status]")?.textContent === "Volume 42%", "volume live region");
+    check(getComputedStyle(notch().querySelector(".notch-clock")).opacity === "0", "the clock steps aside");
+    const paths = [...hud().querySelectorAll(".notch-hud-icon path")];
+    check(getComputedStyle(paths[1]).opacity === "1" && getComputedStyle(paths[2]).opacity === "1" && getComputedStyle(paths[3]).opacity === "0", "42% lights two of the three waves");
+
+    await emit("hud-volume", { level: 0.42, muted: true, limited: false, failed: false });
+    await wait(500);
+    check(hud().querySelector(".notch-hud-value")?.textContent === "0%", "mute shows a zero reading");
+    check(hud().querySelector(".notch-hud-fill")?.style.width === "0%", "mute empties the bar");
+    check(hud().querySelector("[role=status]")?.textContent === "Volume dimatikan", "mute live region");
+    check(getComputedStyle(hud().querySelector(".notch-hud-icon")).color === "rgb(156, 163, 175)", "the muted glyph is gray");
+
+    await emit("hud-brightness", 84);
+    await wait(500);
+    check(hud().querySelector(".notch-hud-value")?.textContent === "84%", "brightness percentage");
+    check(hud().querySelector(".notch-hud-fill")?.getAttribute("data-kind") === "brightness", "the bar switches to the brightness fill");
+    check(getComputedStyle(hud().querySelector(".notch-hud-fill")).backgroundColor === "rgb(253, 230, 138)", "brightness fill is amber");
+    check(hud().querySelector("[role=status]")?.textContent === "Kecerahan 84%", "brightness live region");
+
+    await wait(1600);
+    check(!hud(), "the HUD leaves after its 1600ms hold");
+    check(Math.abs(notch().getBoundingClientRect().width - 200) < 1 && Math.abs(notch().getBoundingClientRect().height - 34) < 1, "the bar collapses fully to 200x34");
+
+    // A reading must never close or replace the panel the user is reading.
+    await openPanel();
+    await emit("hud-brightness", 60);
+    await wait(400);
+    check(notch().getAttribute("aria-expanded") === "true" && Math.abs(sample().width - 640) < 1, "the panel stays open");
+    check(!hud(), "no HUD is drawn over the panel");
+    await emit("notch-click-outside", null);
+    await wait(700);
+  }
+
   window.__nookProbe = { scenario, errors, samples };
   if (errors.length) throw new Error(errors.join("; "));
   return { scenario, errors, final: state() };

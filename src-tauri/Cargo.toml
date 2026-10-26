@@ -55,6 +55,9 @@ windows = { version = "0.57", features = [
     # Brightness through Dxva2/DDC-CI, the same path the Windows flyout uses.
     "Win32_Devices_Display",
     "Win32_Graphics_Gdi",
+    # The volume HUD's keyboard hook; the keyprobe example also reads raw input.
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 # See https://tauri.app/concept/size/#cargo-configuration

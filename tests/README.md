@@ -68,6 +68,7 @@ For the animated layout, open `http://localhost:1420/tests/nook-ui.html` at
 - `stack` — immediate touchpad response, long decaying momentum is ignored, a new push during momentum advances once, slot order, only-active-card interactivity, arrows.
 - `stack-scroll` — nested lists keep wheel input until their edge; zoom/horizontal gestures are not consumed.
 - `quicksettings` — both slider mousedowns reach the range inputs (the shell must not cancel them), mute keeps the endpoint level, `volume_set` carries the dragged level, and `brightness_set` reaches the panel after the drag throttle.
+- `hud` — a volume/brightness reading takes the 300×46 bar with 22px corners and 12px ears (no glow), the clock steps aside, mute empties the bar and greys the speaker, the hold collapses fully to 200×34, and a reading never closes the open panel.
 - `quicksettings-unsupported` — open the page with `?brightness=unsupported`; the brightness slider is disabled and reads `—` instead of inventing a number.
 - `pin` — context menu, 640→752 widening, tab persistence, unpin.
 - `pinlimit` — two pins split the column, third pin disabled, drag reorder.
@@ -103,6 +104,27 @@ Pixel wheel input is classified by decay and renewed acceleration because the
 browser exposes no gesture/momentum phase. Line/page mouse-wheel input retains
 the WPF-style 350ms throttle. Physical touchpads can have different delta curves;
 the final interaction feel should also be checked on the user's device.
+
+## Keyboard HUD
+
+`bun test tests/hud.test.ts` covers the percentage, mute announcement and the
+three speaker waves. The native side is `src-tauri/src/keyboard.rs` (a global
+low-level hook that swallows hardware volume keys and applies 6.25% steps,
+1.5625% with Shift, a 350ms hold and 90ms repeat) and `src-tauri/src/hud.rs`
+(the brightness watcher). Injected keys are deliberately left alone, so
+automation and other remappers keep working.
+
+The Fn brightness keys on this ASUS panel never reach either the low-level hook
+or the raw-input consumer collection; the firmware/OSD handles them first. The
+notch therefore watches the LCD level every 120ms and shows the panel's own
+step instead of pretending to intercept the key. Volume is written and re-read
+through Core Audio, so a refused or clamped change is reported as a failure,
+not drawn as success. The ignored `volume_step_windows_probe` in
+`src-tauri/src/volume.rs` exercises that path on real hardware:
+
+```sh
+cargo test --lib volume_step_windows_probe -- --ignored --nocapture
+```
 
 Run `bun test tests/usb.test.ts` for the pure queue/capacity tests, and
 `cargo test --lib` in `src-tauri` for the native transition tests.

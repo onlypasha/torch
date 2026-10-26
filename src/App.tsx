@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import type { Transition } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -22,6 +22,9 @@ import type { TabId } from "./tabs";
 import { BT_CONNECTING_MS, BT_CONNECTED_MS, foldBluetooth, isBluetoothKind } from "./bluetooth";
 import type { BluetoothPayload, BluetoothState } from "./bluetooth";
 import { useCoverAccent } from "./accent";
+import { HudContent } from "./HudContent";
+import type { HudView } from "./HudContent";
+import { HUD_HOLD_MS } from "./hud";
 
 /**
  * Foundation prototype: a notch that opens, closes and settles cleanly.
@@ -31,6 +34,12 @@ import { useCoverAccent } from "./accent";
  * bottom corner radius run off the same animation.
  */
 const COLLAPSED = { width: 200, height: 34, radius: 14, ear: 6 };
+/**
+ * The keyboard HUD: a shorter, wider bar than the charger's, with the rounder
+ * 22px corners and 12px ears the spec asks for. It holds one row - icon, bar,
+ * percentage - inset 20px from each side.
+ */
+const HUD = { width: 300, height: 46, radius: 22, ear: 12 };
 /**
  * The indicators that take the whole bar - the charger's arrival and a network
  * coming up - share this shape: wider and taller than the clock's bar, and
@@ -54,10 +63,11 @@ const EXPANDED_WIDE = { width: 752, height: 200, radius: 24, ear: 14 };
  * growing into the panel or into the tall bar springs open, shrinking back to
  * the clock's bar springs shut - so the shape is named separately from its size.
  */
-type Bar = "bar" | "tall" | "panel";
+type Bar = "bar" | "tall" | "hud" | "panel";
 const BAR_SIZES: Record<Bar, typeof COLLAPSED> = {
   bar: COLLAPSED,
   tall: TALL,
+  hud: HUD,
   panel: EXPANDED,
 };
 
@@ -78,6 +88,23 @@ const SPRING_OPEN: Transition = {
   mass: 1,
 };
 const SPRING_CLOSE: Transition = { type: "spring", stiffness: 320, damping: 36 };
+/**
+ * The HUD has its own, quicker pair: it should feel like a heads-up readout
+ * rather than the panel's deliberate arrival. Reduced motion turns both into a
+ * short, non-overshooting size change.
+ */
+const HUD_OPEN: Transition = {
+  type: "spring",
+  stiffness: 380,
+  damping: 26,
+  mass: 0.9,
+};
+const HUD_CLOSE: Transition = {
+  type: "spring",
+  stiffness: 500,
+  damping: 40,
+};
+const HUD_REDUCED: Transition = { duration: 0.16, ease: "easeOut" };
 
 /**
  * Content Blur Fade-In / Content Blur Fade-Out. The fade-in starts 80ms after
@@ -134,6 +161,14 @@ type WireEvent = {
   detail: string;
   usb?: UsbPayload;
   bluetooth?: BluetoothPayload;
+};
+
+/** What `keyboard.rs` reports after it has written and re-read the endpoint. */
+type HudVolume = {
+  level: number;
+  muted: boolean;
+  limited: boolean;
+  failed: boolean;
 };
 
 /** Which network an activity is about. */
@@ -831,6 +866,13 @@ export default function App() {
   const nextActivityId = useRef(0);
   // Set between the charger's bar shrinking and the next indicator taking over.
   const [settling, setSettling] = useState(false);
+  // The keyboard HUD is a temporary reading, not a queued activity: the newest
+  // key press simply replaces what is on the bar and restarts its 1600ms hold.
+  const [hud, setHud] = useState<HudView | null>(null);
+  const [hudPulse, setHudPulse] = useState(0);
+  const [hudLimit, setHudLimit] = useState(0);
+  const hudTimer = useRef<number | null>(null);
+  const hudOn = hud !== null;
   // Derive width from retained state so reopening a pinned Nook grows directly
   // to its wide silhouette, without an intermediate narrow frame/hit rectangle.
   const wide = open && activeTab === "nook" && nook.pinned.length > 0;
@@ -843,11 +885,87 @@ export default function App() {
   const openRef = useRef(open);
   openRef.current = open;
 
+  const clearHudTimer = useCallback(() => {
+    if (hudTimer.current !== null) {
+      window.clearTimeout(hudTimer.current);
+      hudTimer.current = null;
+    }
+  }, []);
+
+  /**
+   * Show one HUD reading and push its collapse back to 1600ms from this press.
+   * The panel is never closed for a HUD: if the user is already reading the
+   * panel, the reading waits (the next one, after it closes, will show).
+   */
+  const showHud = useCallback(
+    (next: HudView, limited = false) => {
+      if (openRef.current) return;
+      setHud(next);
+      setHudPulse((count) => count + 1);
+      if (limited) setHudLimit((count) => count + 1);
+      clearHudTimer();
+      hudTimer.current = window.setTimeout(() => {
+        hudTimer.current = null;
+        setHud(null);
+      }, HUD_HOLD_MS);
+    },
+    [clearHudTimer],
+  );
+
+  // Opening the panel takes the bar for itself; a reading that was already
+  // counting down would otherwise reappear when the panel closes.
+  useEffect(() => {
+    if (!open) return;
+    clearHudTimer();
+    setHud(null);
+  }, [open, clearHudTimer]);
+
+  useEffect(
+    () => () => {
+      clearHudTimer();
+    },
+    [clearHudTimer],
+  );
+
+  // Volume steps arrive already applied and re-read by `keyboard.rs`; this
+  // side only decides when the HUD has had its time on screen.
+  useEffect(() => {
+    let disposed = false;
+    const stops: (() => void)[] = [];
+    const attach = <T,>(name: string, handler: (payload: T) => void) => {
+      void listen<T>(name, (event) => handler(event.payload)).then((unlisten) => {
+        if (disposed) unlisten();
+        else stops.push(unlisten);
+      });
+    };
+    attach<HudVolume>("hud-volume", (event) =>
+      showHud(
+        {
+          kind: "volume",
+          level: event.level,
+          muted: event.muted,
+          failed: event.failed,
+        },
+        event.limited,
+      ),
+    );
+    // The brightness keys are handled by the ASUS firmware; this event is the
+    // panel's own new level, observed after the fact.
+    attach<number>("hud-brightness", (level) =>
+      showHud({ kind: "brightness", level, failed: false }),
+    );
+    return () => {
+      disposed = true;
+      for (const stop of stops) stop();
+    };
+  }, [showHud]);
+
   const activity = activities[0];
   // While the panel is open the indicator waits rather than interrupting: it
   // lives on the collapsed bar, so showing it would mean closing what the user
-  // just opened. The queue is held, not dropped.
-  const showingActivity = activity !== undefined && !open && !settling;
+  // just opened. The queue is held, not dropped. The HUD is a shorter pause:
+  // an activity arriving mid-reading simply waits for the bar to come back.
+  const showingActivity = activity !== undefined && !open && !settling && !hudOn;
   // All activity sources now take the tall bar; only the idle clock is small.
   const charging = showingActivity && activity.kind === "power-connected";
   const unplugged = showingActivity && activity.kind === "power-disconnected";
@@ -859,11 +977,12 @@ export default function App() {
   // An indicator is worth showing even when autohide would have hidden the
   // notch; once it has had its turn the autohide state takes over again.
   // Reporting it as *visible* to native matters: the hook then treats it as a
-  // notch again, so it can still be clicked open.
-  const hidden = autohide && !showingActivity;
+  // notch again, so it can still be clicked open. A HUD reading does the same:
+  // the user just pressed a key and expects to see the answer.
+  const hidden = autohide && !showingActivity && !hudOn;
 
   // Which shape the bar is in.
-  const bar: Bar = open ? "panel" : tall ? "tall" : "bar";
+  const bar: Bar = open ? "panel" : hud ? "hud" : tall ? "tall" : "bar";
 
   /**
    * The native window keeps one size for its whole life - a resize makes
@@ -886,12 +1005,28 @@ export default function App() {
   /**
    * The bar always springs between its shapes: growing into the panel or into the
    * charger's bar uses the expand spring, and every return - the charger's, the
-   * panel's, autohide sliding the bar away - uses the collapse one. Nothing here
-   * consults `prefers-reduced-motion`: the arrival is the notch's personality and
-   * plays on every machine, including the one this is built on, which asks for
-   * reduced motion and had been getting a bar that simply jumped.
+   * panel's, autohide sliding the bar away - uses the collapse one. The HUD is
+   * the one shape with its own quicker pair, and the one the reduced-motion
+   * preference is allowed to turn into a plain size change; the rest of the
+   * notch keeps its personality on every machine.
    */
-  const sizeTransition: Transition = bar === "bar" ? SPRING_CLOSE : SPRING_OPEN;
+  const previousBar = useRef<Bar>(bar);
+  useEffect(() => {
+    previousBar.current = bar;
+  }, [bar]);
+  const reducedMotion = useReducedMotion() ?? false;
+  const hudTransition =
+    bar === "hud"
+      ? reducedMotion
+        ? HUD_REDUCED
+        : HUD_OPEN
+      : previousBar.current === "hud" && bar === "bar"
+        ? reducedMotion
+          ? HUD_REDUCED
+          : HUD_CLOSE
+        : undefined;
+  const sizeTransition: Transition =
+    hudTransition ?? (bar === "bar" ? SPRING_CLOSE : SPRING_OPEN);
   // Content Blur Fade-In / Fade-Out for the tall indicators: 8px of blur and a
   // 0.95 scale behind a 250ms fade that starts 80ms after the bar begins to grow.
   // The same timings the panel's own content uses.
@@ -946,7 +1081,7 @@ export default function App() {
     setOpen(false);
     // Immediately tell native that hit area is back to collapsed bar size
     // so autohide check doesn't use the large expanded rectangle during collapse animation.
-    void setHitArea(bar === "tall" ? "tall" : "bar");
+    void setHitArea(bar === "tall" ? "tall" : bar === "hud" ? "hud" : "bar");
   }, [setHitArea, bar]);
 
   /**
@@ -993,6 +1128,13 @@ export default function App() {
   useEffect(() => {
     if (tall) void setHitArea("tall");
   }, [tall, setHitArea]);
+
+  // The HUD expands before its content is drawn, so the hook must already know
+  // the wider rect when the first key press lands. Like the tall bar it stays
+  // click-through: a click on it still opens the panel.
+  useEffect(() => {
+    if (hudOn) void setHitArea("hud");
+  }, [hudOn, setHitArea]);
 
   /**
    * Idle clock. Every tick re-reads the system time instead of counting up, so
@@ -1110,7 +1252,7 @@ export default function App() {
   const introAt = useRef(0);
   useEffect(() => {
     introAt.current = performance.now();
-  }, [activity?.id, activity?.net?.phase, activity?.usb?.phase, activity?.bluetooth?.phase, open, settling]);
+  }, [activity?.id, activity?.net?.phase, activity?.usb?.phase, activity?.bluetooth?.phase, open, settling, hudOn]);
 
   /**
    * One activity at a time, then the next. The timers only run while the activity
@@ -1134,7 +1276,7 @@ export default function App() {
       else popTall();
       return;
     }
-    if (activity === undefined || open || settling) return;
+    if (activity === undefined || open || settling || hudOn) return;
 
     if (activity.bluetooth) {
       const connecting = activity.bluetooth.phase === "connecting";
@@ -1192,7 +1334,7 @@ export default function App() {
       net.phase === "connected" ? NET_LINK_MS : NET_NOTICE_MS,
     );
     return () => window.clearTimeout(timer);
-  }, [activity, open, settling, charging, popActivity, popTall, advanceNetwork, advanceUsb, advanceBluetooth]);
+  }, [activity, open, settling, charging, hudOn, popActivity, popTall, advanceNetwork, advanceUsb, advanceBluetooth]);
 
   // Hiding never changes the click-through state - autohide only ever applies
   // while the notch is collapsed, and collapsed is already click-through. What
@@ -1342,21 +1484,21 @@ export default function App() {
               is vertically centred in the 34px bar. It fades into the panel as
               it opens rather than overlapping it. */}
           <motion.div
-            aria-hidden={open}
+            aria-hidden={open || hudOn}
             initial={false}
             animate={{
-              opacity: open ? 0 : 1,
-              filter: open ? "blur(6px)" : "blur(0px)",
-              scale: open ? 0.95 : 1,
+              opacity: open || hudOn ? 0 : 1,
+              filter: open || hudOn ? "blur(6px)" : "blur(0px)",
+              scale: open || hudOn ? 0.95 : 1,
             }}
-            transition={open ? PANEL_EXIT : CONTENT_ENTER}
+            transition={open || hudOn ? PANEL_EXIT : CONTENT_ENTER}
             className="notch-clock pointer-events-none absolute inset-x-0"
           >
             {/* One indicator at a time takes the clock's place; the WPF original
                 kept the clock and put the activity beside it, but the clock is
                 what this notch shows when it has nothing to say. */}
             <AnimatePresence mode="wait" initial={false}>
-              {tall || settling ? null : (
+              {tall || settling || hudOn ? null : (
                 <motion.div
                   key="clock"
                   initial={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
@@ -1369,7 +1511,7 @@ export default function App() {
                     pomodoro={nook.pomodoro}
                     playing={mediaPlaying}
                     thumbnail={nook.media?.thumbnail}
-                    visible={!open}
+                    visible={!open && !hudOn}
                   />
                 </motion.div>
               )}
@@ -1457,6 +1599,23 @@ export default function App() {
                 transition={arrivalEnter}
               >
                 <BluetoothContent bluetooth={bluetooth} detail={activity.detail} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+          {/* The keyboard HUD. It is a layer of its own so a key press can
+              replace the clock (or wait out an activity) without touching the
+              shell: the 300x46 silhouette and its ears are App's animation. */}
+          <AnimatePresence>
+            {hud && (
+              <motion.div
+                key="hud"
+                className="notch-hud-layer"
+                initial={{ opacity: 0, filter: "blur(8px)", scale: 0.95 }}
+                animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
+                exit={{ opacity: 0, filter: "blur(6px)", transition: arrivalExit }}
+                transition={arrivalEnter}
+              >
+                <HudContent hud={hud} pulse={hudPulse} limit={hudLimit} />
               </motion.div>
             )}
           </AnimatePresence>

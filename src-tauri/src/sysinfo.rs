@@ -274,7 +274,7 @@ mod win {
         }
     }
 
-    fn read_lcd() -> Result<i32, String> {
+    pub(super) fn read_lcd() -> Result<i32, String> {
         let mut raw = [0u8; 3];
         let returned = lcd_ioctl(IOCTL_VIDEO_QUERY_DISPLAY_BRIGHTNESS, None, Some(&mut raw))?;
         if returned < 3 {
@@ -452,6 +452,23 @@ pub fn set_brightness(val: i32) -> Result<(), String> {
     {
         BRIGHTNESS_LEVEL.store(val.clamp(0, 100), Ordering::Relaxed);
         Ok(())
+    }
+}
+
+/// Fast, side-effect-free brightness sample for the HUD watcher.
+///
+/// Deliberately the LCD route only: it takes a millisecond, while a DDC/CI read
+/// can stall for tens of milliseconds and should not be put on a 120ms timer.
+/// A panel that only answers DDC simply gets no Fn-key HUD, rather than a
+/// watcher that hammers the monitor bus.
+pub fn watch_brightness() -> Option<i32> {
+    #[cfg(target_os = "windows")]
+    {
+        win::read_lcd().ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
     }
 }
 

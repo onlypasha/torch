@@ -61,6 +61,13 @@ mod sysinfo;
 #[cfg(target_os = "windows")]
 mod volume;
 
+/// Global volume keys and the HUD's brightness watcher. Both feed events to the
+/// webview; neither draws anything.
+#[cfg(target_os = "windows")]
+mod keyboard;
+
+mod hud;
+
 #[cfg(target_os = "windows")]
 mod win {
     pub use platform_impl::*;
@@ -626,9 +633,15 @@ fn quicksettings_get() -> sysinfo::QuickSettingsState {
 #[tauri::command]
 async fn brightness_set(value: i32) -> Result<(), String> {
     // The write waits for the panel to settle; keep that off the IPC thread.
-    tauri::async_runtime::spawn_blocking(move || sysinfo::set_brightness(value))
+    let result = tauri::async_runtime::spawn_blocking(move || sysinfo::set_brightness(value))
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    if result.is_ok() {
+        // The watcher is about to see this value; it must not mistake our own
+        // write for an Fn-key press.
+        hud::note_brightness(value);
+    }
+    result
 }
 
 #[tauri::command]
@@ -736,6 +749,8 @@ pub fn run() {
                 mouse_hook::install(app.handle());
                 autohide::install(app.handle());
                 activity::install(app.handle());
+                keyboard::install(app.handle());
+                hud::install(app.handle());
                 app.manage(media::install(app.handle().clone()));
             }
 

@@ -381,6 +381,99 @@ body,
   transition: box-shadow 250ms ease-out;
 }
 
+/* ---------------------------------------------------------------------------
+   The keyboard HUD.
+
+   One row inside the 300x46 bar: a 22px glyph, the level, and a 38px readout,
+   with 20px of breathing room at each end. No glow and no second row - this is
+   a glance, not a panel. The bar and readout are the only places the accent
+   colours appear; the slab stays black.
+   --------------------------------------------------------------------------- */
+
+.notch-hud-layer {
+  position: absolute;
+  inset: 0;
+}
+
+.notch-hud {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+}
+
+.notch-hud-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  transform-origin: 50% 50%;
+}
+
+.notch-hud-icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: #f5f5f5;
+}
+
+.notch-hud-icon[data-muted] {
+  color: #9ca3af;
+}
+
+.notch-hud-track {
+  position: relative;
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: rgb(255 255 255 / 0.18);
+  transform-origin: 50% 50%;
+}
+
+.notch-hud-fill {
+  height: 100%;
+  max-width: 100%;
+  border-radius: 4px;
+  background: #f5f5f5;
+}
+
+.notch-hud-fill[data-kind="brightness"] {
+  background: #fde68a;
+}
+
+.notch-hud-fill[data-failed] {
+  background: #f87171;
+}
+
+.notch-hud-value {
+  display: flex;
+  flex: none;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 1px;
+  width: 38px;
+  color: #f5f5f5;
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.notch-hud-value[data-failed] {
+  color: #f87171;
+}
+
+.notch-hud-unit {
+  color: #9ca3af;
+  font-size: 10px;
+  font-weight: 600;
+}
+
 .notch-charging {
   position: absolute;
   inset: 0;
