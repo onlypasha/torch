@@ -52,6 +52,9 @@ windows = { version = "0.57", features = [
     "Win32_System_Performance",
     "Win32_System_SystemInformation",
     "Win32_System_Shutdown",
+    # Brightness through Dxva2/DDC-CI, the same path the Windows flyout uses.
+    "Win32_Devices_Display",
+    "Win32_Graphics_Gdi",
 ] }
 
 # See https://tauri.app/concept/size/#cargo-configuration

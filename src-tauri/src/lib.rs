@@ -624,8 +624,11 @@ fn quicksettings_get() -> sysinfo::QuickSettingsState {
 }
 
 #[tauri::command]
-fn brightness_set(value: i32) {
-    sysinfo::set_brightness(value);
+async fn brightness_set(value: i32) -> Result<(), String> {
+    // The write waits for the panel to settle; keep that off the IPC thread.
+    tauri::async_runtime::spawn_blocking(move || sysinfo::set_brightness(value))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "framer-motion";
+import { brightnessLabel, volumeCommand, volumeLabel, volumePercent } from "./quicksettings";
+import type { VolumeState } from "./quicksettings";
 
 export type SysStats = {
   cpuPercent: number;
@@ -120,38 +122,127 @@ function CloseIcon() {
 }
 
 export function QuickSettingsWidget() {
-  const [vol, setVol] = useState<{ level: number; muted: boolean }>({ level: 0.5, muted: false });
+  const [vol, setVol] = useState<VolumeState>({ level: 0.5, muted: false });
   const [bright, setBright] = useState(50);
+  const [brightSupported, setBrightSupported] = useState(true);
   const [dnd, setDnd] = useState(false);
   const [powerMenu, setPowerMenu] = useState(false);
+  // A refused write must not look like a successful one: the value goes red and
+  // the slider is re-read from Windows instead of keeping the optimistic level.
+  const [volumeFailed, setVolumeFailed] = useState(false);
+  const [brightFailed, setBrightFailed] = useState(false);
 
   useEffect(() => {
-    void invoke<{ level: number; muted: boolean }>("volume_get")
-      .then((res) => setVol(res))
-      .catch(() => {});
+    let live = true;
+    void invoke<VolumeState>("volume_get")
+      .then((res) => {
+        if (live) setVol(res);
+      })
+      .catch(() => {
+        if (live) setVolumeFailed(true);
+      });
     void invoke<QuickState>("quicksettings_get")
       .then((qs) => {
+        if (!live) return;
         setBright(qs.brightness);
+        setBrightSupported(qs.brightnessSupported);
         setDnd(qs.dnd);
       })
+      .catch(() => {
+        if (live) setBrightSupported(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const reReadVolume = useCallback(() => {
+    void invoke<VolumeState>("volume_get")
+      .then((res) => setVol(res))
       .catch(() => {});
   }, []);
 
-  const handleVolume = useCallback((val: number) => {
-    setVol((prev) => ({ ...prev, level: val }));
-    void invoke("volume_set", { level: val, muted: val === 0 }).catch(() => {});
+  const latestBright = useRef<number | null>(null);
+  const brightTimer = useRef<number | null>(null);
+  const brightInFlight = useRef(false);
+
+  const flushBrightness = useCallback(() => {
+    brightTimer.current = null;
+    // One write at a time: the panel settles before it answers, and a queue of
+    // stale drag positions would make the backlight chase the thumb from
+    // behind. The newest value is kept and sent as soon as this one lands.
+    if (brightInFlight.current) return;
+    const value = latestBright.current;
+    latestBright.current = null;
+    if (value === null) return;
+    brightInFlight.current = true;
+    void invoke("brightness_set", { value })
+      .then(() => setBrightFailed(false))
+      .catch((error) => {
+        console.error("brightness_set failed:", error);
+        setBrightFailed(true);
+        // The display is the only authority on what it accepted; if it cannot
+        // even be read, the row stops pretending it is adjustable.
+        void invoke<QuickState>("quicksettings_get")
+          .then((qs) => {
+            setBright(qs.brightness);
+            setBrightSupported(qs.brightnessSupported);
+          })
+          .catch(() => setBrightSupported(false));
+      })
+      .finally(() => {
+        brightInFlight.current = false;
+        if (latestBright.current !== null) {
+          brightTimer.current = window.setTimeout(flushBrightness, 0);
+        }
+      });
   }, []);
+
+  // A drag that ends inside the throttle window still has to reach the panel.
+  useEffect(
+    () => () => {
+      if (brightTimer.current !== null) {
+        window.clearTimeout(brightTimer.current);
+        flushBrightness();
+      }
+    },
+    [flushBrightness],
+  );
+
+  const handleVolume = useCallback((level: number) => {
+    const next = volumeCommand(level);
+    setVol(next);
+    void invoke("volume_set", next)
+      .then(() => setVolumeFailed(false))
+      .catch((error) => {
+        console.error("volume_set failed:", error);
+        setVolumeFailed(true);
+        reReadVolume();
+      });
+  }, [reReadVolume]);
 
   const toggleMute = useCallback(() => {
-    const nextMuted = !vol.muted;
-    setVol((prev) => ({ ...prev, muted: nextMuted }));
-    void invoke("volume_set", { level: vol.level, muted: nextMuted }).catch(() => {});
-  }, [vol]);
+    const next = { level: vol.level, muted: !vol.muted };
+    setVol(next);
+    void invoke("volume_set", next)
+      .then(() => setVolumeFailed(false))
+      .catch((error) => {
+        console.error("volume_set failed:", error);
+        setVolumeFailed(true);
+        reReadVolume();
+      });
+  }, [vol, reReadVolume]);
 
-  const handleBrightness = useCallback((val: number) => {
-    setBright(val);
-    void invoke("brightness_set", { value: val }).catch(() => {});
-  }, []);
+  const handleBrightness = useCallback((value: number) => {
+    setBright(value);
+    // A drag emits an event per pixel, and every write makes the panel settle
+    // before it answers. Keep only the newest value and let one write fly at a
+    // time, so the backlight follows the thumb instead of a queue of stale
+    // positions.
+    latestBright.current = value;
+    if (brightTimer.current !== null) return;
+    brightTimer.current = window.setTimeout(flushBrightness, 100);
+  }, [flushBrightness]);
 
   const toggleDnd = useCallback(() => {
     void invoke<boolean>("dnd_toggle")
@@ -252,11 +343,17 @@ export function QuickSettingsWidget() {
                 className="notch-qs-slider"
                 min={0}
                 max={100}
-                value={vol.muted ? 0 : Math.round(vol.level * 100)}
+                value={volumePercent(vol.level)}
                 onChange={(e) => handleVolume(Number(e.target.value) / 100)}
                 aria-label="Volume"
               />
-              <span className="notch-qs-value">{vol.muted ? "Mute" : `${Math.round(vol.level * 100)}%`}</span>
+              <span
+                className="notch-qs-value"
+                data-failed={volumeFailed ? "true" : "false"}
+                title={volumeFailed ? "Windows menolak perubahan volume" : undefined}
+              >
+                {volumeLabel(vol.level, vol.muted)}
+              </span>
             </div>
 
             {/* Slider Kecerahan */}
@@ -268,10 +365,21 @@ export function QuickSettingsWidget() {
                 min={0}
                 max={100}
                 value={bright}
+                disabled={!brightSupported}
                 onChange={(e) => handleBrightness(Number(e.target.value))}
                 aria-label="Kecerahan layar"
               />
-              <span className="notch-qs-value">{bright}%</span>
+              <span
+                className="notch-qs-value"
+                data-failed={brightFailed ? "true" : "false"}
+                title={
+                  brightSupported
+                    ? brightFailed ? "Layar menolak perubahan kecerahan" : undefined
+                    : "Layar ini tidak dapat diatur kecerahannya"
+                }
+              >
+                {brightnessLabel(bright, brightSupported)}
+              </span>
             </div>
 
             {/* Tombol Aksi */}

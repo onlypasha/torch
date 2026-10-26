@@ -187,6 +187,18 @@ const SETTLE_MS = 460;
 const ACTIVITY_QUEUE_MAX = 8;
 
 /**
+ * Controls whose own mouse semantics must survive the shell's press handler.
+ * A ranged input in particular only moves while the browser still owns its
+ * mousedown; `preventDefault()` there freezes the thumb at its old value.
+ */
+function isNativeControl(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    target.closest("input, textarea, select, option, [contenteditable='true']") !== null
+  );
+}
+
+/**
  * Network timings, in milliseconds.
  *
  * The intro phase has a minimum rather than a dwell: the indicator stays on the
@@ -1288,6 +1300,10 @@ export default function App() {
         onAnimationComplete={handleSettled}
         onMouseDown={(event) => {
           if (event.button !== 0) return;
+          // A press on a real control belongs to that control. Cancelling the
+          // native mousedown would keep a range input's thumb from following
+          // the pointer, which makes the Quick Settings sliders look dead.
+          if (isNativeControl(event.target)) return;
           event.preventDefault();
           pressNotch();
         }}

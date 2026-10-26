@@ -1900,13 +1900,27 @@ body,
   font-size: 14px;
 }
 
+/* 16px tall so the thumb is drawn whole and is comfortable to grab; the
+   native track stays thin inside it. Clipping this to the track's 5px hid the
+   thumb and left a target no pointer could hold. */
 .notch-qs-slider {
   flex: 1;
-  height: 5px;
-  border-radius: 3px;
+  height: 16px;
+  margin: 0;
+  background: transparent;
+  border-radius: 8px;
   accent-color: #f5f5f5;
-  background: rgb(255 255 255 / 0.15);
   cursor: pointer;
+}
+
+.notch-qs-slider:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.notch-qs-slider:focus-visible {
+  outline: 1px solid rgb(255 255 255 / 0.45);
+  outline-offset: 2px;
 }
 
 .notch-qs-value {
@@ -1915,6 +1929,11 @@ body,
   color: #9ca3af;
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+/* A refused write is not a silent one. */
+.notch-qs-value[data-failed="true"] {
+  color: #fca5a5;
 }
 
 .notch-qs-actions {

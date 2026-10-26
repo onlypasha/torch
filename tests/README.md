@@ -67,6 +67,8 @@ For the animated layout, open `http://localhost:1420/tests/nook-ui.html` at
 - `compact` — 640×200 base, 752×200 pinned, fixed 352/252/100px columns, 96px artwork, icon-only header, all media rows fit, native hit rect follows the shape, outside click still closes to 200×34.
 - `stack` — immediate touchpad response, long decaying momentum is ignored, a new push during momentum advances once, slot order, only-active-card interactivity, arrows.
 - `stack-scroll` — nested lists keep wheel input until their edge; zoom/horizontal gestures are not consumed.
+- `quicksettings` — both slider mousedowns reach the range inputs (the shell must not cancel them), mute keeps the endpoint level, `volume_set` carries the dragged level, and `brightness_set` reaches the panel after the drag throttle.
+- `quicksettings-unsupported` — open the page with `?brightness=unsupported`; the brightness slider is disabled and reads `—` instead of inventing a number.
 - `pin` — context menu, 640→752 widening, tab persistence, unpin.
 - `pinlimit` — two pins split the column, third pin disabled, drag reorder.
 - `timer` — Pomodoro runs across tabs, pinned click pauses/resumes, border.

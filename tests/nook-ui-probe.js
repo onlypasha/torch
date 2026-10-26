@@ -53,6 +53,10 @@ function state() {
   const columns = [media, s, pinned].filter(Boolean);
   const clock = n?.querySelector(".notch-clock-time")?.getBoundingClientRect();
   const status = n?.querySelector(".notch-clock-status")?.getBoundingClientRect();
+  const qsSliders = [...(s?.querySelectorAll(".notch-qs-slider") ?? [])];
+  const qsVolume = qsSliders.find((el) => el.getAttribute("aria-label") === "Volume");
+  const qsBright = qsSliders.find((el) => el.getAttribute("aria-label") === "Kecerahan layar");
+  const qsValues = [...(s?.querySelectorAll(".notch-qs-value") ?? [])];
   return {
     open: n?.getAttribute("aria-expanded") === "true",
     width: n?.getBoundingClientRect().width ?? 0,
@@ -114,6 +118,13 @@ function state() {
       && Math.abs(clock.top + clock.height / 2 - (bounds.top + bounds.height / 2)) < 0.5,
     clockStatusFits: !status || (status.left > clock.right + 4 && status.right <= bounds.right - 6),
     scrollTop: document.scrollingElement?.scrollTop ?? 0,
+    qsVolume: qsVolume?.value ?? "",
+    qsVolumeText: qsValues[0]?.textContent ?? "",
+    qsVolumeFailed: qsValues[0]?.dataset.failed ?? "",
+    qsBright: qsBright?.value ?? "",
+    qsBrightText: qsValues[1]?.textContent ?? "",
+    qsBrightFailed: qsValues[1]?.dataset.failed ?? "",
+    qsBrightDisabled: !!qsBright?.disabled,
   };
 }
 
@@ -213,6 +224,14 @@ async function drag(element, dy) {
   window.dispatchEvent(new PointerEvent("pointerup", { ...init, button: 0, clientY: y + dy }));
   await wait(700);
 }
+
+/** Drive a controlled range input the way a browser would. */
+const setRange = (element, value) => {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  setter.call(element, String(value));
+  element.dispatchEvent(new Event("input", { bubbles: true }));
+  element.dispatchEvent(new Event("change", { bubbles: true }));
+};
 
 export async function runNookScenario(scenario = "media") {
   const errors = [];
@@ -638,6 +657,72 @@ export async function runNookScenario(scenario = "media") {
     } finally {
       list.remove();
     }
+  }
+
+  if (scenario === "quicksettings") {
+    await openPanel();
+    await selectWidget("quicksettings");
+    await wait(300);
+
+    const sliders = () => [...activeCard().querySelectorAll(".notch-qs-slider")];
+    const volume = sliders().find((el) => el.getAttribute("aria-label") === "Volume");
+    const bright = sliders().find((el) => el.getAttribute("aria-label") === "Kecerahan layar");
+    check(!!volume && !!bright, "both sliders are rendered");
+
+    // The shell used to cancel every left mousedown, which is exactly why a
+    // native range thumb never followed the pointer. A cancelled event here
+    // means the sliders are dead again.
+    const press = new MouseEvent("mousedown", {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientX: volume.getBoundingClientRect().left + 20,
+      clientY: volume.getBoundingClientRect().top + 8,
+    });
+    const reached = volume.dispatchEvent(press);
+    check(reached && !press.defaultPrevented, "the notch shell leaves a slider mousedown alone");
+
+    let now = sample();
+    check(now.qsVolume === "40" && now.qsVolumeText === "40%", "volume starts at the endpoint level");
+    check(now.qsBright === "50" && now.qsBrightText === "50%" && !now.qsBrightDisabled, "brightness starts at the panel level");
+
+    // Mute is a separate fact from the level: the thumb must not collapse to
+    // zero, otherwise dragging it up starts from silence.
+    activeCard().querySelector(".notch-qs-icon-btn").click();
+    await wait(120);
+    now = sample();
+    check(now.qsVolume === "40" && now.qsVolumeText === "Mute", "muting keeps the level and says Mute");
+    activeCard().querySelector(".notch-qs-icon-btn").click();
+    await wait(120);
+
+    setRange(volume, 64);
+    await wait(200);
+    now = sample();
+    const volumeWrite = window.__notchCommands.filter((entry) => entry.command === "volume_set").at(-1)?.args;
+    check(
+      volumeWrite?.level === 0.64 && volumeWrite?.muted === false,
+      `volume_set carries the new level: ${JSON.stringify(volumeWrite)}`,
+    );
+    check(now.qsVolume === "64" && now.qsVolumeText === "64%" && now.qsVolumeFailed === "false", "volume row follows 64%");
+
+    setRange(bright, 71);
+    await wait(260);
+    now = sample();
+    const brightWrite = window.__notchCommands.filter((entry) => entry.command === "brightness_set").at(-1)?.args;
+    check(brightWrite?.value === 71, `brightness_set carries 71: ${JSON.stringify(brightWrite)}`);
+    check(now.qsBright === "71" && now.qsBrightText === "71%", "brightness row follows 71%");
+    check(window.__notchQuickSettings.brightness === 71, "the panel mock received the brightness write");
+
+    sample();
+  }
+
+  if (scenario === "quicksettings-unsupported") {
+    await openPanel();
+    await selectWidget("quicksettings");
+    await wait(300);
+    const now = sample();
+    check(now.qsBrightDisabled, "a display with no backlight control disables the slider");
+    check(now.qsBrightText === "—", `unsupported brightness reads —, got ${now.qsBrightText}`);
   }
 
   if (scenario === "pin") {
