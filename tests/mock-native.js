@@ -1,4 +1,7 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
+import { INITIAL_SHARING } from "../src/sharing.ts";
+import { INITIAL_NOTIFICATIONS } from "../src/notifications.ts";
+import { runtimeConfig } from "../src/config.ts";
 
 // Browser-only fixture; never imported by the production entrypoint.
 mockWindows("main");
@@ -20,6 +23,19 @@ if (new URLSearchParams(window.location.search).get("brightness") === "unsupport
 }
 mockIPC((command, args) => {
   window.__notchCommands.push({ command, args });
+  if (command === "config_get") return structuredClone(window.__configMock ?? runtimeConfig);
+  if (command === "config_save") { window.__savedConfig = structuredClone(args.config); return null; }
+  if (command.startsWith("weather_")) return window.__weatherMock ? window.__weatherMock(command, args) : null;
+  if (command.startsWith("notifications_")) {
+    return window.__notificationsMock ? window.__notificationsMock(command, args) : INITIAL_NOTIFICATIONS;
+  }
+  if (command.startsWith("sharing_")) {
+    return window.__sharingMock ? window.__sharingMock(command, args) : INITIAL_SHARING;
+  }
+  if (command.startsWith("tray_")) {
+    if (window.__trayMock) return window.__trayMock(command, args);
+    if (command === "tray_snapshot") return { items: [], revision: 0 };
+  }
   // The volume panel reads the level back on mount; a mock that answered
   // nothing would leave it stuck at zero.
   if (command === "volume_get") {
@@ -33,6 +49,10 @@ mockIPC((command, args) => {
   if (command === "quicksettings_get") {
     return window.__notchQuickSettings;
   }
+  if (command === "dnd_toggle") {
+    window.__notchQuickSettings.dnd = !window.__notchQuickSettings.dnd;
+    return window.__notchQuickSettings.dnd;
+  }
   if (command === "brightness_set") {
     if (window.__notchBrightnessFail || !window.__notchQuickSettings.brightnessSupported) {
       return Promise.reject(new Error("no backlight"));
@@ -43,6 +63,7 @@ mockIPC((command, args) => {
   // The system monitor widget renders percentages straight from this payload;
   // answering null used to crash the whole fixture when that widget rotated in.
   if (command === "sysinfo_stats") {
+    if (window.__notchStatsFail) return Promise.reject(new Error("system stats unavailable"));
     return {
       cpuPercent: 34,
       memPercent: 58,

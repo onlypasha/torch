@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { runtimeConfig } from "./config";
 import {
   MAX_SAMPLE_AGE_MS,
   mergeMediaState,
@@ -11,7 +12,7 @@ import {
   trackIdentity,
 } from "./media";
 import type { MediaCommand, MediaState, PlayheadAnchor, SeekOutcome } from "./media";
-import { fetchLyricsSheet, lyricWindow } from "./lyrics";
+import { fetchLyricsSheet, lyricWindow, MAX_DURATION_DIFF_SEC } from "./lyrics";
 import type { LyricLine, LyricsState, LyricsStatus } from "./lyrics";
 import {
   pinVerdict,
@@ -26,6 +27,8 @@ import {
 import type { PinVerdict, PomodoroPhase, WidgetId } from "./nook";
 import { initialPomodoro, pomodoroReducer } from "./pomodoro";
 import type { PomodoroState } from "./pomodoro";
+import { useWeather } from "./useWeather";
+import type { WeatherModel } from "./useWeather";
 
 /**
  * App owns this model for its whole lifetime, like WPF's retained controls.
@@ -36,14 +39,21 @@ import type { PomodoroState } from "./pomodoro";
 /** How long a seek may hold the bar before the player's own position wins. */
 const SEEK_HOLD_MS = 3000;
 
+export type SeekGesture = {
+  trackKey: string;
+  durationMs: number;
+};
+
 export type NookModel = {
+  weather: WeatherModel;
   media: MediaState;
   /** Where the bar is drawn: the player's position, or a seek in flight. */
   positionMs: number;
   mediaControl: (action: MediaCommand) => void;
-  beginSeek: () => void;
-  previewSeek: (ratio: number) => void;
-  commitSeek: (ratio: number) => void;
+  beginSeek: () => SeekGesture | null;
+  cancelSeek: () => void;
+  previewSeek: (ratio: number, gesture: SeekGesture) => void;
+  commitSeek: (ratio: number, gesture?: SeekGesture) => void;
   seekFailed: boolean;
   toggleShuffle: () => void;
   cycleRepeat: () => void;
@@ -66,12 +76,14 @@ export type NookModel = {
 };
 
 export function useNook(open: boolean): NookModel {
+  const weather = useWeather();
   const [media, setMedia] = useState<MediaState>(null);
   const artwork = useRef<NonNullable<MediaState> | null>(null);
 
   // Keep the lightweight media listener alive, but poll rapidly only while
   // Nook is visible. Other tabs and the closed bar use the passive cadence.
   useEffect(() => {
+    if (!runtimeConfig.features.media) return;
     void invoke("media_polling", { active: open }).catch(() => {});
     if (open) void invoke("media_snapshot").catch(() => {});
     return () => {
@@ -85,14 +97,35 @@ export function useNook(open: boolean): NookModel {
   // The request id is the only way to tell an answer for the drag just
   // released from one for a drag that was abandoned or aimed at another song.
   const seekTokenRef = useRef(0);
-  const pendingRef = useRef<{ token: number; targetMs: number; at: number } | null>(null);
+  const pendingRef = useRef<{ token: number; targetMs: number; trackKey: string } | null>(null);
+  const seekTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const gestureRef = useRef<SeekGesture | null>(null);
   const trackKeyRef = useRef("");
+
+  const clearPending = useCallback(() => {
+    if (seekTimerRef.current !== null) window.clearTimeout(seekTimerRef.current);
+    seekTimerRef.current = null;
+    pendingRef.current = null;
+    setSeekPending(null);
+  }, []);
+
+  const cancelSeek = useCallback(() => {
+    gestureRef.current = null;
+    setSeekPreviewMs(null);
+  }, []);
+
+  useEffect(() => () => {
+    if (seekTimerRef.current !== null) window.clearTimeout(seekTimerRef.current);
+    seekTimerRef.current = null;
+    pendingRef.current = null;
+    gestureRef.current = null;
+  }, []);
 
   // A panel can disappear during a drag. Keep real playback/requests, not an
   // abandoned preview that would otherwise cover the timeline on reopening.
   useEffect(() => {
-    if (!open) setSeekPreviewMs(null);
-  }, [open]);
+    if (!open) cancelSeek();
+  }, [open, cancelSeek]);
 
   // Local monotonic playhead clock: interpolates between GSMTC polls so lyrics and
   // progress move in real-time and do not freeze if Windows sends infrequent updates.
@@ -108,6 +141,7 @@ export function useNook(open: boolean): NookModel {
   });
 
   useEffect(() => {
+    if (!runtimeConfig.features.media) return;
     let disposed = false;
     let stop: (() => void) | undefined;
     listen<MediaState>("media-state", (event) => {
@@ -121,18 +155,21 @@ export function useNook(open: boolean): NookModel {
       const nextKey = merged ? trackIdentity(merged) : "";
       if (nextKey !== trackKeyRef.current) {
         trackKeyRef.current = nextKey;
-        pendingRef.current = null;
-        setSeekPending(null);
-        setSeekPreviewMs(null);
+        clearPending();
+        cancelSeek();
+        setSeekFailed(false);
+      } else if (!merged?.hasTimeline || merged.durationMs <= 0) {
+        clearPending();
+        cancelSeek();
+        setSeekFailed(false);
+      } else if (!merged.canSeek || (gestureRef.current && gestureRef.current.durationMs !== merged.durationMs)) {
+        cancelSeek();
       }
 
       const pending = pendingRef.current;
-      if (pending) {
-        const near = merged ? seekSettled(pending.targetMs, merged.positionMs) : true;
-        if (near || performance.now() - pending.at > SEEK_HOLD_MS) {
-          pendingRef.current = null;
-          setSeekPending(null);
-        }
+      if (pending && merged && seekSettled(pending.targetMs, merged.positionMs)) {
+        // Stop holding the thumb, but still await this request's outcome.
+        setSeekPending(null);
       }
       setMedia(merged);
 
@@ -144,6 +181,12 @@ export function useNook(open: boolean): NookModel {
         const anchor = nextPlayheadAnchor(anchorRef.current, merged, now, receivedAtMs);
         anchorRef.current = anchor;
         setLocalClockMs(Math.round(playheadAt(anchor, now)));
+      } else {
+        anchorRef.current = {
+          baseMs: 0, at: performance.now(), playing: false, durationMs: 0,
+          trackKey: "", playbackRate: 1, sampleStampMs: null,
+        };
+        setLocalClockMs(0);
       }
     }).then((unlisten) => {
       if (disposed) unlisten();
@@ -153,16 +196,19 @@ export function useNook(open: boolean): NookModel {
       disposed = true;
       stop?.();
     };
-  }, []);
+  }, [clearPending, cancelSeek]);
 
   // Paint the clock from the anchor every frame while the panel is open. The
   // loop never stops early: a pause or a source-side seek changes the anchor,
   // and the next frame must pick that up instead of freezing on old state.
   useEffect(() => {
-    if (!open) return;
+    if (!open || !runtimeConfig.features.media) return;
+    const now = performance.now();
+    const immediate = Math.round(playheadAt(anchorRef.current, now));
+    setLocalClockMs(immediate);
     let animId: number;
-    let lastPaintMs = -1;
-    let lastPaintAt = 0;
+    let lastPaintMs = immediate;
+    let lastPaintAt = now;
 
     const frame = (at: number) => {
       // 30 updates a second is smoother than the WPF ticker and still keeps the
@@ -183,19 +229,19 @@ export function useNook(open: boolean): NookModel {
   }, [open]);
 
   useEffect(() => {
+    if (!runtimeConfig.features.media) return;
     let disposed = false;
     let stop: (() => void) | undefined;
     listen<SeekOutcome>("media-seek", (event) => {
       const outcome = event.payload;
-      // Late answers for an older drag (or a probe without a token) must not
-      // move a bar that now belongs to a different request. Untokened events
-      // are still accepted, which keeps the plain worker/UI contract usable.
-      if (outcome.token !== undefined && outcome.token !== seekTokenRef.current) return;
+      const pending = pendingRef.current;
+      // Only the still-active request owns this reply. A counter alone would
+      // accept the last token again after a track change, timeout or new drag.
+      if (!pending || outcome.token !== pending.token || pending.trackKey !== trackKeyRef.current) return;
 
       // Whatever the player answered, the preview must not stay on screen once
       // the worker has finished verifying: a rejected seek snaps back.
-      pendingRef.current = null;
-      setSeekPending(null);
+      clearPending();
       setSeekPreviewMs(null);
       setSeekFailed(!outcome.applied);
       if (outcome.applied) {
@@ -207,7 +253,9 @@ export function useNook(open: boolean): NookModel {
         const age = outcome.sampledAtMs
           ? Math.min(MAX_SAMPLE_AGE_MS, Math.max(0, Date.now() - outcome.sampledAtMs))
           : 0;
-        const base = outcome.positionMs + (anchorRef.current.playing ? age * rate : 0);
+        const projected = Math.max(0, outcome.positionMs + (anchorRef.current.playing ? age * rate : 0));
+        const duration = anchorRef.current.durationMs;
+        const base = duration > 0 ? Math.min(duration, projected) : projected;
         anchorRef.current = {
           ...anchorRef.current,
           baseMs: base,
@@ -226,7 +274,7 @@ export function useNook(open: boolean): NookModel {
       disposed = true;
       stop?.();
     };
-  }, []);
+  }, [clearPending]);
 
   const mediaControl = useCallback((action: MediaCommand) => {
     void invoke("media_control", { action }).catch((error) => {
@@ -235,29 +283,45 @@ export function useNook(open: boolean): NookModel {
   }, []);
 
   const beginSeek = useCallback(() => {
+    const current = artwork.current;
+    if (!current?.canSeek || current.durationMs <= 0) return null;
+    clearPending();
+    setSeekPreviewMs(null);
     setSeekFailed(false);
+    const gesture = { trackKey: trackIdentity(current), durationMs: current.durationMs };
+    gestureRef.current = gesture;
+    return gesture;
+  }, [clearPending]);
+
+  const previewSeek = useCallback((ratio: number, gesture: SeekGesture) => {
+    if (gestureRef.current !== gesture) return;
+    const current = artwork.current;
+    if (!current?.canSeek || trackIdentity(current) !== gesture.trackKey || current.durationMs !== gesture.durationMs) return;
+    setSeekPreviewMs(seekTarget(ratio, gesture.durationMs));
   }, []);
 
-  const previewSeek = useCallback((ratio: number) => {
-    setSeekPreviewMs((current) => {
-      // The duration lives on the last media payload; the component passes a
-      // ratio, so the target is resolved here against the freshest state.
-      const duration = artwork.current?.durationMs ?? 0;
-      if (duration <= 0) return current;
-      return seekTarget(ratio, duration);
-    });
-  }, []);
-
-  const commitSeek = useCallback((ratio: number) => {
+  const commitSeek = useCallback((ratio: number, gesture?: SeekGesture) => {
+    // The exact gesture object is invalidated on every track change, including
+    // A -> B -> A. Matching metadata alone cannot detect that round trip.
+    if (gesture && gestureRef.current !== gesture) return;
     const current = artwork.current;
     const duration = current?.durationMs ?? 0;
-    setSeekPreviewMs(null);
-    if (!current || duration <= 0) return;
+    cancelSeek();
+    if (!current?.canSeek || duration <= 0) return;
+    const trackKey = trackIdentity(current);
+    if (gesture && (gesture.trackKey !== trackKey || gesture.durationMs !== duration)) return;
+    clearPending();
     const targetMs = seekTarget(ratio, duration);
     const token = ++seekTokenRef.current;
-    pendingRef.current = { token, targetMs, at: performance.now() };
+    pendingRef.current = { token, targetMs, trackKey };
     setSeekPending(targetMs);
     setSeekFailed(false);
+    seekTimerRef.current = window.setTimeout(() => {
+      if (pendingRef.current?.token !== token) return;
+      clearPending();
+      setSeekFailed(true);
+      void invoke("media_snapshot").catch(() => {});
+    }, SEEK_HOLD_MS);
     void invoke("media_seek", {
       positionMs: targetMs,
       token,
@@ -272,11 +336,10 @@ export function useNook(open: boolean): NookModel {
     }).catch((error) => {
       console.error("media_seek failed:", error);
       if (pendingRef.current?.token !== token) return;
-      pendingRef.current = null;
-      setSeekPending(null);
+      clearPending();
       setSeekFailed(true);
     });
-  }, []);
+  }, [cancelSeek, clearPending]);
 
   const toggleShuffle = useCallback(() => {
     const active = artwork.current?.shuffle === true;
@@ -304,7 +367,7 @@ export function useNook(open: boolean): NookModel {
 
   const [active, setActive] = useState<WidgetId>(WIDGETS[0]);
   const [pinned, setPinned] = useState<WidgetId[]>([]);
-  const stack = stackWidgets(pinned);
+  const stack = stackWidgets(pinned).filter((id) => runtimeConfig.widgets.includes(id) && (id !== "lyric" || runtimeConfig.features.media));
   // A pinned widget cannot stay active in the stack; fall back to the head.
   const activeWidget = stack.includes(active) ? active : stack[0];
 
@@ -314,12 +377,13 @@ export function useNook(open: boolean): NookModel {
   activeRef.current = activeWidget;
 
   const step = useCallback((delta: 1 | -1) => {
-    const list = stackWidgets(pinnedRef.current);
+    const list = stackWidgets(pinnedRef.current).filter((id) => runtimeConfig.widgets.includes(id) && (id !== "lyric" || runtimeConfig.features.media));
+    if (!list.length) return;
     setActive(rotate(list, activeRef.current, delta));
   }, []);
 
   const select = useCallback((widget: WidgetId) => {
-    if (stackWidgets(pinnedRef.current).includes(widget)) setActive(widget);
+    if (runtimeConfig.widgets.includes(widget) && stackWidgets(pinnedRef.current).includes(widget)) setActive(widget);
   }, []);
 
   const verdict = useCallback(
@@ -399,16 +463,24 @@ export function useNook(open: boolean): NookModel {
     return trackIdentity(media);
   }, [media, lyricTitle, lyricArtist]);
 
-  // A duration that arrives a moment after the metadata is a reason to ask
-  // again: the first lookup may have been sent without one. It never goes back
-  // to unknown, so a momentary zero cannot start a request loop.
+  // Revalidate both unknown -> known and corrected durations. Ignore small
+  // jitter within the service's matching tolerance and transient zero readings.
   const lastDurationRef = useRef(0);
-  if (lyricDuration > 0) lastDurationRef.current = lyricDuration;
-  const lyricFetchSeconds = lyricDuration > 0 ? lyricDuration : lastDurationRef.current;
-  const lyricDurationReady = lyricFetchSeconds > 0;
+  const currentKeyRef = useRef("");
+  if (currentSongKey !== currentKeyRef.current) {
+    currentKeyRef.current = currentSongKey;
+    lastDurationRef.current = 0;
+  }
+  if (lyricDuration > 0 && (
+    lastDurationRef.current === 0 ||
+    Math.abs(lyricDuration - lastDurationRef.current) > MAX_DURATION_DIFF_SEC
+  )) lastDurationRef.current = lyricDuration;
+  const lyricFetchSeconds = lastDurationRef.current;
 
   useEffect(() => {
-    if (!hasMedia) {
+    // Media's inline lyrics and the optional lyric card share this sheet.
+    // Hiding the card must not disable lyrics in Media Control.
+    if (!hasMedia || !runtimeConfig.features.media) {
       setLyricStatus("idle");
       setLyricLines([]);
       setLyricPlain("");
@@ -452,9 +524,7 @@ export function useNook(open: boolean): NookModel {
         setLyricStatus("failed");
       });
     return () => controller.abort();
-    // The duration only matters as "known or not": a sheet found without one
-    // is looked up again when the player finally reports it.
-  }, [currentSongKey, lyricDurationReady, hasMedia]);
+  }, [currentSongKey, lyricFetchSeconds, hasMedia]);
 
   // The row follows the displayed position, which includes a seek preview, so
   // the words move with the thumb instead of waiting for the player's answer.
@@ -469,10 +539,12 @@ export function useNook(open: boolean): NookModel {
   );
 
   return {
+    weather,
     media,
     positionMs,
     mediaControl,
     beginSeek,
+    cancelSeek,
     previewSeek,
     commitSeek,
     seekFailed,

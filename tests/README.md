@@ -1,5 +1,146 @@
 # Activity indicator checks
 
+## Configuration
+
+`tests/nook-ui.html?no-lyric-widget` plus
+`runNookScenario("media-lyrics-independent")` checks that synced and plain
+lyrics remain in Media Control when the lyric card is disabled. Use
+`?no-widgets` for Media alone with all cards disabled. Combine
+`?no-media&no-lyric-widget` with `runNookScenario("media-disabled-no-lyrics")`
+to check that turning off Media still suppresses lyric lookups. Lyric responses
+in these probes are mocked; no external lyric service is contacted.
+
+`tests/nook-ui.html?no-media` plus `runNookScenario("no-media")` verifies
+the 276px widget-only shell and native hit rectangle, the 388px pinned size,
+640px other tabs, pin/unpin and reopening. The standard `compact` scenario
+continues to check the 640/752px sizes with Media enabled.
+
+`tests/settings-ui.html?settings` opens the configuration with mocked native
+storage. `?disabled` opens the notch with all services and widgets disabled.
+Check the light preset, Sharing/Tray dependency, save payload and keyboard
+switches. The disabled fixture should show only Nook and make no media,
+notification, sharing or tray IPC calls. Native defaults/round trips are
+covered by `cargo test --lib config::tests`.
+
+## Windows notifications
+
+`cargo test --lib notifications::tests` verifies permission changes, live inbox
+reconciliation and scoped dismissal without reading or deleting actual user
+notifications. `bun test tests/notifications.test.ts` covers relative time.
+Open `http://localhost:1420/tests/notifications-ui.html` at 800×320 and run
+`runNotificationScenario` sequentially with `permission`, `arrival`, `queue`, `closed`, `lifetime`, `filter`,
+`dismiss`, `clear`, `denied`. The fixture uses fabricated notifications and
+mocked IPC. Actual Windows access requires a package identity declaring
+`userNotificationListener`, plus explicit user permission.
+After `permission`, `filter-keyboard` checks focus entry/Escape restoration;
+`photo` checks a late WhatsApp image in the active and collapsed notches and
+the initials fallback for an invalid image. `cargo test --lib notifications::avatar`
+checks exact ID/app/time matching, XML extraction and source validation.
+The ignored `live_database_payload_probe` reads only an active WhatsApp toast,
+prints sanitized match/fetch status, and contacts its approved image host.
+`collapsed-preview` checks sender/app text, hidden body, clock replacement and
+containment and native hit testing in the 300×46 notification shell.
+`spring-close` samples elastic settling and reverses a close in flight;
+`notification-size-cycle` checks HUD priority, panel-to-notification closing,
+and expiry back to 200×34 idle. Check these in normal and reduced-motion modes.
+`interruption-fit` checks 12px padding around the existing 520×132 card,
+the matching 544×156 native hit area, and restoration of the underlying tab
+after local dismissal. Run it after `permission` in both motion modes.
+
+## Weather
+
+Native settings-window regression: run `bun run build`, then
+`powershell -File scripts/Test-SettingsNative.ps1`. This requires Windows SDK
+Manifest Tool. It builds a small Tauri example using the real config module and
+embedded frontend, initiates the same UI-thread boundary as the native menu,
+waits for the React heading and controls, closes/recreates settings through real
+`config_open` IPC, and checks concurrent opens. A 20-second watchdog fails an
+unrendered window. It does not save settings or request location permission.
+The helper supplies the example's Common Controls/application manifest; running
+the raw Cargo example without that manifest is not the supported test command.
+
+For Windows startup/identity regressions, run `powershell -File scripts/Test-NotchLaunch.ps1`
+from the repository root. Add `-Executable <absolute release exe path>` to check
+release too. The probe creates a suspended process and terminates it before app
+code executes; it checks native activation without opening a window or requesting
+notification/location data. The updater must run while NotchApp is closed and
+preserves its existing registered external location by default.
+
+`bun test tests/weather.test.ts` covers provider nulls, zero/negative temperature,
+future timestamps, city timezones across midnight, cached and shared requests,
+retry and location/mode changes. `cargo test --lib config::tests` checks backward
+compatibility and persisted coordinate validation.
+
+`cargo test --lib weather::tests::live_provider -- --ignored --nocapture` contacts
+the public provider with the test city Jakarta. It does not read device location.
+
+Open `/tests/weather-ui.html` and run `runWeatherScenario('ready')` to verify the
+current response, four future hours, source attribution, shared pin data and one
+request under StrictMode. Fresh `?mode=unset`, `error`, `stale`, or `disabled`
+fixtures use scenarios of the same name. A fresh default fixture also supports
+`refresh-failure`, which advances its local test clock to check failed refresh
+retention and subsequent recovery. These are fabricated provider fixtures.
+
+`?settings&mode=unset` supports `settings` for manual search/selection/save and,
+after reloading, `windows-settings` for denied/allowed permission and persistence.
+Actual Windows consent is tested interactively in the foreground settings window;
+the browser fixture never requests system permission.
+
+## LocalSend Sharing
+
+Reference/design notes: `SHARING-REVIEW.md`. `bun test tests/sharing.test.ts`
+checks progress and sizes; `cargo test --lib sharing::tests` exercises protocol
+and TLS with loopback mock receivers. It does not send user files to LAN peers.
+
+Open `http://localhost:1420/tests/sharing-ui.html` at **800×320**. Run
+`await runSharingScenario("empty")`, then `stage`, `transfer`, `success`, `drop`,
+`selection`, `persist`, and `error` in order. The network boundary is mocked, while the real
+React components and retained model run. For desktop verification, open Sharing,
+open LocalSend on a second LAN device, add a harmless test file to Tray, then explicitly
+click Kirim and accept it on the receiver. Also check cancellation and rejection.
+
+## Windows z-order
+
+`cargo test --lib window_z_order_tests` from `src-tauri` uses an invisible test
+window to demote/re-raise the overlay twice and checks WS_EX_TOPMOST, retained
+geometry, WS_EX_NOACTIVATE and unchanged foreground window. Initial placement
+now sets HWND_TOPMOST explicitly; expanded `set_notch_hit` reasserts it after
+the click-through style change, before the frontend starts opening.
+
+## Tray
+
+Native thumbnail encoding: `cargo test --lib tray_preview::tests` from
+`src-tauri`. Optional desktop icon extraction: add `-- --ignored --nocapture`
+and filter `windows_shell_icon_probe`. Preview requests are lazy and null/error
+results retain the type glyph. Visual reference dimensions are recorded in
+`TRAY-REVIEW.md`.
+
+`TRAY-REVIEW.md` records boring.notch source evidence, Windows adaptation, design
+decisions and verification limits. `bun test tests/tray.test.ts` checks selection
+and metadata; `cargo test --lib tray::tests` checks persistence and file ownership.
+
+Open `http://localhost:1420/tests/tray-ui.html` at **800×320**. Run
+`await runTrayScenario("empty")`, then `filled`, `persist`, `drop`, `remove`,
+and `error` in that order. Only the native boundaries are mocked. File picker,
+clipboard, Explorer open/reveal and outgoing file drag require a desktop run.
+The native shelf is stored in app-data `tray.json`; remove/clear must leave
+the original files untouched. `await runTrayScenario("auto-open")` also checks
+file hover opens the collapsed notch directly into Tray and imports the released
+file. `cargo test --lib tray_drop::tests` verifies the native OLE data path and
+gesture cancellation. A physical Explorer drag needs a rebuilt desktop app.
+The Tray has no add/paste buttons. `filled` uses Ctrl+V, and `paste-scope`
+checks that native paste requests are accepted in Tray and ignored on Nook.
+The desktop keyboard hook routes Ctrl+V only while the open Tray is active.
+`await runTrayScenario("ripple")` checks hover/drop feedback, automatic cleanup,
+and that duplicates/failed imports do not play the success ripple. Run with both
+normal and reduced-motion media preferences.
+
+Media/lyrics comparison and implementation notes: `MEDIA-LYRICS-REVIEW.md`.
+The browser media fixture also supports `plain-marquee`, `synced-marquee`, and
+`song-transition-clock` through `runMediaRegression(...)`. The transition case
+starts a different track at zero and repeats its unchanged timeline snapshot;
+both progress and synced lyric text must advance automatically.
+
 ## Panel tabs (open notch)
 
 `bun test tests/panel.test.ts` covers the tab order and the direction helper.
@@ -17,6 +158,15 @@ Open `http://localhost:1420/tests/panel-ui.html` in an isolated browser at
 component state and each scenario assumes a fresh Nook start.
 
 ## Nook (media, widgets, pins)
+
+`runNookScenario("widget-redesign")` checks the redesigned utility widgets:
+fixed-slot containment, 44px controls, system-monitor error recovery, DND,
+lock and power mock actions, Back and Escape. Also run it with reduced motion.
+The calendar ribbon now uses 44px cells; inline Media lyrics are unchanged.
+
+`await runNookScenario("calendar")` checks the boring.notch-style date wheel,
+date selection, return to today and scroll isolation. Reference evidence and
+the current agenda limitation are in `CALENDAR-REVIEW.md`.
 
 The model and last selected tab live in `App`, so collapse only unmounts the
 view: widget selection, pin order and Pomodoro survive until the app exits.
@@ -87,6 +237,35 @@ For the animated layout, open `http://localhost:1420/tests/nook-ui.html` at
 - `lyrics-plain` — untimed words render as one static block (never as timed rows), and a duration arriving after the first lookup asks the service again.
 - `lyrics-timeout` — a stalled request reports failure after seven seconds instead of staying in loading.
 - `lyrics-layout` — long active lines wrap to two compact lines; fixed slots stay inside 252×148 during transitions; pinned lyrics fit with two pins. `lyrics-layout-showcase` leaves the full lyric card visible for screenshots.
+
+### Media regression checks
+
+The same Nook fixture also exposes `await runMediaRegression("cancel")` from
+`tests/media-ui-regressions.js`. These checks use the production hook and seek
+component, paused timelines for deterministic assertions, and mocked Windows
+events/network responses. Keep the browser tab foreground at **800×320** so
+timer and animation throttling cannot affect the result. Success returns
+`{ scenario, ok: true }`; a failed assertion rejects with its exact reason.
+
+- `cancel`, `lost-capture` — discard a drag without issuing a seek or leaving a preview.
+- `track-change`, `track-round-trip` — a drag begun on A cannot seek B, even after A→B→A.
+- `capability-change` — a revoked seek capability cancels the drag.
+- `late-result`, `new-drag-old-result`, `untokened-result` — only a matching active request can change the playhead; old or uncorrelated replies cannot erase a new preview.
+- `near-sample-then-result` — a timeline near the target releases the visual hold, but does not discard the request's awaited result.
+- `timeout` — the three-second hold expires without requiring a new media event.
+- `null-session`, `timeline-expiry` — clear the old clock and optimistic seek when the session or native timeline disappears.
+- `keyboard` — ArrowRight, Home and End still send tokened seeks and settle correctly.
+- `duration-correction`, `duration-jitter` — revalidate corrected lyric durations, without refetching for jitter within the duration-matching tolerance.
+- `instrumental` — timed empty lines clear both the karaoke strip and active lyric row, rather than showing old words or an unavailable notice.
+
+The native worker retains a previously valid finite timeline for the same active
+track while Firefox publishes empty timeline properties, without a five-second
+expiry. It clears retention on a track/session change or stopped session and
+disables seek while raw timeline properties are missing. The frontend preserves
+artwork only; it must not restore a missing timeline or seek capability.
+`media-seek` fixture replies must echo the request token, just
+like the worker does for UI-issued seeks. Tokenless manual probes are not
+confirmations of a UI request.
 
 `showcase0`, `showcase`, `showcase2`, `showcase3` leave the panel in a state
 worth screenshotting (media only, one pin, two pins with a running Pomodoro,

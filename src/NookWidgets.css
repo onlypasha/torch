@@ -1,0 +1,136 @@
+/* Utilities share Media Control's material and neutral control hierarchy. */
+.notch-nook {
+  --widget-surface: var(--nook-card-material), #000;
+  --widget-raised: rgb(255 255 255 / .09);
+  --widget-border: rgb(255 255 255 / .055);
+  --widget-text: #fff;
+  --widget-secondary: #a1a1aa;
+  --widget-accent: #f5f5f5;
+}
+.notch-nook .notch-stack-card {
+  padding: 12px;
+  border-radius: 20px;
+  border-color: var(--widget-border);
+  background: var(--widget-surface);
+  color: var(--widget-text);
+  touch-action: pan-x;
+}
+.notch-nook .notch-stack-card[data-slot="next"] { background: var(--widget-surface); border-color: var(--widget-border); }
+.notch-nook .notch-stack-card[data-slot="active"]:active { cursor: grabbing; }
+.notch-nook .notch-widget { height: 100%; gap: 7px; }
+.notch-nook .notch-widget-label { color: var(--widget-secondary); font-size: 11px; line-height: 14px; font-weight: 500; letter-spacing: 0; }
+.notch-nook .notch-stack:focus-visible { border-radius: 20px; outline-color: var(--widget-accent); outline-offset: -3px; }
+.notch-nook .notch-stack :is(button,input):focus-visible { outline: 2px solid var(--widget-accent); outline-offset: 2px; }
+.notch-nook .notch-stack button:active { transform: scale(.97); }
+.notch-nook .notch-stack :is(button,input):disabled { cursor: not-allowed; opacity: .45; }
+
+/* Full-length tracks, with labels and readouts aligned as three quiet columns. */
+.notch-nook .notch-stack-card[data-widget="quicksettings"] { padding-block: 7px; }
+.notch-stack .notch-qs-widget { min-height: 0; justify-content: center; }
+.notch-stack .notch-qs-main-view { display: grid; grid-template-columns: 1fr; grid-template-rows: 44px 44px 44px; gap: 0; }
+.notch-stack .notch-qs-row { display: grid; grid-template-columns: 67px minmax(0,1fr) 31px; align-items: center; gap: 5px; }
+.notch-stack .notch-qs-field-label { display: flex; align-items: center; gap: 3px; font-size: 10px; line-height: 16px; color: var(--widget-secondary); cursor: pointer; white-space: nowrap; }
+.notch-stack .notch-qs-field-label svg { width: 11px; height: 11px; }
+.notch-stack .notch-qs-field-label>span { display: flex; }
+.notch-stack .notch-qs-value { width: auto; font-size: 10px; color: var(--widget-text); }
+.notch-stack .notch-qs-value[data-failed="true"] { color: #fca5a5; }
+.notch-stack .notch-qs-slider { width: 100%; min-width: 0; height: 44px; accent-color: var(--widget-accent); }
+.notch-stack .notch-qs-actions { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 4px; margin: 0; }
+.notch-stack .notch-qs-btn { width: auto; min-width: 44px; height: 44px; border-radius: 999px; background: transparent; color: #d4d4d8; }
+.notch-stack .notch-qs-btn:hover { background: var(--widget-raised); color: var(--widget-text); }
+.notch-stack .notch-qs-btn.active,.notch-stack .notch-qs-icon-btn[aria-pressed="true"] { background: rgb(255 255 255 / .16); color: var(--widget-text); }
+.notch-stack .notch-qs-btn svg { width: 17px; height: 17px; }
+.notch-stack .notch-qs-power-head { height: 44px; }
+.notch-stack .notch-qs-power-back { width: 44px; height: 44px; border-radius: 999px; color: var(--widget-secondary); }
+.notch-stack .notch-qs-power-back:hover { background: var(--widget-raised); color: var(--widget-text); }
+.notch-stack .notch-qs-power-view { gap: 8px; }
+.notch-stack .notch-qs-power-btn { min-width: 44px; height: 44px; background: transparent; color: #d4d4d8; border-radius: 999px; }
+.notch-stack .notch-qs-power-btn:hover { background: var(--widget-raised); color: var(--widget-text); }
+.notch-stack .notch-qs-power-btn.notch-qs-danger:hover { background: #8f2930; color: #fff; }
+
+/* A large countdown and one primary action keep focus on the remaining time. */
+.notch-stack .notch-pomodoro { display: flex; flex-direction: column; align-items: stretch; flex: 1; gap: 0; }
+.notch-stack .notch-pomodoro-head { height: 44px; flex: none; display: flex; justify-content: space-between; align-items: center; }
+.notch-stack .notch-pomodoro-mode { position: static; min-width: 60px; height: 44px; border-radius: 999px; font-size: 11px; font-weight: 500; color: var(--widget-secondary); padding: 0 6px; }
+.notch-stack .notch-pomodoro-mode:hover { background: var(--widget-raised); color: var(--widget-text); }
+.notch-stack .notch-pomodoro-mode-label { font-size: 12.5px; line-height: 17px; color: var(--widget-text); font-weight: 600; }
+.notch-stack .notch-pomodoro-side { display: grid; grid-template-columns: minmax(0,1fr) 92px; align-items: center; flex: 1; min-height: 64px; gap: 0; }
+.notch-stack .notch-pomodoro-time { font-size: 42px; line-height: 52px; letter-spacing: -.05em; font-weight: 350; color: var(--widget-text); }
+.notch-stack .notch-pomodoro-actions { display: flex; gap: 4px; }
+.notch-stack :is(.notch-pill-light,.notch-pill-ghost) { min-width: 44px; height: 44px; padding: 0 4px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+.notch-stack .notch-pill-light { background: transparent; color: var(--widget-text); }
+.notch-stack .notch-pill-light:hover { background: rgb(255 255 255 / .12); }
+.notch-stack .notch-pill-ghost { color: var(--widget-secondary); background: transparent; font-size: 20px; }
+.notch-stack .notch-pill-ghost:hover { color: var(--widget-text); background: var(--widget-raised); }
+.notch-stack .notch-pomodoro-track { flex: none; height: 4px; margin-top: 6px; overflow: hidden; border-radius: 999px; background: #73737a; }
+.notch-stack .notch-pomodoro-track>span { display: block; height: 100%; background: var(--widget-accent); }
+
+/* Aligned values and lanes show how much of each system resource is used. */
+.notch-stack .notch-sysmon-widget { flex: 1; min-height: 0; align-items: stretch; }
+.notch-stack .notch-system-readings { display: grid; gap: 10px; width: 100%; align-content: center; }
+.notch-stack .notch-metric-reading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 5px; color: var(--widget-text); font-size: 11px; line-height: 16px; }
+.notch-stack .notch-metric-reading>span:last-child { display: flex; align-items: baseline; gap: 10px; }
+.notch-stack .notch-metric-reading small { font-size: 9px; color: var(--widget-secondary); font-variant-numeric: tabular-nums; }
+.notch-stack .notch-metric-reading strong { font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.notch-stack .notch-metric-track { height: 4px; background: #73737a; border-radius: 999px; overflow: hidden; }
+.notch-stack .notch-metric-track>span { display: block; height: 100%; background: var(--widget-accent); transition: width .25s ease; }
+.notch-stack .notch-metric-track>span.high { background: #fecaca; }
+.notch-widget-notice { margin: 0; color: var(--widget-secondary); font-size: 11px; line-height: 17px; }
+
+.notch-stack .notch-lyrics { grid-template-rows: 16px 44px 16px; gap: 5px; }
+.notch-stack .notch-lyric-line { color: var(--widget-secondary); }
+.notch-stack .notch-lyric-line[data-current="true"] { font-size: 15px; line-height: 20px; max-height: 40px; letter-spacing: -.015em; color: var(--widget-text); font-weight: 550; }
+.notch-stack .notch-lyric-line[data-placeholder="true"] { font-size: 12px; line-height: 18px; letter-spacing: 0; font-weight: 400; color: var(--widget-secondary); }
+.notch-stack .notch-lyric-plain-text { color: var(--widget-text); }
+
+/* Selection uses Media's hover material; an outline identifies today. */
+.notch-stack .notch-calendar { --calendar-accent: #f5f5f5; }
+.notch-stack .calendar-month { flex-basis: 44px; min-height: 52px; color: var(--widget-text); }
+.notch-stack .calendar-month>span:first-child { font-size: 16px; letter-spacing: -.025em; }
+.notch-stack .calendar-month>span:last-child { font-size: 11px; color: var(--widget-secondary); }
+.notch-stack .calendar-date-button { flex-basis: 44px; gap: 5px; border-radius: 8px; color: var(--widget-secondary); }
+.notch-stack .calendar-wheel-spacer { flex-basis: calc(50% - 22px); }
+.notch-stack .calendar-date-button[aria-pressed="true"] { background: var(--widget-raised); color: var(--widget-text); }
+.notch-stack .calendar-date-number { width: 24px; height: 24px; font-size: 15px; line-height: 24px; }
+.notch-stack .calendar-date-button[data-today="true"] .calendar-date-number { background: transparent; border: 1px solid var(--widget-accent); color: var(--widget-accent); }
+.notch-stack .calendar-agenda-empty { gap: 2px; }
+.notch-stack .calendar-agenda-empty>svg { width: 18px; height: 18px; margin-bottom: 0; color: var(--widget-secondary); }
+.notch-stack .calendar-agenda-empty>span { color: var(--widget-text); }
+.notch-stack .calendar-agenda-empty>small { color: var(--widget-secondary); }
+
+.notch-stack .notch-weather { height: 122px; flex: none; gap: 3px; }
+.notch-stack .notch-weather-header { display: flex; align-items: center; justify-content: space-between; gap: 4px; height: 44px; flex: none; }
+.notch-stack .notch-weather-header .notch-widget-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notch-stack .notch-weather-source { flex: none; height: 44px; min-width: 74px; padding: 0 4px; border: 0; border-radius: 8px; background: transparent; color: var(--widget-secondary); font: inherit; font-size: 9px; cursor: pointer; }
+.notch-stack .notch-weather-source:hover { background: var(--widget-raised); color: var(--widget-text); }
+.notch-stack .notch-weather-now { height: 45px; flex: none; align-items: center; gap: 12px; }
+.notch-stack .notch-weather-temp { font-size: 40px; line-height: 45px; letter-spacing: -.045em; font-weight: 350; color: var(--widget-text); }
+.notch-stack .notch-weather-detail { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
+.notch-stack .notch-weather-detail small { color: var(--widget-secondary); font-size: 10px; line-height: 12px; }
+.notch-stack .notch-weather-condition { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 11px; line-height: 14px; color: var(--widget-secondary); }
+.notch-stack .notch-weather-hours { height: 27px; flex: none; }
+.notch-stack .notch-weather-hour { gap: 0; }
+.notch-stack .notch-weather-hour-label { font-size: 9px; line-height: 12px; color: var(--widget-secondary); }
+.notch-stack .notch-weather-hour-temp { font-size: 12px; line-height: 15px; font-weight: 500; color: var(--widget-text); }
+.notch-stack .notch-weather-empty { display: flex; flex: 1; min-height: 0; flex-direction: column; }
+.notch-stack .notch-weather-empty>.notch-widget-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 20px; }
+.notch-stack .notch-weather-notice { display: flex; flex: 1; min-height: 0; flex-direction: column; justify-content: center; gap: 4px; }
+.notch-stack .notch-weather-notice p { margin: 0; font-size: 11px; line-height: 16px; color: var(--widget-secondary); }
+.notch-stack .notch-weather-actions { display: flex; gap: 4px; }
+.notch-stack .notch-weather-actions button { min-width: 44px; height: 44px; border: 0; border-radius: 8px; padding: 0 9px; background: transparent; color: var(--widget-text); font: inherit; font-size: 11px; cursor: pointer; }
+.notch-stack .notch-weather-actions button:hover { background: var(--widget-raised); }
+.notch-nook .notch-pin-card { border-radius: 16px; background: var(--widget-surface); border-color: var(--widget-border); color: var(--widget-text); }
+.notch-nook :is(.notch-pin-label,.notch-pin-badge,.notch-pin-month,.notch-pin-weekday,.notch-pin-weather-condition) { color: var(--widget-secondary); }
+.notch-nook :is(.notch-pin-time,.notch-pin-big,.notch-pin-weather-temp) { color: var(--widget-text); letter-spacing: -.035em; font-weight: 400; }
+.notch-nook :is(.notch-pin-track,.notch-pin-progress) { border-radius: inherit; }
+.notch-nook .notch-pin-track { border-color: #73737a; }
+.notch-nook .notch-pin-progress { border-color: var(--widget-accent); }
+.notch-nook .notch-pin-weather-condition { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.notch-nook .notch-pin-card:focus-visible { outline: 2px solid var(--widget-accent); outline-offset: -3px; }
+@media (prefers-reduced-motion: reduce) {
+  .notch-nook .notch-stack button:active { transform: none; }
+  .notch-nook .notch-stack :is(button,input,.notch-metric-track>span) { transition: none; }
+}
+@media (prefers-contrast: more) {
+  .notch-nook { --widget-secondary: #d4d4d8; --widget-border: #73737a; }
+}

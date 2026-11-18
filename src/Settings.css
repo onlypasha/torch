@@ -1,0 +1,46 @@
+html:has(.config-app), body:has(.config-app), #root:has(.config-app) { width:100%;height:100%;margin:0;overflow:auto;background:#161719;color:#f1f2f4; }
+.config-app { min-height:100vh;display:grid;grid-template-columns:176px minmax(0,1fr);font-family:"Segoe UI Variable","Segoe UI",sans-serif;font-size:13px;line-height:1.45;color-scheme:dark; }
+.config-sidebar { padding:30px 16px;background:#202124;border-right:1px solid #313236; }
+.config-brand { display:flex;align-items:center;gap:10px;font-weight:600;font-size:17px;margin-bottom:36px; }
+.config-notch { display:block;width:28px;height:16px;border-radius:0 0 9px 9px;background:#080809;border:1px solid #45464a; }
+.config-nav { padding:10px 12px;background:#34363c;border-radius:7px;color:#f7f8fa;font-weight:600; }
+.config-sidebar p { color:#8e929c;font-size:12px;line-height:1.7;margin:24px 12px; }
+.config-main { padding:32px 30px 0;min-width:0; }
+.config-main h1 { font-size:27px;line-height:1.2;letter-spacing:-.7px;font-weight:600;margin:0 0 10px; }
+.config-main header p { color:#a9adb7;max-width:470px;margin:0 0 18px; }
+.config-app button { cursor:pointer;font:inherit; }
+.config-preset { background:#292c32;border:1px solid #454953;border-radius:6px;padding:7px 11px;color:#dee7fa; }
+.config-main fieldset { padding:0;border:0;margin:28px 0;min-width:0; }
+.config-main legend { font-size:14px;font-weight:600;margin-bottom:10px;padding:0; }
+.config-group { border:1px solid #34363b;border-radius:10px;overflow:hidden;background:#202124; }
+.config-row { display:flex;align-items:center;position:relative;gap:16px;padding:14px 16px;cursor:pointer; }
+.config-row + .config-row { border-top:1px solid #34363b; }
+.config-row > span:first-child { flex:1;min-width:0; }
+.config-row strong { display:block;font-size:13px;font-weight:600; }
+.config-row small { display:block;color:#9ba0ac;margin-top:3px;font-size:12px; }
+.config-row input { position:absolute;right:16px;width:34px;height:22px;opacity:0; }
+.config-switch { flex:none;width:34px;height:20px;border-radius:20px;background:#50535a;position:relative;pointer-events:none; }
+.config-switch:after { content:"";position:absolute;left:3px;top:3px;width:14px;height:14px;background:white;border-radius:50%;transition:transform .14s; }
+.config-row input:checked + .config-switch { background:#537ec7; }
+.config-row input:checked + .config-switch:after { transform:translateX(14px); }
+.config-row:has(input:disabled) { opacity:.45;cursor:default; }
+.config-row input:focus-visible + .config-switch { outline:2px solid #a5c7ff;outline-offset:4px; }
+.config-caption { color:#999eaa;font-size:12px;margin:-4px 0 12px; }
+.config-main footer { position:sticky;bottom:0;background:#161719;display:flex;gap:16px;align-items:center;justify-content:space-between;padding:18px 0;border-top:1px solid #34363b; }
+.config-main footer p { margin:0;font-size:12px;color:#c5c9d2; }.config-main footer small { display:block;color:#878d99;font-size:11px;margin-top:3px; }
+.config-save { flex:none;border:0;border-radius:7px;background:#537ec7;color:white;padding:10px 13px;font-weight:600!important; }
+.config-app button:disabled { opacity:.45;cursor:default; }.config-app button:focus-visible { outline:2px solid #a5c7ff;outline-offset:3px; }.config-main .config-error { color:#ff9d9d; }
+@media(max-width:650px) { .config-app { grid-template-columns:1fr; }.config-sidebar { display:none; }.config-main { padding:24px 22px 0; } }
+@media(prefers-reduced-motion:reduce) { .config-switch:after { transition:none; } }
+.config-weather { padding: 16px; border: 1px solid #34363b; border-radius: 10px; background: #202124; }
+.config-weather p { margin: 0 0 12px; }
+.config-weather .config-weather-detail { color: #a9adb7; font-size: 12px; margin: 10px 0 16px; }
+.config-weather label { display: block; margin: 12px 0 6px; }
+.config-weather-search { display: flex; gap: 8px; }
+.config-weather-search input { flex: 1; min-width: 0; height: 44px; padding: 0 10px; font: inherit; color: #f1f2f4; background: #161719; border: 1px solid #777b85; border-radius: 6px; }
+.config-weather-search input::placeholder { color: #a9adb7; }
+.config-weather-search input:focus-visible { outline: 2px solid #a5c7ff; outline-offset: 2px; }
+.config-weather button { min-width: 44px; min-height: 44px; border: 1px solid #777b85; border-radius: 6px; padding: 8px 12px; background: transparent; color: #f1f2f4; }
+.config-weather button:hover:not(:disabled), .config-weather button[aria-pressed="true"] { background: #34363c; }
+.config-weather-results { list-style: none; margin: 12px 0; padding: 0; }
+.config-weather-results button { width: 100%; text-align: left; margin-top: 4px; }

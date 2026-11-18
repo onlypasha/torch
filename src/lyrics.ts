@@ -36,11 +36,19 @@ const TIMEOUT_MS = 7000;
 const CACHE_LIMIT = 64;
 const cache = new Map<string, LyricsSheet | null>();
 
-/** Drop "(feat. ...)", "- Remastered" and similar before asking the service. */
+/** Match boring.notch's diacritic-insensitive queries without losing non-Latin scripts. */
+export function normalizeLyricsQuery(text: string): string {
+  return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\uFFFD/g, "").trim();
+}
+
+/** Remove credits/mastering noise, but keep performance labels in requests and cache keys. */
 export function cleanTrackTitle(title: string): string {
   return title
     .replace(/\s*[([/]\s*(feat|ft|featuring|with)\.?\s+.*?[)\]]/gi, "")
-    .replace(/\s+-\s+.*?(remaster|radio edit|single|version|acoustic|live).*$/i, "")
+    .replace(/\s+(?:-\s+)?(?:feat|ft|featuring)\.?\s+.*?(?=\s+-\s+|$)/gi, "")
+    .replace(/\s+-\s+.*?(remaster|radio edit|single|version).*$/i, (suffix) =>
+      versionMarkers(suffix).length > 0 ? suffix : "",
+    )
     .trim();
 }
 
@@ -80,12 +88,12 @@ export function parseLrc(text: string): LyricLine[] {
     }
     if (times.length === 0) continue;
     const words = trimmed.replace(stamp, "").trim();
-    if (!words) continue;
     for (const timeMs of times) {
-      // In standard LRC, positive offset means lyric plays later: effective time is stamp - offset
-      lines.push({ timeMs: Math.max(0, timeMs - globalOffsetMs), text: words });
+      lines.push({ timeMs, text: words });
     }
   }
+  // Preserve the existing stamp-minus-offset convention, applying metadata globally.
+  for (const line of lines) line.timeMs = Math.max(0, line.timeMs - globalOffsetMs);
   return lines.sort((a, b) => a.timeMs - b.timeMs);
 }
 
@@ -162,7 +170,7 @@ export const MAX_DURATION_DIFF_SEC = 2.0;
 /**
  * Words that mark a different performance. They are kept in the title when the
  * service is searched (a live recording needs the live words), and used here to
- * prefer a candidate that carries the same marker instead of silently swapping
+ * require a candidate that carries the same marker instead of silently swapping
  * in the studio version.
  */
 const VERSION_MARKERS = [
@@ -232,6 +240,45 @@ function lengthMatches(item: Candidate, durationMs: number): boolean {
   return !known || Math.abs((item.duration as number) - durationMs / 1000) <= MAX_DURATION_DIFF_SEC;
 }
 
+function normalizeForMatch(text: string): string {
+  return normalizeLyricsQuery(text)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Strip performance qualifiers only for comparing the song's base title. */
+function baseTrackTitle(title: string): string {
+  return normalizeForMatch(cleanTrackTitle(title)
+    .replace(/\s*[([]([^)[\]]*)[)\]]/g, (suffix, qualifier: string) =>
+      versionMarkers(qualifier).length > 0 ? "" : suffix,
+    )
+    .replace(/\s+-\s+(.+)$/, (suffix, qualifier: string) =>
+      versionMarkers(qualifier).length > 0 ? "" : suffix,
+    ));
+}
+
+/** Known request fields require metadata; compare the entire normalized base title. */
+function matchesTrack(candidate: Candidate, title: string, artist: string): boolean {
+  const cleanTitle = baseTrackTitle(title);
+  if (cleanTitle && cleanTitle !== baseTrackTitle(candidate.trackName ?? "")) return false;
+
+  const cleanArtist = normalizeForMatch(artist);
+  const candArtist = normalizeForMatch(candidate.artistName ?? "");
+  if (cleanArtist && !candArtist) return false;
+  if (cleanArtist && candArtist) {
+    const artistTokens = cleanArtist.split(" ").filter((t) => t.length > 1);
+    const candArtistTokens = candArtist.split(" ").filter((t) => t.length > 1);
+    const matchedArtist = artistTokens.filter((token) => candArtistTokens.includes(token));
+    if (artistTokens.length > 0 && matchedArtist.length === 0) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 /**
  * Choose the best answer, including a plain one when nothing timed fits.
  * Duration and version markers are applied to both kinds, so a mismatched
@@ -241,22 +288,34 @@ export function pickSheet(
   candidates: readonly Candidate[],
   durationMs: number,
   title = "",
+  artist = "",
 ): LyricsSheet | null {
   const markers = versionMarkers(title);
+  const filtered = candidates.filter((item) => {
+    if (!matchesTrack(item, title, artist)) return false;
+    const candidateTitle = item.trackName ?? "";
+    const album = item.albumName ?? "";
+    if (!markers.every((marker) => hasMarker(`${candidateTitle} ${album}`, marker))) return false;
+    // Album names alone are weak evidence of a demo/cover (e.g. "Album Demo").
+    // Explicit title markers and album performance labels must still agree.
+    return !title || VERSION_MARKERS.every((marker) => markers.includes(marker) ||
+      (!hasMarker(candidateTitle, marker) &&
+        (marker === "demo" || marker === "cover" || !hasMarker(album, marker))),
+    );
+  });
 
-  const synced = candidates.filter(
+  const synced = filtered.filter(
     (item): item is Candidate & { syncedLyrics: string } =>
       typeof item.syncedLyrics === "string" &&
       item.syncedLyrics.trim().length > 0 &&
       lengthMatches(item, durationMs),
   );
-  const bestSynced = rank(synced, durationMs, markers)[0];
-  if (bestSynced) {
-    const lines = parseLrc((bestSynced.item as Candidate & { syncedLyrics: string }).syncedLyrics);
-    if (lines.length > 0) return { lines, plain: "" };
+  for (const candidate of rank(synced, durationMs, markers)) {
+    const lines = parseLrc((candidate.item as Candidate & { syncedLyrics: string }).syncedLyrics);
+    if (lines.some((line) => line.text.length > 0)) return { lines, plain: "" };
   }
 
-  const plain = candidates.filter(
+  const plain = filtered.filter(
     (item): item is Candidate & { plainLyrics: string } =>
       plainText(item.plainLyrics).length > 0 && lengthMatches(item, durationMs),
   );
@@ -275,8 +334,9 @@ export function pickBest(
   candidates: readonly Candidate[],
   durationMs: number,
   title = "",
+  artist = "",
 ): LyricLine[] | null {
-  const sheet = pickSheet(candidates, durationMs, title);
+  const sheet = pickSheet(candidates, durationMs, title, artist);
   return sheet && sheet.lines.length > 0 ? sheet.lines : null;
 }
 
@@ -317,10 +377,11 @@ export async function fetchLyricsSheet({
   signal,
 }: LyricsRequest): Promise<LyricsSheet | null> {
   signal?.throwIfAborted();
-  const clean = cleanTrackTitle(title);
-  if (!clean || !artist.trim()) return null;
+  const clean = normalizeLyricsQuery(cleanTrackTitle(title));
+  const cleanArtist = normalizeLyricsQuery(artist);
+  if (!clean || !cleanArtist) return null;
   const albumPart = album?.trim().toLowerCase() ?? "";
-  const key = `${clean.toLowerCase()}|${artist.trim().toLowerCase()}|${albumPart}|${Math.round(durationMs / 1000)}`;
+  const key = `${clean.toLowerCase()}|${cleanArtist.toLowerCase()}|${albumPart}|${Math.round(durationMs / 1000)}`;
   if (cache.has(key)) return cache.get(key) ?? null;
 
   const timeout = new AbortController();
@@ -328,8 +389,9 @@ export async function fetchLyricsSheet({
   const abort = () => timeout.abort();
   signal?.addEventListener("abort", abort, { once: true });
 
+  let exactSheet: LyricsSheet | null = null;
   try {
-    let query = `?track_name=${encodeURIComponent(clean)}&artist_name=${encodeURIComponent(artist.trim())}`;
+    let query = `?track_name=${encodeURIComponent(clean)}&artist_name=${encodeURIComponent(cleanArtist)}`;
     if (album?.trim()) {
       query += `&album_name=${encodeURIComponent(album.trim())}`;
     }
@@ -339,27 +401,31 @@ export async function fetchLyricsSheet({
     // An exact answer with timestamps settles it. An exact answer with plain
     // words is kept as a fallback while the search looks for a timed version
     // of the same recording, rather than giving up on sync too early.
-    let exactSheet: LyricsSheet | null = null;
     const exact = await request(`/get${query}`, timeout.signal);
+    signal?.throwIfAborted();
     if (exact.ok) {
       const body = (await exact.json()) as Candidate;
-      exactSheet = pickSheet([body], durationMs, title);
+      signal?.throwIfAborted();
+      exactSheet = pickSheet([body], durationMs, title, artist);
       if (exactSheet && exactSheet.lines.length > 0) {
         remember(key, exactSheet);
         return exactSheet;
       }
     }
 
-    const searchQuery = album?.trim()
-      ? `${clean} ${artist.trim()} ${album.trim()}`
-      : `${clean} ${artist.trim()}`;
+    // Album metadata often names a compilation/reissue. Search the song and
+    // artist independently, then validate performance and duration locally.
+    // This follows boring.notch's structured LRCLIB search instead of requiring
+    // the album text to occur in the service's full-text index.
     const search = await request(
-      `/search?q=${encodeURIComponent(searchQuery)}`,
+      `/search?track_name=${encodeURIComponent(clean)}&artist_name=${encodeURIComponent(cleanArtist)}`,
       timeout.signal,
     );
+    signal?.throwIfAborted();
     if (search.ok) {
       const body = (await search.json()) as Candidate[];
-      const found = Array.isArray(body) ? pickSheet(body, durationMs, title) : null;
+      signal?.throwIfAborted();
+      const found = Array.isArray(body) ? pickSheet(body, durationMs, title, artist) : null;
       const sheet = found && (found.lines.length > 0 || !exactSheet) ? found : exactSheet;
       remember(key, sheet);
       return sheet;
@@ -372,6 +438,12 @@ export async function fetchLyricsSheet({
       return exactSheet;
     }
     return exactSheet;
+  } catch (error) {
+    // Changing tracks cancels the whole lookup; a service/search failure does not
+    // invalidate the already verified exact plain lyrics. Leave failures retryable.
+    signal?.throwIfAborted();
+    if (exactSheet) return exactSheet;
+    throw error;
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { StringCache } from "./stringCache";
 
 /**
  * The card's accent, taken from the cover the way the WPF original did: the
@@ -9,15 +10,9 @@ import { useEffect, useState } from "react";
  * cover only changes on a track change, so this runs a handful of times per
  * session rather than per frame.
  */
-const cache = new Map<string, string | null>();
-/** A data URL is large; keeping every cover of the session would leak memory. */
-const CACHE_LIMIT = 16;
+const cache = new StringCache(16, 2 * 1024 * 1024);
 
 function remember(key: string, value: string | null): void {
-  if (cache.size >= CACHE_LIMIT) {
-    const oldest = cache.keys().next().value;
-    if (oldest !== undefined) cache.delete(oldest);
-  }
   cache.set(key, value);
 }
 
@@ -125,6 +120,9 @@ export function useCoverAccent(url: string | undefined): string | null {
     image.src = url;
     return () => {
       disposed = true;
+      image.onload = null;
+      image.onerror = null;
+      image.removeAttribute("src");
     };
   }, [url]);
 

@@ -86,6 +86,55 @@ body,
   opacity: 1;
 }
 
+/* A clipped wave across the entire notch; it never intercepts a drop/click. */
+.notch-tray-ripple {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+.notch-tray-wave {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 160px;
+  height: 160px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgb(185 210 255 / 0.02) 38%, rgb(185 210 255 / 0.08) 53%, rgb(185 210 255 / 0.32) 63%, transparent 72%);
+  animation: notch-tray-ripple 700ms cubic-bezier(0.16, 0.7, 0.3, 1) both;
+  will-change: transform, opacity;
+}
+.notch-tray-wave[data-kind="hover"] {
+  animation: notch-tray-hover-ripple 1800ms ease-out infinite;
+}
+@keyframes notch-tray-ripple {
+  0% { transform: translate(-50%, -50%) scale(0.15); opacity: 0; }
+  12% { opacity: 0.9; }
+  100% { transform: translate(-50%, -50%) scale(7); opacity: 0; }
+}
+@keyframes notch-tray-hover-ripple {
+  0% { transform: translate(-50%, -50%) scale(0.4); opacity: 0; }
+  15% { opacity: 0.25; }
+  80%, 100% { transform: translate(-50%, -50%) scale(6); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .notch-tray-wave[data-kind="hover"] { display: none; }
+  .notch-tray-wave[data-kind="drop"] {
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    background: rgb(185 210 255 / 0.09);
+    animation: notch-tray-drop-feedback 180ms ease-out both;
+  }
+}
+@keyframes notch-tray-drop-feedback {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
 /* Same stack the WPF original asked for, falling back through the optical
    sizes that Windows 11 exposes to the browser, then plain Segoe UI. */
 .notch-clock {
@@ -197,6 +246,10 @@ body,
   min-height: 0;
 }
 
+.notch-panel--notification {
+  inset: 12px;
+}
+
 .notch-tabbar {
   display: flex;
   flex: none;
@@ -256,6 +309,7 @@ body,
 .notch-tab-icon {
   flex: none;
 }
+.notch-tab-badge { position: absolute !important; top: -4px; right: -5px; z-index: 3 !important; min-width: 12px; height: 12px; padding: 0 2px; border-radius: 7px; background: #c4d7f8; color: #151923; font-size: 8px; font-weight: 700; line-height: 12px; }
 
 .notch-tab-content {
   flex: none;
@@ -885,7 +939,10 @@ body,
   color: #818cf8;
 }
 
-.notch-bluetooth-glyph { width: 22px; height: 22px; }
+.notch-bluetooth-glyph {
+  width: 22px;
+  height: 22px;
+}
 .notch-bluetooth-radar,
 .notch-bluetooth-ripple {
   position: absolute;
@@ -920,7 +977,11 @@ body,
   color: #818cf8;
 }
 
-.notch-bluetooth-cell { position: relative; width: 20px; height: 10px; }
+.notch-bluetooth-cell {
+  position: relative;
+  width: 20px;
+  height: 10px;
+}
 .notch-bluetooth-cell-outline {
   position: absolute;
   inset: 0 2px 0 0;
@@ -946,7 +1007,11 @@ body,
   border-radius: 0 1px 1px 0;
   background: currentColor;
 }
-.notch-bluetooth-percent { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.notch-bluetooth-percent {
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 
 /* ---------------------------------------------------------------------------
    Nook: media on the left, the rotating widget stack in the middle, and the
@@ -955,6 +1020,13 @@ body,
    --------------------------------------------------------------------------- */
 
 .notch-nook {
+  --nook-card-material:
+    radial-gradient(
+      120% 150% at 0% 100%,
+      color-mix(in srgb, var(--cover-accent, #f5f5f5) 9%, transparent) 0%,
+      transparent 60%
+    ),
+    linear-gradient(160deg, rgb(255 255 255 / 0.035), rgb(255 255 255 / 0.01));
   display: flex;
   width: 100%;
   height: 100%;
@@ -962,6 +1034,7 @@ body,
   gap: 12px;
   min-width: 0;
 }
+.nook-disabled { color:#9b9da5; font-size:13px; padding:22px; margin:0; }
 
 /* Media ------------------------------------------------------------------ */
 
@@ -977,13 +1050,7 @@ body,
   overflow: hidden;
   border-radius: 20px;
   border: 1px solid rgb(255 255 255 / 0.055);
-  background:
-    radial-gradient(
-      120% 150% at 0% 100%,
-      color-mix(in srgb, var(--cover-accent, #f5f5f5) 9%, transparent) 0%,
-      transparent 60%
-    ),
-    linear-gradient(160deg, rgb(255 255 255 / 0.035), rgb(255 255 255 / 0.01));
+  background: var(--nook-card-material);
 }
 
 /* The sleeve itself, blurred and enlarged behind the card. This is the
@@ -1024,7 +1091,8 @@ body,
 }
 
 .notch-marquee-inner[data-scroll="true"] {
-  animation: notch-marquee var(--marquee-duration, 6s) ease-in-out infinite alternate;
+  animation: notch-marquee var(--marquee-duration, 6s) ease-in-out infinite
+    alternate;
 }
 
 @keyframes notch-marquee {
@@ -1123,8 +1191,7 @@ body,
   color: color-mix(in srgb, var(--cover-accent, #f5f5f5) 55%, #a1a1aa);
 }
 
-/* One karaoke line, exactly like the reference: never wraps, ellipsis at the
-   end, and sits between the artist and the timeline. */
+/* One scrolling lyric line between the artist and the timeline. */
 .notch-media-lyric {
   display: flex;
   align-items: center;
@@ -1146,6 +1213,8 @@ body,
 
 .notch-media-lyric-line {
   display: block;
+  width: 100%;
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -1175,7 +1244,9 @@ body,
   inset: 4px 0;
   border-radius: 999px;
   background: rgb(255 255 255 / 0.14);
-  transition: inset 120ms ease, background 120ms ease;
+  transition:
+    inset 120ms ease,
+    background 120ms ease;
 }
 
 .notch-media-track[data-interactive="true"] {
@@ -1205,7 +1276,9 @@ body,
   background: var(--cover-accent, #f5f5f5);
   /* No width transition: the fill is already painted from the shared playhead
      clock, and easing it would put it behind the lyrics by a frame or two. */
-  transition: top 120ms ease, height 120ms ease;
+  transition:
+    top 120ms ease,
+    height 120ms ease;
 }
 
 .notch-media-fill::after {
@@ -1290,7 +1363,9 @@ body,
   background: transparent;
   color: #d4d4d8;
   cursor: pointer;
-  transition: background 140ms ease, color 140ms ease;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
 }
 
 .notch-media-button:hover:not(:disabled) {
@@ -1349,15 +1424,12 @@ body,
 }
 
 .notch-stack:focus-visible {
-  outline: 1px solid rgb(255 255 255 / 0.35);
+  outline: 2px solid #c4d7f8;
   outline-offset: 2px;
-  border-radius: 20px;
+  border-radius: 14px;
 }
 
-/* Boring Notch lets widgets sit almost directly on the black slab. The card
-   keeps only a whisper of surface and the sleeve's hue, so the content - not
-   the chrome - carries the panel. The base is opaque: cards behind the active
-   one may peek at the bottom edge, and their text must not show through. */
+/* The opaque base hides the retained deck beneath the active widget. */
 .notch-stack-card {
   position: absolute;
   top: 0;
@@ -1367,16 +1439,9 @@ body,
   height: 148px;
   padding: 12px;
   overflow: hidden;
-  border-radius: 20px;
-  border: 1px solid rgb(255 255 255 / 0.055);
-  background:
-    radial-gradient(
-      130% 150% at 22% 118%,
-      color-mix(in srgb, var(--cover-accent, #000) 14%, transparent) 0%,
-      transparent 62%
-    ),
-    linear-gradient(160deg, #17171a, #101013);
-  transition: background 0.4s ease-out, border-color 0.4s ease-out;
+  border-radius: 14px;
+  border: 1px solid #303036;
+  background: #141416;
   cursor: grab;
 }
 
@@ -1401,97 +1466,10 @@ body,
 
 .notch-widget-label {
   flex: none;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: #71717a;
-}
-
-/* Calendar --------------------------------------------------------------- */
-
-.notch-calendar {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-}
-
-.notch-calendar-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: #f5f5f5;
-}
-
-.notch-calendar-week {
-  display: flex;
-  justify-content: space-between;
-}
-
-.notch-calendar-cell {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  width: 28px;
-  padding: 5px 0;
-  border-radius: 10px;
-  color: #9ca3af;
-}
-
-.notch-calendar-cell[data-today="true"] {
-  background: #f5f5f5;
-  color: #000;
-}
-
-.notch-calendar-day {
   font-size: 11px;
-}
-
-.notch-calendar-date {
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-}
-
-.notch-calendar-event {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.notch-calendar-dot {
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: #34d399;
-}
-
-.notch-calendar-event-text {
-  overflow: hidden;
-  font-size: 12px;
-  color: #9ca3af;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.notch-calendar-compact {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.notch-calendar-big {
-  font-size: 30px;
-  font-weight: 700;
-  line-height: 1;
-  color: #f5f5f5;
-}
-
-.notch-calendar-short,
-.notch-calendar-weekday {
-  font-size: 11px;
-  color: #9ca3af;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: #b0b3bd;
 }
 
 /* Pomodoro --------------------------------------------------------------- */
@@ -1766,16 +1744,9 @@ body,
   min-height: 0;
   padding: 7px 10px;
   overflow: hidden;
-  border-radius: 20px;
-  border: 1px solid rgb(255 255 255 / 0.055);
-  background:
-    radial-gradient(
-      130% 150% at 22% 118%,
-      color-mix(in srgb, var(--cover-accent, #000) 18%, transparent) 0%,
-      transparent 62%
-    ),
-    linear-gradient(160deg, rgb(255 255 255 / 0.045), rgb(255 255 255 / 0.012));
-  transition: background 0.4s ease-out, border-color 0.4s ease-out;
+  border-radius: 12px;
+  border: 1px solid #303036;
+  background: #141416;
   color: #f5f5f5;
   text-align: left;
   font: inherit;
@@ -1784,6 +1755,8 @@ body,
 }
 
 .notch-pin-pomodoro {
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
 }
 
@@ -1815,12 +1788,22 @@ body,
 
 .notch-pin-calendar {
   display: flex;
-  flex: none;
+  flex: 1;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 3px;
+  min-width: 0;
+}
+
+.notch-pin-calendar-meta {
+  display: flex;
   flex-direction: column;
+  min-width: 0;
   gap: 1px;
 }
 
 .notch-pin-big {
+  flex: none;
   font-size: 30px;
   font-weight: 700;
   line-height: 1.05;
@@ -1829,8 +1812,9 @@ body,
 
 .notch-pin-month,
 .notch-pin-weekday {
-  font-size: 10px;
+  font-size: 11px;
   color: #9ca3af;
+  white-space: nowrap;
 }
 
 .notch-pin-weather {
@@ -1860,15 +1844,6 @@ body,
   font-variant-numeric: tabular-nums;
 }
 
-.notch-pin-status {
-  max-width: 100%;
-  overflow: hidden;
-  font-size: 11px;
-  color: #9ca3af;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 /* The pinned Pomodoro's progress is the card's own border: a conic mask over a
    3px border, shrinking clockwise. @property is what lets the fill transition
    smoothly between the per-second values. */
@@ -1893,14 +1868,30 @@ body,
 
 .notch-pin-progress {
   border-color: #34d399;
-  transition: --fill 0.9s linear, opacity 0.3s linear;
-  -webkit-mask: conic-gradient(from 0turn, #000 calc(var(--fill) * 1turn), transparent 0);
-  mask: conic-gradient(from 0turn, #000 calc(var(--fill) * 1turn), transparent 0);
+  transition:
+    --fill 0.9s linear,
+    opacity 0.3s linear;
+  -webkit-mask: conic-gradient(
+    from 0turn,
+    #000 calc(var(--fill) * 1turn),
+    transparent 0
+  );
+  mask: conic-gradient(
+    from 0turn,
+    #000 calc(var(--fill) * 1turn),
+    transparent 0
+  );
 }
 
-.notch-pin-pomodoro[data-phase="running"] .notch-pin-progress { opacity: 1; }
-.notch-pin-pomodoro[data-phase="paused"] .notch-pin-progress { opacity: 0.55; }
-.notch-pin-pomodoro[data-phase="finished"] .notch-pin-progress { opacity: 0; }
+.notch-pin-pomodoro[data-phase="running"] .notch-pin-progress {
+  opacity: 1;
+}
+.notch-pin-pomodoro[data-phase="paused"] .notch-pin-progress {
+  opacity: 0.55;
+}
+.notch-pin-pomodoro[data-phase="finished"] .notch-pin-progress {
+  opacity: 0;
+}
 
 /* Context menu ----------------------------------------------------------- */
 
@@ -2047,7 +2038,9 @@ body,
   background: rgb(255 255 255 / 0.1);
   color: #f5f5f5;
   cursor: pointer;
-  transition: background 0.15s ease, transform 0.1s ease;
+  transition:
+    background 0.15s ease,
+    transform 0.1s ease;
 }
 
 .notch-qs-btn:hover {
@@ -2107,7 +2100,9 @@ body,
   background: rgb(255 255 255 / 0.08);
   color: #f5f5f5;
   cursor: pointer;
-  transition: background 0.15s ease, transform 0.1s ease;
+  transition:
+    background 0.15s ease,
+    transform 0.1s ease;
 }
 
 .notch-qs-power-btn:hover {

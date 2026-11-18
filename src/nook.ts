@@ -35,6 +35,12 @@ export const isPinnable = (widget: WidgetId): boolean =>
 /** Two pinned at most, and the stack always keeps at least one widget. */
 export const MAX_PINNED = 2;
 
+/** Match the visible Nook columns, retaining room for the tab bar when empty. */
+export function nookPanelWidth(media: boolean, widgets: number, pinned: number): number {
+  const columns = [media ? 352 : 0, widgets > 0 ? 252 : 0, pinned > 0 ? 100 : 0].filter(Boolean);
+  return Math.max(276, 24 + columns.reduce((sum, width) => sum + width, 0) + Math.max(0, columns.length - 1) * 12);
+}
+
 /** The stack, in its fixed order, without the widgets that live in the column. */
 export const stackWidgets = (pinned: readonly WidgetId[]): WidgetId[] =>
   WIDGETS.filter((widget) => !pinned.includes(widget));
@@ -232,17 +238,3 @@ export const pomodoroClock = (remainingSeconds: number): string => {
 export const pomodoroFraction = (remainingSeconds: number, durationSeconds = POMODORO_SECONDS): number =>
   durationSeconds > 0 ? Math.max(0, Math.min(1, remainingSeconds / durationSeconds)) : 0;
 
-// ---------------------------------------------------------------------------
-// Weather (sample data, as the spec's preview)
-// ---------------------------------------------------------------------------
-
-export const WEATHER = {
-  temperature: 27,
-  condition: "Cerah berawan",
-  hourly: [
-    { label: "Kini", temperature: 27 },
-    { label: "14.00", temperature: 28 },
-    { label: "16.00", temperature: 27 },
-    { label: "18.00", temperature: 25 },
-  ],
-} as const;

@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import type { Transition } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
+import { runtimeConfig } from "./config";
 import { listen } from "@tauri-apps/api/event";
 import {
   foldUsb,
@@ -16,7 +17,16 @@ import type { UsbPayload, UsbState, UsbPhase } from "./usb";
 import { UsbContent } from "./UsbContent";
 import { BluetoothContent } from "./BluetoothContent";
 import { Panel } from "./Panel";
+import { NotificationInterruption } from "./NotificationTab";
+import { CollapsedNotification } from "./CollapsedNotification";
 import { useNook } from "./useNook";
+import { nookPanelWidth } from "./nook";
+import { useTray } from "./useTray";
+import { useSharing } from "./useSharing";
+import { useNotifications } from "./useNotifications";
+import type { NotificationItem } from "./notifications";
+import { TrayDropRipple } from "./TrayDropRipple";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { CollapsedClock } from "./CollapsedClock";
 import type { TabId } from "./tabs";
 import { BT_CONNECTING_MS, BT_CONNECTED_MS, foldBluetooth, isBluetoothKind } from "./bluetooth";
@@ -29,9 +39,8 @@ import { HUD_HOLD_MS } from "./hud";
 /**
  * Foundation prototype: a notch that opens, closes and settles cleanly.
  *
- * Three sizes, all sharing one spring per direction. Every future tab will reuse
- * EXPANDED so the geometry never changes between tabs, and both the size and the
- * bottom corner radius run off the same animation.
+ * The open Nook fits its enabled columns; other tabs use EXPANDED. Size and
+ * bottom corner radius share the same retargetable shell animation.
  */
 const COLLAPSED = { width: 200, height: 34, radius: 14, ear: 6 };
 /**
@@ -52,58 +61,44 @@ const TALL = { width: 300, height: 52, radius: 24, ear: 14 };
  * media block keeps the reference's 352px so the artwork has room to breathe;
  * the widget stack keeps its fixed 252px.
  *
- * Pinning a widget widens the shell by the compact column (100) and its gap
- * (12), exactly as before, so the stack itself never resizes.
+ * Disabled columns are omitted from Nook's width. Pinning adds the compact
+ * column (100) and its gap (12), so the stack itself never resizes.
  */
 const EXPANDED = { width: 640, height: 200, radius: 24, ear: 14 };
-const EXPANDED_WIDE = { width: 752, height: 200, radius: 24, ear: 14 };
+const NOTIFICATION_EXPANDED = { ...EXPANDED, width: 544, height: 156 };
 
 /**
  * The three shapes the bar can be in. The destination is what picks the spring -
  * growing into the panel or into the tall bar springs open, shrinking back to
  * the clock's bar springs shut - so the shape is named separately from its size.
  */
-type Bar = "bar" | "tall" | "hud" | "panel";
+type Bar = "bar" | "tall" | "hud" | "notification" | "panel";
 const BAR_SIZES: Record<Bar, typeof COLLAPSED> = {
   bar: COLLAPSED,
   tall: TALL,
   hud: HUD,
+  notification: HUD,
   panel: EXPANDED,
 };
 
 /**
- * Boring Notch's springs, expressed for Motion. Opening is close to the
- * reference's interactive spring (response ~0.36s, damping fraction ~0.8):
- * quick enough to feel pressed, with a whisper of overshoot instead of a
- * bounce. Closing is the same shape, critically damped, so the slab settles
- * flat.
+ * A slower, visibly elastic shell: response ~0.44s and damping ratio ~0.74.
+ * Opening and closing share the same feel, with a slightly firmer return.
+ * Even the wide panel's overshoot fits inside the 800px native surface.
  *
  * The window keeps transparent margins because the spring overshoots by a few
  * percent of the distance travelled.
  */
 const SPRING_OPEN: Transition = {
   type: "spring",
-  stiffness: 300,
-  damping: 28,
-  mass: 1,
+  stiffness: 240,
+  damping: 25,
+  mass: 1.2,
 };
-const SPRING_CLOSE: Transition = { type: "spring", stiffness: 320, damping: 36 };
+const SPRING_CLOSE: Transition = { type: "spring", stiffness: 260, damping: 26, mass: 1.2 };
 /**
- * The HUD has its own, quicker pair: it should feel like a heads-up readout
- * rather than the panel's deliberate arrival. Reduced motion turns both into a
- * short, non-overshooting size change.
+ * Reduced motion uses a short, non-overshooting size change in every state.
  */
-const HUD_OPEN: Transition = {
-  type: "spring",
-  stiffness: 380,
-  damping: 26,
-  mass: 0.9,
-};
-const HUD_CLOSE: Transition = {
-  type: "spring",
-  stiffness: 500,
-  damping: 40,
-};
 const HUD_REDUCED: Transition = { duration: 0.16, ease: "easeOut" };
 
 /**
@@ -855,6 +850,63 @@ export default function App() {
   // Retain the model and last tab when the animated panel view unmounts.
   const [activeTab, setActiveTab] = useState<TabId>("nook");
   const nook = useNook(open);
+  const tray = useTray(open && activeTab === "tray");
+  const sharing = useSharing(open && activeTab === "sharing");
+  const notifications = useNotifications(open && activeTab === "notification");
+  const [notificationLive, setNotificationLive] = useState<{ active: NotificationItem | null; queue: NotificationItem[] }>({ active: null, queue: [] });
+  const recentNotification = notificationLive.active;
+  const notificationIds = useRef<Set<string> | null>(null);
+  const notificationHeld = useRef(false);
+  useEffect(() => {
+    if (notifications.access !== "allowed") {
+      notificationIds.current = null;
+      setNotificationLive((previous) => previous.active || previous.queue.length ? { active: null, queue: [] } : previous);
+      return;
+    }
+    const key = (item: NotificationItem) => `${item.id}:${item.createdAtMs}`;
+    const next = new Set(notifications.allItems.map(key));
+    const current = new Map(notifications.allItems.map((item) => [key(item), item]));
+    const fresh = notificationIds.current === null ? [] : notifications.items.filter((item) => !notificationIds.current!.has(key(item))).reverse();
+    notificationIds.current = next;
+    setNotificationLive((previous) => {
+      const sync = (old: NotificationItem) => {
+        const updated = current.get(key(old));
+        return updated && (updated.avatar !== old.avatar || updated.icon !== old.icon || updated.title !== old.title || updated.body !== old.body) ? updated : old;
+      };
+      let active = previous.active ? sync(previous.active) : null;
+      let queue = previous.queue.map(sync);
+      for (const item of fresh) {
+        if (active && open) queue = [...queue, item].slice(-5);
+        else { active = item; queue = []; }
+      }
+      if (!fresh.length && active === previous.active && queue.every((item, index) => item === previous.queue[index])) return previous;
+      return { active, queue };
+    });
+  }, [notifications.access, notifications.allItems, notifications.items, open]);
+  useEffect(() => {
+    if (!recentNotification) return;
+    if (open) { notificationHeld.current = true; return; }
+    const delay = notificationHeld.current ? 2000 : 8000;
+    notificationHeld.current = false;
+    const token = `${recentNotification.id}:${recentNotification.createdAtMs}`;
+    const timer = window.setTimeout(() => setNotificationLive((previous) => previous.active && `${previous.active.id}:${previous.active.createdAtMs}` === token ? { active: null, queue: [] } : previous), delay);
+    return () => window.clearTimeout(timer);
+  }, [recentNotification?.id, recentNotification?.createdAtMs, open]);
+  useEffect(() => { if (!recentNotification) notificationHeld.current = false; }, [recentNotification]);
+  const dismissLiveNotification = useCallback(() => setNotificationLive((previous) => {
+    if (!previous.active) return previous;
+    const [next, ...queue] = previous.queue;
+    return { active: next ?? null, queue };
+  }), []);
+  const showNextLiveNotification = useCallback(() => setNotificationLive((previous) => {
+    if (!previous.active || !previous.queue.length) return previous;
+    const [next, ...queue] = previous.queue;
+    return { active: next, queue: [...queue, previous.active!] };
+  }), []);
+  const openLiveNotification = useCallback(async () => {
+    const current = notificationLive.active;
+    if (current && await notifications.perform("notifications_open", { id: current.id })) dismissLiveNotification();
+  }, [notificationLive.active, notifications.perform, dismissLiveNotification]);
   const mediaPlaying = nook.media?.playing === true;
   const coverAccent = useCoverAccent(nook.media?.thumbnail);
   // True while a foreground window covers the collapsed notch (native monitors
@@ -873,9 +925,13 @@ export default function App() {
   const [hudLimit, setHudLimit] = useState(0);
   const hudTimer = useRef<number | null>(null);
   const hudOn = hud !== null;
-  // Derive width from retained state so reopening a pinned Nook grows directly
-  // to its wide silhouette, without an intermediate narrow frame/hit rectangle.
-  const wide = open && activeTab === "nook" && nook.pinned.length > 0;
+  // Visual and native geometry share the columns retained by the Nook model.
+  const nookWidth = nookPanelWidth(runtimeConfig.features.media, nook.stack.length, nook.pinned.length);
+  const panelSize = useMemo(() => recentNotification ? NOTIFICATION_EXPANDED : ({ ...EXPANDED,
+    width: activeTab === "nook" ? nookWidth : EXPANDED.width,
+  }), [activeTab, nookWidth, recentNotification]);
+  const panelSizeRef = useRef(panelSize);
+  panelSizeRef.current = panelSize;
   // `wanted` is the user's intent; `open` is the rendered state. They differ
   // only while a native call is in flight, which is what lets a fast reverse
   // cancel an open that has not started animating yet.
@@ -979,10 +1035,11 @@ export default function App() {
   // Reporting it as *visible* to native matters: the hook then treats it as a
   // notch again, so it can still be clicked open. A HUD reading does the same:
   // the user just pressed a key and expects to see the answer.
-  const hidden = autohide && !showingActivity && !hudOn;
+  const notificationOn = !!recentNotification && !open && !hudOn && !tall && !settling;
+  const hidden = autohide && !showingActivity && !hudOn && !recentNotification;
 
   // Which shape the bar is in.
-  const bar: Bar = open ? "panel" : hud ? "hud" : tall ? "tall" : "bar";
+  const bar: Bar = open ? "panel" : hud ? "hud" : tall ? "tall" : notificationOn ? "notification" : "bar";
 
   /**
    * The native window keeps one size for its whole life - a resize makes
@@ -998,35 +1055,29 @@ export default function App() {
    */
   const silhouette = bar === "bar" && hidden
     ? { ...COLLAPSED, height: 0 }
-    : bar === "panel" && wide
-      ? EXPANDED_WIDE
+    : bar === "panel"
+      ? panelSize
       : BAR_SIZES[bar];
 
   /**
    * The bar always springs between its shapes: growing into the panel or into the
    * charger's bar uses the expand spring, and every return - the charger's, the
-   * panel's, autohide sliding the bar away - uses the collapse one. The HUD is
-   * the one shape with its own quicker pair, and the one the reduced-motion
-   * preference is allowed to turn into a plain size change; the rest of the
-   * notch keeps its personality on every machine.
+   * panel's, autohide sliding the bar away - uses the collapse one.
+   * HUD and notifications share their compact shape and opening response.
+   * Reduced motion replaces shell physics with a short size transition.
    */
-  const previousBar = useRef<Bar>(bar);
-  useEffect(() => {
-    previousBar.current = bar;
-  }, [bar]);
   const reducedMotion = useReducedMotion() ?? false;
-  const hudTransition =
-    bar === "hud"
-      ? reducedMotion
-        ? HUD_REDUCED
-        : HUD_OPEN
-      : previousBar.current === "hud" && bar === "bar"
-        ? reducedMotion
-          ? HUD_REDUCED
-          : HUD_CLOSE
-        : undefined;
-  const sizeTransition: Transition =
-    hudTransition ?? (bar === "bar" ? SPRING_CLOSE : SPRING_OPEN);
+  const previousSize = useRef(silhouette);
+  // Keep one retargetable shell. Choose the closing spring by geometry, so
+  // panel -> notification/HUD closes just like panel -> idle. Memoization keeps
+  // that choice stable during unrelated clock and notification updates.
+  const sizeTransition: Transition = useMemo(() => {
+    if (reducedMotion) return HUD_REDUCED;
+    const shrinking = silhouette.width < previousSize.current.width || silhouette.height < previousSize.current.height;
+    if (shrinking) return SPRING_CLOSE;
+    return SPRING_OPEN;
+  }, [bar, silhouette.width, silhouette.height, reducedMotion]);
+  useEffect(() => { previousSize.current = silhouette; }, [silhouette]);
   // Content Blur Fade-In / Fade-Out for the tall indicators: 8px of blur and a
   // 0.95 scale behind a 250ms fade that starts 80ms after the bar begins to grow.
   // The same timings the panel's own content uses.
@@ -1038,7 +1089,7 @@ export default function App() {
   const arrivalExit: Transition = { duration: 0.12 };
 
   const setHitArea = useCallback(async (state: Bar) => {
-    const size = BAR_SIZES[state];
+    const size = state === "panel" ? panelSizeRef.current : BAR_SIZES[state];
     try {
       await invoke("set_notch_hit", {
         width: size.width,
@@ -1054,19 +1105,20 @@ export default function App() {
 
   useEffect(() => {
     if (!open) return;
-    const size = wide ? EXPANDED_WIDE : EXPANDED;
+    const size = panelSize;
     void invoke("set_notch_hit", {
       width: size.width,
       height: size.height,
       clickThrough: false,
     }).catch((err) => console.error("set_notch_hit failed:", err));
-  }, [open, wide]);
+  }, [open, panelSize]);
 
-  const openPanel = useCallback(async () => {
+  const openPanel = useCallback(async (tab: TabId = activeTab) => {
     wanted.current = true;
     // Stop passing clicks through before the notch starts growing, otherwise
     // the panel would be click-through while it animates in.
-    const size = activeTab === "nook" && nook.pinned.length > 0 ? EXPANDED_WIDE : EXPANDED;
+    const size = recentNotification ? NOTIFICATION_EXPANDED
+      : tab === "nook" ? { ...EXPANDED, width: nookWidth } : EXPANDED;
     try {
       await invoke("set_notch_hit", { width: size.width, height: size.height, clickThrough: false });
     } catch (err) {
@@ -1074,15 +1126,15 @@ export default function App() {
     }
     if (!wanted.current) return; // reversed while the call was in flight
     setOpen(true);
-  }, [activeTab, nook.pinned.length]);
+  }, [activeTab, nookWidth, recentNotification]);
 
   const closePanel = useCallback(() => {
     wanted.current = false;
     setOpen(false);
     // Immediately tell native that hit area is back to collapsed bar size
     // so autohide check doesn't use the large expanded rectangle during collapse animation.
-    void setHitArea(bar === "tall" ? "tall" : bar === "hud" ? "hud" : "bar");
-  }, [setHitArea, bar]);
+    void setHitArea(hudOn ? "hud" : recentNotification ? "notification" : "bar");
+  }, [setHitArea, hudOn, recentNotification]);
 
   /**
    * A press on the notch may only ever *open* it. Once the panel is open the
@@ -1094,6 +1146,60 @@ export default function App() {
     if (wanted.current) return;
     void openPanel();
   }, [openPanel]);
+
+  const openPanelRef = useRef(openPanel);
+  openPanelRef.current = openPanel;
+
+  // Listen for native file drops once at App level, so tab switches and the
+  // collapsed panel cannot discard the incoming files. Tauri reports physical
+  // coordinates; ignore transparent margins outside the notch silhouette.
+  useEffect(() => {
+    if (!runtimeConfig.features.tray) return;
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    void getCurrentWebview().onDragDropEvent(({ payload }) => {
+      if (tray.dragging.current) return;
+      if (payload.type === "leave") { tray.setTargeted(false); return; }
+      const rect = document.querySelector("[data-notch]")?.getBoundingClientRect();
+      const x = payload.position.x / window.devicePixelRatio;
+      const y = payload.position.y / window.devicePixelRatio;
+      const inside = rect && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+      tray.setTargeted(!!inside && payload.type !== "drop");
+      if (!inside) return;
+      setNotificationLive((previous) => previous.active || previous.queue.length ? { active: null, queue: [] } : previous);
+      setActiveTab("tray");
+      void openPanelRef.current("tray");
+      if (payload.type === "drop") void tray.addPaths(payload.paths);
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten; }).catch(() => {});
+    return () => { disposed = true; stop?.(); };
+  }, [tray.addPaths, tray.setTargeted, tray.dragging]);
+
+  // The small native OLE surface sees files even while the main window is
+  // click-through. Ordinary mouse drags do not emit these validated events.
+  useEffect(() => {
+    if (!runtimeConfig.features.tray) return;
+    let disposed = false;
+    const stops: (() => void)[] = [];
+    const keep = (stop: () => void) => { if (disposed) stop(); else stops.push(stop); };
+    const revealTray = () => {
+      setNotificationLive((previous) => previous.active || previous.queue.length ? { active: null, queue: [] } : previous);
+      setAutohide(false);
+      setActiveTab("tray");
+      void openPanelRef.current("tray");
+    };
+    void listen<boolean>("tray-drag-hover", ({ payload }) => {
+      if (tray.dragging.current) return;
+      tray.setTargeted(payload);
+      if (payload) revealTray();
+    }).then(keep).catch(() => {});
+    void listen<string[]>("tray-native-drop", ({ payload }) => {
+      if (tray.dragging.current) return;
+      tray.setTargeted(false);
+      revealTray();
+      void tray.addPaths(payload);
+    }).then(keep).catch(() => {});
+    return () => { disposed = true; stops.forEach((stop) => stop()); };
+  }, [tray.addPaths, tray.setTargeted, tray.dragging]);
 
   /**
    * The notch menu is native (Windows draws it and it can extend past the
@@ -1135,6 +1241,10 @@ export default function App() {
   useEffect(() => {
     if (hudOn) void setHitArea("hud");
   }, [hudOn, setHitArea]);
+
+  useEffect(() => {
+    if (notificationOn) void setHitArea("notification");
+  }, [notificationOn, setHitArea]);
 
   /**
    * Idle clock. Every tick re-reads the system time instead of counting up, so
@@ -1185,6 +1295,7 @@ export default function App() {
 
   // Charger, networks, Bluetooth and USB, detected natively.
   useEffect(() => {
+    if (!runtimeConfig.features.activity) return;
     let stop: (() => void) | undefined;
     let disposed = false;
     void listen<WireEvent>("notch-activity", (event) => {
@@ -1418,6 +1529,7 @@ export default function App() {
       />
       <motion.div
         data-notch="1"
+        data-shape={bar}
         data-activity={
           !settling && showingActivity && activity !== undefined
             ? activity.kind
@@ -1479,32 +1591,33 @@ export default function App() {
             data-active={open && !!coverAccent}
             aria-hidden="true"
           />
+          <TrayDropRipple targeted={tray.targeted} pulse={tray.dropPulse} visible={open} />
           {/* The clock and the content are separate layers: neither can push the
               other around while one fades in and the other out, and the clock
               is vertically centred in the 34px bar. It fades into the panel as
               it opens rather than overlapping it. */}
           <motion.div
-            aria-hidden={open || hudOn}
+            aria-hidden={open || hudOn || notificationOn}
             initial={false}
             animate={{
-              opacity: open || hudOn ? 0 : 1,
-              filter: open || hudOn ? "blur(6px)" : "blur(0px)",
-              scale: open || hudOn ? 0.95 : 1,
+              opacity: open || hudOn || notificationOn ? 0 : 1,
+              filter: open || hudOn || notificationOn ? "blur(6px)" : "blur(0px)",
+              scale: open || hudOn || notificationOn ? 0.95 : 1,
             }}
-            transition={open || hudOn ? PANEL_EXIT : CONTENT_ENTER}
+            transition={open || hudOn || notificationOn ? PANEL_EXIT : CONTENT_ENTER}
             className="notch-clock pointer-events-none absolute inset-x-0"
           >
             {/* One indicator at a time takes the clock's place; the WPF original
                 kept the clock and put the activity beside it, but the clock is
                 what this notch shows when it has nothing to say. */}
-            <AnimatePresence mode="wait" initial={false}>
-              {tall || settling || hudOn ? null : (
+            <AnimatePresence mode="popLayout" initial={false}>
+              {tall || settling || hudOn || notificationOn ? null : (
                 <motion.div
                   key="clock"
-                  initial={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
-                  animate={{ opacity: 1, filter: "blur(0px)", scale: 1 }}
-                  exit={{ opacity: 0, filter: "blur(6px)", scale: 0.95 }}
-                  transition={{ duration: 0.18, ease: "easeOut" }}
+                  initial={{ opacity: 0, y: reducedMotion ? 0 : -4, scale: reducedMotion ? 1 : .98 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: reducedMotion ? 0 : -4, scale: reducedMotion ? 1 : .98 }}
+                  transition={reducedMotion ? { duration: .12 } : { type: "spring", bounce: 0, duration: .32 }}
                 >
                   <CollapsedClock
                     time={time}
@@ -1517,6 +1630,17 @@ export default function App() {
               )}
             </AnimatePresence>
           </motion.div>
+          <AnimatePresence initial={false}>
+            {notificationOn && recentNotification && <motion.div
+              key={`notification-${recentNotification.id}:${recentNotification.createdAtMs}`}
+              className="notch-notification-layer"
+              initial={{ opacity: 0, y: reducedMotion ? 0 : -4, scale: reducedMotion ? 1 : .96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: reducedMotion ? 0 : -4, scale: reducedMotion ? 1 : .96 }}
+              transition={reducedMotion ? { duration: .12 } : { type: "spring", bounce: 0, duration: .32, opacity: { duration: .12 } }}>
+              <CollapsedNotification item={recentNotification} />
+            </motion.div>}
+          </AnimatePresence>
           {/* Plugging in takes the whole bar rather than the clock's 20px row, so
               it is a layer of its own - and keyed per activity, so a second plug
               replays the arrival from the start. */}
@@ -1619,7 +1743,7 @@ export default function App() {
               </motion.div>
             )}
           </AnimatePresence>
-          {/* The open panel: nav bar plus the active tab's (still empty)
+          {/* The open panel: nav bar plus the active tab's
               content. Enters late and small-blurred, exits quickly, exactly
               like the clock row above it did when it was a placeholder. */}
           <AnimatePresence>
@@ -1629,9 +1753,10 @@ export default function App() {
                 animate={{ opacity: 1, filter: "blur(0px)", scale: 1, y: 0 }}
                 exit={{ opacity: 0, filter: "blur(6px)", transition: PANEL_EXIT }}
                 transition={PANEL_ENTER}
-                className="notch-panel"
+                className={`notch-panel${recentNotification ? " notch-panel--notification" : ""}`}
               >
-                <Panel active={activeTab} onTab={setActiveTab} nook={nook} />
+                {recentNotification ? <NotificationInterruption item={recentNotification} queued={notificationLive.queue.length} onNext={showNextLiveNotification} onDismiss={dismissLiveNotification} onOpen={() => void openLiveNotification()} />
+                  : <Panel active={activeTab} onTab={setActiveTab} nook={nook} tray={tray} sharing={sharing} notifications={notifications} />}
               </motion.div>
             )}
           </AnimatePresence>

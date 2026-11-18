@@ -134,6 +134,8 @@ const seconds = (clock) => {
 };
 
 const openPanel = async () => {
+  for (let attempt = 0; attempt < 50 && !notch(); attempt++) await wait(20);
+  await wait(40);
   await emit("notch-press", null);
   await wait(900);
 };
@@ -238,6 +240,124 @@ export async function runNookScenario(scenario = "media") {
   const samples = [];
   const check = (ok, reason) => { if (!ok) errors.push(reason); };
   const sample = () => { const value = state(); samples.push(value); return value; };
+
+  if (scenario === "widget-redesign") {
+    await openPanel();
+    for (const widget of ["quicksettings", "sysmon", "calendar", "pomodoro", "lyric", "weather"]) {
+      await selectWidget(widget);
+      const card = activeCard(); const bounds = card.getBoundingClientRect();
+      check(bounds.width === 252 && bounds.height === 148, `${widget} retains its 252x148 slot`);
+      check([...card.querySelectorAll("button,input,.notch-widget-label,.notch-lyric-slot,.notch-weather-hours,.notch-system-readings,.calendar-wheel-frame")].filter(node => !node.closest(".notch-calendar-dates")).every(node => {
+        const rect = node.getBoundingClientRect();
+        return rect.left >= bounds.left && rect.right <= bounds.right && rect.bottom <= bounds.bottom;
+      }), `${widget} content fits the fixed slot`);
+      check([...card.querySelectorAll("button,input")].every(node => {
+        const rect = node.getBoundingClientRect(); return rect.width >= 43.5 && rect.height >= 43.5;
+      }), `${widget} controls have 44px targets`);
+    }
+    await selectWidget("sysmon");
+    window.__notchStatsFail = true; await wait(1200);
+    check(activeCard().textContent.includes("Data sistem belum tersedia"), "system monitor displays a read failure");
+    window.__notchStatsFail = false; await wait(1200);
+    check(!!activeCard().querySelector(".notch-system-readings"), "system monitor recovers on the next poll");
+    await selectWidget("quicksettings");
+    const dndButton = () => activeCard().querySelector('[aria-label$="DND"]');
+    dndButton().click(); await wait(100);
+    check(dndButton().getAttribute("aria-pressed") === "true", "DND reflects its enabled state");
+    dndButton().click(); await wait(100);
+    check(dndButton().getAttribute("aria-pressed") === "false", "DND reflects its disabled state");
+    activeCard().querySelector('[aria-label="Kunci Layar"]').click(); await wait(50);
+    check(window.__notchCommands.some(entry => entry.command === "system_lock"), "lock retains its native action");
+    activeCard().querySelector('[aria-label="Buka menu daya"]').click(); await wait(400);
+    check(!!activeCard().querySelector(".notch-qs-power-view"), "power menu opens in place");
+    for (const [label, command] of [["Sleep", "system_sleep"], ["Hibernasi", "system_hibernate"], ["Matikan komputer", "system_shutdown"]]) {
+      activeCard().querySelector(`[aria-label="${label}"]`).click(); await wait(50);
+      check(window.__notchCommands.some(entry => entry.command === command), `${label} retains its mocked native action`);
+    }
+    activeCard().querySelector('[aria-label="Kembali"]').click(); await wait(400);
+    check(!!activeCard().querySelector(".notch-qs-main-view"), "back returns to the controls");
+    activeCard().querySelector('[aria-label="Buka menu daya"]').click(); await wait(400);
+    press(window, "Escape"); await wait(400);
+    check(!!activeCard().querySelector(".notch-qs-main-view"), "Escape closes the power menu");
+  }
+
+  if (scenario === "media-lyrics-independent" || scenario === "media-disabled-no-lyrics") {
+    const original = window.fetch;
+    let calls = 0;
+    let plain = false;
+    window.fetch = async (input) => {
+      calls++;
+      const body = { trackName: plain ? "Lagu tanpa sinkronisasi" : TRACK.title,
+        artistName: TRACK.artist, duration: 180,
+        syncedLyrics: plain ? null : "[00:00.00]Awal lagu\n[00:30.00]Tengah lagu\n[01:00.00]Akhir lagu",
+        plainLyrics: plain ? "Baris satu\nBaris dua" : null };
+      return new Response(JSON.stringify(String(input).includes("/api/get") ? body : []), { status: 200 });
+    };
+    try {
+      await openPanel();
+      await emit("media-state", { ...TRACK, playing: false }); await wait(500);
+      check(!notch().querySelector('.notch-stack-card[data-widget="lyric"]'), "disabled lyric widget is absent");
+      if (scenario === "media-disabled-no-lyrics") {
+        check(!notch().querySelector(".notch-media"), "disabled Media is absent");
+        check(calls === 0, "disabled Media makes no lyrics request");
+      } else {
+        check(calls > 0, "Media fetches lyrics while the lyric widget is disabled");
+        check(sample().lyric === "Akhir lagu", `Media still displays synced lyrics, got ${sample().lyric}`);
+        await emit("media-state", { ...TRACK, playing: false, positionMs: 5_000 }); await wait(350);
+        check(sample().lyric === "Awal lagu", "Media lyric line follows playback position without its widget");
+        plain = true;
+        await emit("media-state", { ...TRACK, title: "Lagu tanpa sinkronisasi", playing: false }); await wait(500);
+        check(sample().lyric === "Baris satu Baris dua", `Media keeps plain lyrics without the widget, got ${sample().lyric}`);
+      }
+    } finally { window.fetch = original; }
+  }
+
+  if (scenario === "no-media") {
+    await openPanel();
+    await wait(700);
+    const now = sample();
+    check(!notch().querySelector(".notch-media"), "Media is disabled in this fixture");
+    check(Math.abs(now.width - 276) < 1, `widget-only Nook fits 252px content plus padding, got ${now.width}`);
+    check(now.nativeHit?.width === 276, `widget-only hit rectangle is 276px, got ${now.nativeHit?.width}`);
+    await selectWidget("calendar");
+    await pinActive();
+    check(Math.abs(sample().width - 388) < 1 && sample().nativeHit?.width === 388, "pinning adds only the 100px column and 12px gap without Media");
+    clickTab("tray"); await wait(800);
+    check(Math.abs(sample().width - 640) < 1 && sample().nativeHit?.width === 640, "Tray keeps its full width");
+    clickTab("nook"); await wait(900);
+    check(Math.abs(sample().width - 388) < 1 && sample().nativeHit?.width === 388, "returning to Nook restores its compact pinned size");
+    await emit("notch-click-outside", null); await wait(700);
+    check(!sample().open && sample().nativeHit?.width === 200, "closing keeps the collapsed geometry");
+    await openPanel();
+    check(Math.abs(sample().width - 388) < 1 && sample().nativeHit?.width === 388, "reopening uses the retained compact pinned size");
+    contextMenu(pinnedCards()[0]); await wait(160); clickMenu(); await wait(950);
+    check(Math.abs(sample().width - 276) < 1 && sample().nativeHit?.width === 276, "unpinning returns to the widget-only size");
+    await selectWidget("quicksettings");
+  }
+
+  if (scenario === "calendar") {
+    await openPanel();
+    await selectWidget("calendar");
+    await wait(400);
+    const widget = notch().querySelector('.notch-stack-card[data-widget="calendar"]');
+    widget.querySelector(".calendar-month").click(); await wait(600);
+    const dates = [...widget.querySelectorAll(".calendar-date-button")];
+    check(dates.length === 22, "date wheel covers seven previous and fourteen future days");
+    check(dates[7].getAttribute("aria-pressed") === "true", "today is initially selected");
+    dates[21].click(); await wait(600);
+    check(dates[21].getAttribute("aria-pressed") === "true", "future date can be selected and centered");
+    widget.querySelector(".calendar-month").click(); await wait(600);
+    check(dates[7].getAttribute("aria-pressed") === "true", "month returns to today");
+    const initialDateOffset = widget.querySelector(".notch-calendar-dates").scrollLeft;
+    widget.querySelector(".notch-calendar-dates").dispatchEvent(new WheelEvent("wheel", { deltaY: 44, bubbles: true, cancelable: true }));
+    await wait(350);
+    check(sample().active === "calendar", "scrolling dates does not rotate the widget stack");
+    check(widget.querySelector(".notch-calendar-dates").scrollLeft > initialDateOffset, "date wheel advances with vertical wheel input");
+    const bounds = widget.getBoundingClientRect();
+    const agenda = widget.querySelector(".calendar-agenda-empty").getBoundingClientRect();
+    check(agenda.bottom <= bounds.bottom - 10, "calendar agenda fits inside widget padding");
+    check(widget.textContent.includes("Agenda belum terhubung"), "agenda availability is explicit");
+  }
 
   if (scenario === "compact") {
     await openPanel();
@@ -351,7 +471,7 @@ export async function runNookScenario(scenario = "media") {
     check(now.notice === "", "no warning while the seek is in flight");
 
     await emit("media-state", { ...TRACK, positionMs: 135_000 });
-    await emit("media-seek", { applied: true, positionMs: 135_000 });
+    await emit("media-seek", { applied: true, positionMs: 135_000, token: seeks().at(-1)?.args?.token });
     await wait(150);
     now = sample();
     check(now.current === "2:15" && now.notice === "", `a confirmed seek settles quietly, got "${now.current}"`);
@@ -359,7 +479,7 @@ export async function runNookScenario(scenario = "media") {
     pointer(bar, "pointerdown", rect.left + rect.width * 0.05);
     pointer(bar, "pointerup", rect.left + rect.width * 0.05);
     await wait(150);
-    await emit("media-seek", { applied: false, positionMs: 135_000 });
+    await emit("media-seek", { applied: false, positionMs: 135_000, token: seeks().at(-1)?.args?.token });
     await wait(150);
     now = sample();
     check(now.notice === "true", "a rejected seek is reported on the bar");
@@ -459,6 +579,7 @@ export async function runNookScenario(scenario = "media") {
         "the line being sung is the current one",
       );
       check(rows.includes("Tengah lagu"), "the line just sung stays as context");
+      check(now.lyric === "Akhir lagu", "Media and the lyric widget share the current line");
 
       await emit("media-state", { ...TRACK, positionMs: 5_000 });
       await wait(200);
@@ -467,6 +588,7 @@ export async function runNookScenario(scenario = "media") {
         now.lyrics.some((row) => row.current && row.text === "Awal lagu"),
         `a new position moves the current line, got ${JSON.stringify(now.lyrics)}`,
       );
+      check(now.lyric === "Awal lagu", "Media and the lyric widget update from the same position");
 
       // No artist means no service call, and the widget says so plainly.
       await emit("media-state", { ...TRACK, title: "", artist: "", album: "" });
@@ -486,7 +608,11 @@ export async function runNookScenario(scenario = "media") {
       window.fetch = async (input) => {
         const old = String(input).includes("Lagu%20Lama");
         await wait(old ? 800 : 100);
-        return new Response(JSON.stringify({ ...body, syncedLyrics: `[00:00.00]${old ? "Lirik lama" : "Lirik baru"}` }), { status: 200 });
+        return new Response(JSON.stringify({
+          ...body,
+          trackName: old ? "Lagu Lama" : "Lagu Baru",
+          syncedLyrics: `[00:00.00]${old ? "Lirik lama" : "Lirik baru"}`,
+        }), { status: 200 });
       };
       await emit("media-state", { ...TRACK, title: "Lagu Lama" });
       await wait(100);
@@ -508,6 +634,8 @@ export async function runNookScenario(scenario = "media") {
     window.fetch = async () => new Response(JSON.stringify({
       syncedLyrics: `[00:00.00]${lines[0]}\n[00:30.00]${lines[1]}\n[01:00.00]${lines[2]}`,
       duration: 180,
+      trackName: "Layout lirik panjang",
+      artistName: TRACK.artist,
     }), { status: 200 });
     const contains = (outer, inner) => inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1
       && inner.left >= outer.left - 1 && inner.right <= outer.right + 1;
@@ -526,8 +654,8 @@ export async function runNookScenario(scenario = "media") {
       check(slots.every((slot) => contains(bounds, slot.getBoundingClientRect())), "all lyric slots fit inside the card");
       const current = lyric.querySelector('[data-current="true"]');
       check(current.textContent === lines[1], "the full active lyric text is retained");
-      check(getComputedStyle(current).fontSize === "13px", "the active lyric uses the compact 13px type scale");
-      check(current.clientHeight > 18 && current.clientHeight <= 36, `the long active lyric wraps to two lines, height=${current.clientHeight}`);
+      check(getComputedStyle(current).fontSize === "15px", "the active lyric uses the readable 15px type scale");
+      check(current.clientHeight > 20 && current.clientHeight <= 40, `the long active lyric wraps to two lines, height=${current.clientHeight}`);
       check(current.scrollHeight <= current.clientHeight + 1, "the two-line lyric is not clipped");
       const slotHeights = slots.map((slot) => slot.getBoundingClientRect().height);
       for (const positionMs of [65_000, 1_000, 35_000]) {
@@ -829,13 +957,13 @@ export async function runNookScenario(scenario = "media") {
       Number(now.pinFill) > 0.9 && Number(now.pinFill) <= 1,
       `border fill follows the remaining time, got "${now.pinFill}"`,
     );
-    check(now.pinnedStatus === "Fokus", `status Fokus, got "${now.pinnedStatus}"`);
+    check(now.pinnedStatus === "", "the pinned countdown has no visible status label");
 
     pinnedCards()[0].click();
     await wait(500);
     now = sample();
     check(now.pinnedPressed === "false" && now.pinnedPhase === "paused", `click pauses, got ${now.pinnedPhase}/${now.pinnedPressed}`);
-    check(now.pinnedStatus === "Jeda", `status Jeda, got "${now.pinnedStatus}"`);
+    check(now.pinnedStatus === "", "the paused pinned countdown has no visible status label");
     const pausedClock = now.pinnedTime;
     await wait(1300);
     now = sample();

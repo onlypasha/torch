@@ -5,9 +5,19 @@
     <div id="root"></div>
     <script type="module">
       import "./mock-native.js";
+      const params = new URLSearchParams(location.search);
+      if (params.has("no-media") || params.has("no-lyric-widget") || params.has("no-widgets")) {
+        const { runtimeConfig } = await import("../src/config.ts");
+        window.__configMock = { ...runtimeConfig,
+          features: { ...runtimeConfig.features, media: !params.has("no-media") },
+          widgets: params.has("no-widgets") ? [] : runtimeConfig.widgets.filter(id => id !== "lyric" || !params.has("no-lyric-widget")),
+        };
+      }
       await import("../src/main.tsx");
       const { runNookScenario } = await import("./nook-ui-probe.js");
       window.runNookScenario = runNookScenario;
+      const { runMediaRegression } = await import("./media-ui-regressions.js");
+      window.runMediaRegression = runMediaRegression;
     </script>
   </body>
 </html>

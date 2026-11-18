@@ -6,12 +6,16 @@ import { TAB_PILL_SPRING, TAB_SLIDE_PX, TAB_SWITCH_MS, TABS, tabDirection } from
 import type { TabId } from "./tabs";
 import { Nook } from "./NookTab";
 import type { NookModel } from "./useNook";
+import { TrayTab } from "./TrayTab";
+import type { TrayModel } from "./useTray";
+import { SharingTab } from "./SharingTab";
+import type { SharingModel } from "./useSharing";
+import { NotificationTab } from "./NotificationTab";
+import { runtimeConfig } from "./config";
+import type { NotificationModel } from "./useNotifications";
 
 /**
- * The open panel's body: a nav bar of four tabs on top and one empty tab panel
- * beneath it. The widget widgets (media, tray, sharing, notifications) are
- * delivered separately; every tab keeps its id so filling one in is a matter of
- * replacing its placeholder, not renaming anything.
+ * The open panel's body: four tabs with retained models.
  *
  * The notch never steals focus from other applications (WS_EX_NOACTIVATE), so
  * the bar only reads a keyboard when the panel itself is focused; Arrow keys
@@ -75,11 +79,15 @@ const TAB_SWITCH: Variants = {
   }),
 };
 
-export function Panel({ active, onTab, nook }: {
+export function Panel({ active, onTab, nook, tray, sharing, notifications }: {
   active: TabId;
   onTab: (tab: TabId) => void;
   nook: NookModel;
+  tray: TrayModel;
+  sharing: SharingModel;
+  notifications: NotificationModel;
 }) {
+  const tabs = TABS.filter(({id}) => id === "nook" || (id === "notification" ? runtimeConfig.features.notifications : runtimeConfig.features[id]));
   const [direction, setDirection] = useState(0);
 
   // Roving focus: arrows move selection, and the newly active tab receives the
@@ -97,22 +105,22 @@ export function Panel({ active, onTab, nook }: {
   };
 
   const onTablistKeyDown = (event: React.KeyboardEvent) => {
-    const at = TABS.findIndex((tab) => tab.id === active);
-    if (event.key === "ArrowRight" && at < TABS.length - 1) {
+    const at = tabs.findIndex((tab) => tab.id === active);
+    if (event.key === "ArrowRight" && at < tabs.length - 1) {
       event.preventDefault();
-      switchTab(TABS[at + 1].id);
+      switchTab(tabs[at + 1].id);
     } else if (event.key === "ArrowLeft" && at > 0) {
       event.preventDefault();
-      switchTab(TABS[at - 1].id);
+      switchTab(tabs[at - 1].id);
     }
   };
 
-  const tab = TABS.find(({ id }) => id === active) ?? TABS[0];
+  const tab = tabs.find(({ id }) => id === active) ?? tabs[0];
 
   return (
     <>
       <div role="tablist" aria-label="Panel notch" className="notch-tabbar" onKeyDown={onTablistKeyDown}>
-        {TABS.map(({ id, label }) => (
+        {tabs.map(({ id, label }) => (
           <motion.button
             key={id}
             ref={(node) => { buttons.current[id] = node; }}
@@ -127,7 +135,7 @@ export function Panel({ active, onTab, nook }: {
             tabIndex={active === id ? 0 : -1}
             data-tab-id={id}
             className="notch-tab"
-            aria-label={label}
+            aria-label={id === "notification" && notifications.items.length ? `${label}, ${notifications.items.length} notifikasi` : label}
             title={label}
           >
             {/* One shared pill slides under the icon of whichever tab is on
@@ -141,6 +149,7 @@ export function Panel({ active, onTab, nook }: {
               />
             )}
             <TabIcon tab={id} size={15} />
+            {id === "notification" && notifications.items.length > 0 && <span className="notch-tab-badge" aria-label={`${notifications.items.length} notifikasi`}>{notifications.items.length > 9 ? "9+" : notifications.items.length}</span>}
           </motion.button>
         ))}
       </div>
@@ -163,9 +172,13 @@ export function Panel({ active, onTab, nook }: {
           >
             {tab.id === "nook" ? (
               <Nook nook={nook} />
-            ) : (
-              <span className="notch-tab-empty">{`Tab ${tab.label} kosong`}</span>
-            )}
+            ) : tab.id === "tray" ? (
+              <TrayTab tray={tray} onShare={runtimeConfig.features.sharing ? (ids) => { sharing.selectTrayFiles(ids); switchTab("sharing"); } : undefined} sharingBusy={sharing.busy} />
+            ) : tab.id === "sharing" ? (
+              <SharingTab sharing={sharing} tray={tray} onOpenTray={() => switchTab("tray")} />
+            ) : tab.id === "notification" ? (
+              <NotificationTab notifications={notifications} />
+            ) : null}
           </motion.div>
         </AnimatePresence>
       </div>

@@ -1,4 +1,4 @@
-//! Global volume keys for the notch HUD.
+//! Global volume keys for the HUD and scoped Ctrl+V for the open Tray.
 //!
 //! Windows would normally turn `VK_VOLUME_UP`/`DOWN`/`MUTE` into its own
 //! flyout and a 2% step. The notch wants sixteen 6.25% steps, so a low-level
@@ -26,12 +26,15 @@ use tauri::{AppHandle, Emitter};
 
 use crate::volume;
 
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SHIFT};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
-    WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 
 /// Emitted after every volume step and every mute toggle.
@@ -57,6 +60,7 @@ pub struct VolumeEvent {
 }
 
 enum Message {
+    TrayPaste,
     Step { direction: i32, shift: bool },
     Mute,
     Release { direction: i32 },
@@ -67,8 +71,17 @@ static HOOK_KEYS: AtomicBool = AtomicBool::new(false);
 static UP_DOWN: AtomicBool = AtomicBool::new(false);
 static DOWN_DOWN: AtomicBool = AtomicBool::new(false);
 static MUTE_DOWN: AtomicBool = AtomicBool::new(false);
+static TRAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PASTE_DOWN: AtomicBool = AtomicBool::new(false);
 
-fn volume_event(step: Result<volume::Step, String>, last: &mut Option<volume::Volume>) -> VolumeEvent {
+pub fn set_tray_active(active: bool) {
+    TRAY_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+fn volume_event(
+    step: Result<volume::Step, String>,
+    last: &mut Option<volume::Volume>,
+) -> VolumeEvent {
     match step {
         Ok(step) => {
             *last = Some(step.volume);
@@ -117,11 +130,7 @@ fn worker(app: AppHandle, messages: std::sync::mpsc::Receiver<Message>) {
                         let (direction, shift, _) = held.expect("held");
                         let event = volume_event(volume::step(direction, shift), &mut last);
                         let _ = app.emit(VOLUME_EVENT, event);
-                        held = Some((
-                            direction,
-                            shift,
-                            Instant::now() + Duration::from_millis(90),
-                        ));
+                        held = Some((direction, shift, Instant::now() + Duration::from_millis(90)));
                         continue;
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -134,6 +143,9 @@ fn worker(app: AppHandle, messages: std::sync::mpsc::Receiver<Message>) {
         };
 
         match message {
+            Message::TrayPaste => {
+                let _ = app.emit("tray-paste-request", ());
+            }
             Message::Step { direction, shift } => {
                 // A different key pressed while one is held starts its own
                 // hold; the hook has already filtered that key's auto-repeat.
@@ -169,6 +181,37 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
         let up = matches!(message, WM_KEYUP | WM_SYSKEYUP);
 
+        // The overlay deliberately never takes foreground keyboard focus.
+        // Route only Ctrl+V while its Tray is open, and consume the matching
+        // repeat/release so the underlying application cannot paste as well.
+        if down || up {
+            if let Some(info) = unsafe { (lparam.0 as *const KBDLLHOOKSTRUCT).as_ref() } {
+                if info.flags.0 & INJECTED == 0 && info.vkCode == u32::from(b'V') {
+                    if up && PASTE_DOWN.swap(false, Ordering::Relaxed) {
+                        return LRESULT(1);
+                    }
+                    if down && PASTE_DOWN.load(Ordering::Relaxed) {
+                        return LRESULT(1);
+                    }
+                    let held = |key: i32| unsafe { GetAsyncKeyState(key) } < 0;
+                    if down
+                        && TRAY_ACTIVE.load(Ordering::Relaxed)
+                        && crate::mouse_hook::is_open()
+                        && held(VK_CONTROL.0 as i32)
+                        && !held(VK_MENU.0 as i32)
+                        && !held(VK_LWIN.0 as i32)
+                        && !held(VK_RWIN.0 as i32)
+                    {
+                        PASTE_DOWN.store(true, Ordering::Relaxed);
+                        if let Some(tx) = NOTIFY.get() {
+                            let _ = tx.send(Message::TrayPaste);
+                        }
+                        return LRESULT(1);
+                    }
+                }
+            }
+        }
+
         if (down || up) && HOOK_KEYS.load(Ordering::Relaxed) {
             if let Some(info) = unsafe { (lparam.0 as *const KBDLLHOOKSTRUCT).as_ref() } {
                 if info.flags.0 & INJECTED == 0 {
@@ -177,7 +220,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         VK_VOLUME_DOWN => (&DOWN_DOWN, -1),
                         VK_VOLUME_MUTE => (&MUTE_DOWN, 0),
                         _ => {
-                            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+                            return unsafe {
+                                CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+                            };
                         }
                     };
 
@@ -215,9 +260,9 @@ pub fn install(app: &AppHandle) {
     // would make the volume keys do nothing at all.
     if volume::get().is_err() {
         eprintln!("keyboard HUD disabled: no default audio endpoint");
-        return;
+    } else {
+        HOOK_KEYS.store(true, Ordering::Relaxed);
     }
-    HOOK_KEYS.store(true, Ordering::Relaxed);
 
     let (tx, rx) = channel::<Message>();
     let _ = NOTIFY.set(tx);
@@ -230,14 +275,14 @@ pub fn install(app: &AppHandle) {
             Ok(module) => module,
             Err(_) => return,
         };
-        let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), HINSTANCE(module.0), 0)
-        {
-            Ok(hook) => hook,
-            Err(error) => {
-                eprintln!("keyboard hook failed: {error}");
-                return;
-            }
-        };
+        let hook =
+            match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), HINSTANCE(module.0), 0) {
+                Ok(hook) => hook,
+                Err(error) => {
+                    eprintln!("keyboard hook failed: {error}");
+                    return;
+                }
+            };
 
         let mut message = MSG::default();
         while GetMessageW(&mut message, HWND::default(), 0, 0).0 > 0 {

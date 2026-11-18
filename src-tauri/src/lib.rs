@@ -32,6 +32,7 @@
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::{Manager, WebviewWindow};
+mod config;
 
 /// The window is deliberately larger than the widest panel: the opening
 /// spring overshoots by a few percent of its travel - the compact tab panel is
@@ -48,6 +49,41 @@ const INITIAL_HEIGHT: f64 = 320.0;
 /// does not swallow clicks in the first few frames after launch.
 const INITIAL_NOTCH: (f64, f64) = (200.0, 34.0);
 
+#[cfg(all(test, target_os = "windows"))]
+mod window_z_order_tests {
+    use windows::{core::w, Win32::{Foundation::HWND, UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+        GWL_EXSTYLE, HWND_NOTOPMOST, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    }}};
+    #[test]
+    fn raising_overlay_restores_topmost_without_changing_geometry_or_focus() {
+        // An invisible test window: no real application is moved or activated.
+        let window = unsafe { CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            w!("STATIC"), w!("Notch z-order regression"), WS_POPUP,
+            -2000, -2000, 800, 320, None, None, None, None) };
+        assert_ne!(window, HWND::default());
+        struct Cleanup(HWND);
+        impl Drop for Cleanup { fn drop(&mut self) { unsafe { let _ = DestroyWindow(self.0); } } }
+        let _cleanup = Cleanup(window);
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut before = Default::default();
+        unsafe { GetWindowRect(window, &mut before).unwrap(); }
+        for _ in 0..2 {
+            unsafe { SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE).unwrap(); }
+            super::win::raise(window).unwrap();
+            let style = unsafe { GetWindowLongW(window, GWL_EXSTYLE) };
+            assert_ne!(style & WS_EX_TOPMOST.0 as i32, 0);
+            assert_ne!(style & WS_EX_NOACTIVATE.0 as i32, 0);
+            let mut after = Default::default();
+            unsafe { GetWindowRect(window, &mut after).unwrap(); }
+            assert_eq!(before, after);
+            assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+        }
+    }
+}
+
 /// Activity indicators - charger, network, Bluetooth, USB - and the events they
 /// raise for the webview to display in place of the clock.
 #[cfg(target_os = "windows")]
@@ -55,6 +91,27 @@ mod activity;
 
 #[cfg(target_os = "windows")]
 mod media;
+
+#[cfg(target_os = "windows")]
+mod tray;
+
+#[cfg(target_os = "windows")]
+mod tray_drop;
+
+#[cfg(target_os = "windows")]
+mod tray_preview;
+
+#[cfg(target_os = "windows")]
+mod sharing;
+
+#[cfg(target_os = "windows")]
+mod sharing_clipboard;
+
+#[cfg(target_os = "windows")]
+mod notifications;
+
+#[cfg(target_os = "windows")]
+mod weather;
 
 mod sysinfo;
 
@@ -77,7 +134,7 @@ mod win {
 
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            GWL_EXSTYLE, GetWindowLongW, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongW,
+            GWL_EXSTYLE, GetWindowLongW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowLongW,
             SetWindowPos, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
         };
 
@@ -96,10 +153,18 @@ mod win {
             }
         }
 
-        /// Move/resize without activating and without touching z-order.
+        /// Keep the overlay in the topmost band without taking keyboard focus.
+        pub fn raise(hwnd: HWND) -> windows::core::Result<()> {
+            unsafe {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)
+            }
+        }
+
+        /// Initial placement also establishes the actual native z-order.
         pub fn place(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> windows::core::Result<()> {
             unsafe {
-                SetWindowPos(hwnd, HWND::default(), x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER)
+                SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)
             }
         }
 
@@ -216,6 +281,13 @@ fn set_notch_hit(
             (height * scale).round() as i32,
         );
         win::set_click_through(&window, click_through);
+        // Reassert after changing extended styles, before the expansion starts.
+        // Preserving the old z-order can leave the panel behind the source app.
+        if !click_through {
+            if let Some(hwnd) = win::raw(&window) {
+                win::raise(hwnd).map_err(|error| error.to_string())?;
+            }
+        }
         return Ok(());
     }
 
@@ -546,6 +618,14 @@ fn set_panel_open(open: bool) {
     let _ = open;
 }
 
+#[tauri::command]
+fn tray_set_active(active: bool) {
+    #[cfg(target_os = "windows")]
+    keyboard::set_tray_active(active);
+    #[cfg(not(target_os = "windows"))]
+    let _ = active;
+}
+
 /// The webview reporting that it has applied the autohide state. Only needed so
 /// the mouse hook knows whether there is a notch to click.
 #[tauri::command]
@@ -561,15 +641,16 @@ const EXIT_MENU_ID: &str = "exit";
 
 /// Show the notch context menu at the cursor. Deliberately synchronous so it
 /// runs on the main thread - `TrackPopupMenu` needs the thread that owns the
-/// window - and deliberately only one entry wide for now.
+/// window. Configuration opens in its own focusable window.
 #[tauri::command]
 fn show_notch_menu(window: WebviewWindow) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     mouse_hook::set_menu_open(true);
 
     let shown = (|| -> tauri::Result<()> {
-        let exit = MenuItem::with_id(window.app_handle(), EXIT_MENU_ID, "Exit", true, None::<&str>)?;
-        let menu = Menu::with_items(window.app_handle(), &[&exit])?;
+        let exit = MenuItem::with_id(window.app_handle(), EXIT_MENU_ID, "Keluar", true, None::<&str>)?;
+        let settings = MenuItem::with_id(window.app_handle(), "settings", "Konfigurasi NotchApp…", true, None::<&str>)?;
+        let menu = Menu::with_items(window.app_handle(), &[&settings, &exit])?;
         window.popup_menu(&menu)
     })();
 
@@ -734,11 +815,13 @@ fn volume_set(level: f32, muted: bool) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .on_menu_event(|app, event| {
+            if event.id().as_ref() == "settings" { config::open(app); }
             if event.id().as_ref() == EXIT_MENU_ID {
                 app.exit(0);
             }
         })
         .setup(|app| {
+            let config = config::load(app.handle());
             let window = app
                 .get_webview_window("main")
                 .ok_or("main window missing")?;
@@ -748,10 +831,14 @@ pub fn run() {
                 win::apply_styles(&window);
                 mouse_hook::install(app.handle());
                 autohide::install(app.handle());
-                activity::install(app.handle());
+                if config.features.activity { activity::install(app.handle()); }
                 keyboard::install(app.handle());
                 hud::install(app.handle());
-                app.manage(media::install(app.handle().clone()));
+                if config.features.media { app.manage(media::install(app.handle().clone())); }
+                if config.features.tray { app.manage(tray::Store::load(app.handle()).map_err(std::io::Error::other)?); }
+                if config.features.sharing { app.manage(sharing::Store::new(app.handle().clone()).map_err(std::io::Error::other)?); }
+                if config.features.notifications { app.manage(notifications::install(app.handle().clone())); }
+                if config.features.tray { tray_drop::install(app.handle()); }
             }
 
             // Place it top-centre immediately so the first frames are already
@@ -770,6 +857,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            config::config_get,
+            config::config_save,
+            config::config_open,
+            weather::weather_search,
+            weather::weather_get,
+            weather::weather_windows_location,
+            weather::weather_open_source,
             set_notch_size,
             set_notch_hit,
             set_panel_open,
@@ -780,6 +874,33 @@ pub fn run() {
             media_repeat,
             media_snapshot,
             media_polling,
+            tray::tray_snapshot,
+            tray_preview::tray_preview,
+            tray_set_active,
+            sharing::sharing_snapshot,
+            sharing_clipboard::sharing_add_peer_clipboard,
+            sharing::sharing_active,
+            sharing::sharing_refresh,
+            sharing::sharing_add_peer,
+            sharing::sharing_send,
+            sharing::sharing_cancel,
+            notifications::notifications_snapshot,
+            notifications::notifications_refresh,
+            notifications::notifications_request_access,
+            notifications::notifications_dismiss,
+            notifications::notifications_clear,
+            notifications::notifications_open,
+            notifications::notifications_settings,
+            tray::tray_add_paths,
+            tray::tray_add_text,
+            tray::tray_remove,
+            tray::tray_clear,
+            tray::tray_open,
+            tray::tray_reveal,
+            tray::tray_copy,
+            tray::tray_paste,
+            tray::tray_pick_files,
+            tray::tray_start_drag,
             volume_get,
             volume_set,
             sysinfo_stats,

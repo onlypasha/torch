@@ -20,7 +20,7 @@
 //! * the position comes from Windows' own `LastUpdatedTime`, so a paused track
 //!   stops and a resumed one continues from the right place even when the
 //!   player publishes its timeline only once;
-//! * artwork is read once per track, retried while it is still missing, and
+//! * artwork is read per track or metadata change, retried while missing, and
 //!   sent only on request or on change - never on every poll;
 //! * a seek is verified against the session it was sent to, with the same
 //!   pause/seek/resume fallback the WPF original needed for players that
@@ -96,10 +96,6 @@ pub struct MediaPayload {
     pub sampled_at_ms: u64,
 }
 
-/// Maximum time to latch missing timeline properties for the same song before
-/// accepting that the track truly has no timeline (e.g. infinite live streams).
-const TIMELINE_LATCH_TTL: Duration = Duration::from_secs(5);
-
 #[derive(Clone, Debug, Default, PartialEq)]
 struct LatchedTimeline {
     key: (String, String, String, String),
@@ -108,6 +104,48 @@ struct LatchedTimeline {
     can_seek: bool,
     has_timeline: bool,
     updated_at: Option<Instant>,
+    projected_at: Option<Instant>,
+    playing: bool,
+    playback_rate: f64,
+}
+
+impl LatchedTimeline {
+    /// Project using the previous playback state, then adopt the new state.
+    /// Firefox can clear its timeline indefinitely after publishing a valid
+    /// duration once. The caller scopes retention to an active, identical track;
+    /// elapsed wall time alone is not evidence that the song became a stream.
+    fn retained_position(
+        &mut self,
+        now: Instant,
+        playing: bool,
+        playback_rate: f64,
+    ) -> Option<u64> {
+        if self.updated_at.is_none() || self.duration_ms == 0 {
+            return None;
+        }
+        let elapsed = self
+            .projected_at
+            .map(|at| now.saturating_duration_since(at).as_secs_f64())
+            .unwrap_or(0.0);
+        let rate = if self.playback_rate > 0.0 && self.playback_rate <= 16.0 {
+            self.playback_rate
+        } else {
+            1.0
+        };
+        let advance = if self.playing {
+            (elapsed * rate * 1000.0).round() as u64
+        } else {
+            0
+        };
+        self.last_position_ms = clamp_position(
+            self.last_position_ms.saturating_add(advance),
+            self.duration_ms,
+        );
+        self.projected_at = Some(now);
+        self.playing = playing;
+        self.playback_rate = playback_rate;
+        Some(self.last_position_ms)
+    }
 }
 
 /// The track a seek was meant for. The webview sends the identity it computed
@@ -154,7 +192,9 @@ pub enum Action {
     /// Position polling is only useful while the bar is on screen.
     SetPolling(bool),
     /// A WinRT session/manager event says something changed right now.
-    Refresh,
+    Refresh {
+        artwork: bool,
+    },
 }
 
 pub struct Control(Sender<Action>);
@@ -191,7 +231,13 @@ fn now_filetime_ticks() -> i64 {
 /// displayed position is that value plus real elapsed time. A stale or absurd
 /// timestamp (sleep, clock change) contributes nothing rather than jumping the
 /// bar to the end of the track.
-fn advance_position(position_ms: u64, updated: DateTime, playing: bool, rate: f64, now_ticks: i64) -> u64 {
+fn advance_position(
+    position_ms: u64,
+    updated: DateTime,
+    playing: bool,
+    rate: f64,
+    now_ticks: i64,
+) -> u64 {
     if !playing {
         return position_ms;
     }
@@ -209,7 +255,11 @@ fn advance_position(position_ms: u64, updated: DateTime, playing: bool, rate: f6
     if elapsed_ms >= 86_400_000 {
         return position_ms;
     }
-    let effective_rate = if rate > 0.0 && rate <= 16.0 { rate } else { 1.0 };
+    let effective_rate = if rate > 0.0 && rate <= 16.0 {
+        rate
+    } else {
+        1.0
+    };
     let scaled_elapsed = ((elapsed_ms as f64) * effective_rate).round() as u64;
     position_ms.saturating_add(scaled_elapsed)
 }
@@ -425,59 +475,48 @@ fn read_session(
                     timeline_updated_ms = Some(updated_ms - EPOCH_DIFF_MS);
                 }
             }
-            position_ms = advance_position(
-                base,
-                updated,
-                playing,
-                playback_rate,
-                now,
-            );
+            position_ms = advance_position(base, updated, playing, playback_rate, now);
             position_ms = clamp_position(position_ms, duration_ms);
             has_timeline = true;
         }
     }
 
+    let native_timeline = has_timeline;
+    let active_session = playing_res.map_or(last_playing.is_some(), |status| {
+        status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
+            || status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused
+    });
     if has_timeline && duration_ms > 0 {
         latched.key = key;
         latched.duration_ms = duration_ms;
         latched.last_position_ms = position_ms;
         latched.can_seek = can_position;
         latched.has_timeline = true;
-        latched.updated_at = Some(Instant::now());
-    } else if latched.key == key && latched.duration_ms > 0 {
-        let within_ttl = latched
-            .updated_at
-            .is_some_and(|t| t.elapsed() < TIMELINE_LATCH_TTL);
-        if within_ttl {
-            let elapsed_since_latch = latched
-                .updated_at
-                .map(|t| t.elapsed().as_millis() as u64)
-                .unwrap_or(0);
+        let measured_at = Instant::now();
+        latched.updated_at = Some(measured_at);
+        latched.projected_at = Some(measured_at);
+        latched.playing = playing;
+        latched.playback_rate = playback_rate;
+    } else if latched.key == key && latched.duration_ms > 0 && active_session {
+        if let Some(retained) = latched.retained_position(Instant::now(), playing, playback_rate) {
             duration_ms = latched.duration_ms;
             has_timeline = latched.has_timeline;
-            position_ms = if playing {
-                clamp_position(
-                    latched.last_position_ms.saturating_add(elapsed_since_latch),
-                    duration_ms,
-                )
-            } else {
-                latched.last_position_ms
-            };
+            position_ms = retained;
         } else {
-            // TTL expired: accept true zero duration / stream without timeline
+            // No valid finite timeline has been observed for this track.
             *latched = LatchedTimeline {
                 key,
                 ..Default::default()
             };
         }
-    } else if latched.key != key {
+    } else if latched.key != key || !active_session {
         *latched = LatchedTimeline {
             key,
             ..Default::default()
         };
     }
 
-    let final_can_seek = if has_timeline {
+    let final_can_seek = if native_timeline {
         can_position || (latched.duration_ms > 0 && latched.can_seek)
     } else {
         false
@@ -676,6 +715,10 @@ struct Emitted {
     position_sec: u64,
     duration_ms: u64,
     capabilities: (bool, bool, bool, bool, bool, bool, String),
+    has_timeline: bool,
+    timeline_updated_ms: Option<u64>,
+    playback_rate: f64,
+    shuffle_supported: bool,
     art_generation: u64,
 }
 
@@ -689,6 +732,10 @@ impl Emitted {
         }) && self.playing == payload.playing
             && self.position_sec == payload.position_ms / 1000
             && self.duration_ms == payload.duration_ms
+            && self.has_timeline == payload.has_timeline
+            && self.timeline_updated_ms == payload.timeline_updated_ms
+            && self.playback_rate == payload.playback_rate
+            && self.shuffle_supported == payload.shuffle_supported
             && self.capabilities
                 == (
                     payload.can_previous,
@@ -712,6 +759,10 @@ impl Emitted {
         self.playing = payload.playing;
         self.position_sec = payload.position_ms / 1000;
         self.duration_ms = payload.duration_ms;
+        self.has_timeline = payload.has_timeline;
+        self.timeline_updated_ms = payload.timeline_updated_ms;
+        self.playback_rate = payload.playback_rate;
+        self.shuffle_supported = payload.shuffle_supported;
         self.capabilities = (
             payload.can_previous,
             payload.can_next,
@@ -738,6 +789,14 @@ struct Artwork {
 }
 
 impl Artwork {
+    /// Identical metadata events must not resend a large unchanged data URL.
+    fn adopt(&mut self, art: String) {
+        if self.data.as_ref() != Some(&art) {
+            self.data = Some(art);
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
     /// Returns whether the cached cover belongs to this track, reading it if
     /// this is a new track or the previous read came back empty too early.
     fn resolve(
@@ -759,8 +818,7 @@ impl Artwork {
         if retry || force {
             self.attempts = self.attempts.saturating_add(1);
             if let Some(art) = reference.and_then(album_art) {
-                self.data = Some(art);
-                self.generation = self.generation.wrapping_add(1);
+                self.adopt(art);
                 return true;
             }
         }
@@ -808,12 +866,13 @@ impl SessionHook {
 
         let handler = |wake: &Sender<Action>| {
             let wake = wake.clone();
-            TypedEventHandler::<GlobalSystemMediaTransportControlsSession, MediaPropertiesChangedEventArgs>::new(
-                move |_, _| {
-                    let _ = wake.send(Action::Refresh);
-                    Ok(())
-                },
-            )
+            TypedEventHandler::<
+                GlobalSystemMediaTransportControlsSession,
+                MediaPropertiesChangedEventArgs,
+            >::new(move |_, _| {
+                let _ = wake.send(Action::Refresh { artwork: true });
+                Ok(())
+            })
         };
         if let Ok(token) = session.MediaPropertiesChanged(&handler(wake)) {
             self.properties = Some(token);
@@ -821,12 +880,13 @@ impl SessionHook {
 
         let handler = |wake: &Sender<Action>| {
             let wake = wake.clone();
-            TypedEventHandler::<GlobalSystemMediaTransportControlsSession, PlaybackInfoChangedEventArgs>::new(
-                move |_, _| {
-                    let _ = wake.send(Action::Refresh);
-                    Ok(())
-                },
-            )
+            TypedEventHandler::<
+                GlobalSystemMediaTransportControlsSession,
+                PlaybackInfoChangedEventArgs,
+            >::new(move |_, _| {
+                let _ = wake.send(Action::Refresh { artwork: false });
+                Ok(())
+            })
         };
         if let Ok(token) = session.PlaybackInfoChanged(&handler(wake)) {
             self.playback = Some(token);
@@ -834,12 +894,13 @@ impl SessionHook {
 
         let handler = |wake: &Sender<Action>| {
             let wake = wake.clone();
-            TypedEventHandler::<GlobalSystemMediaTransportControlsSession, TimelinePropertiesChangedEventArgs>::new(
-                move |_, _| {
-                    let _ = wake.send(Action::Refresh);
-                    Ok(())
-                },
-            )
+            TypedEventHandler::<
+                GlobalSystemMediaTransportControlsSession,
+                TimelinePropertiesChangedEventArgs,
+            >::new(move |_, _| {
+                let _ = wake.send(Action::Refresh { artwork: false });
+                Ok(())
+            })
         };
         if let Ok(token) = session.TimelinePropertiesChanged(&handler(wake)) {
             self.timeline = Some(token);
@@ -884,7 +945,7 @@ fn watch(app: AppHandle, commands: Receiver<Action>, wake: Sender<Action>) {
         GlobalSystemMediaTransportControlsSessionManager,
         CurrentSessionChangedEventArgs,
     >::new(move |_, _| {
-        let _ = manager_wake.send(Action::Refresh);
+        let _ = manager_wake.send(Action::Refresh { artwork: false });
         Ok(())
     }));
 
@@ -899,6 +960,7 @@ fn watch(app: AppHandle, commands: Receiver<Action>, wake: Sender<Action>) {
     // Set after a command so the next read reflects the press immediately.
     let mut force_poll = true;
     let mut force_art = false;
+    let mut refresh_art = false;
 
     loop {
         // Wait up to the next poll, but wake for a command straight away.
@@ -1002,7 +1064,8 @@ fn watch(app: AppHandle, commands: Receiver<Action>, wake: Sender<Action>) {
                 polling = active;
                 force_poll = true;
             }
-            Ok(Action::Refresh) => {
+            Ok(Action::Refresh { artwork }) => {
+                refresh_art |= artwork;
                 // Collapse bursts of WinRT events: refresh now when the last read
                 // is old enough, otherwise as soon as the gap allows.
                 if last_poll.elapsed() >= MIN_REFRESH_GAP {
@@ -1049,7 +1112,12 @@ fn watch(app: AppHandle, commands: Receiver<Action>, wake: Sender<Action>) {
                     reading.payload.album.clone(),
                     reading.payload.source.clone(),
                 );
-                let has_art = art.resolve(key, reading.art_reference.as_ref(), force_art);
+                let has_art = art.resolve(
+                    key,
+                    reading.art_reference.as_ref(),
+                    force_art || refresh_art,
+                );
+                refresh_art = false;
                 // A track with art but not yet delivered must not let the panel
                 // forget the previous cover and then never update it.
                 if has_art || art.data.is_some() {
@@ -1069,6 +1137,7 @@ fn watch(app: AppHandle, commands: Receiver<Action>, wake: Sender<Action>) {
             }
             // No session at all: that is a fact worth reporting once.
             (None, _) => {
+                refresh_art = false;
                 art.forget();
                 latched = LatchedTimeline::default();
                 last_playing = None;
@@ -1161,6 +1230,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_timeline_preserves_rate_pause_and_resume() {
+        let at = Instant::now();
+        let mut latch = LatchedTimeline {
+            duration_ms: 60_000,
+            last_position_ms: 10_000,
+            has_timeline: true,
+            updated_at: Some(at),
+            projected_at: Some(at),
+            playing: true,
+            playback_rate: 1.5,
+            ..Default::default()
+        };
+        assert_eq!(
+            latch.retained_position(at + Duration::from_secs(1), true, 2.0),
+            Some(11_500)
+        );
+        // The pause arrives after one more second at the previous rate.
+        assert_eq!(
+            latch.retained_position(at + Duration::from_secs(2), false, 2.0),
+            Some(13_500)
+        );
+        assert_eq!(
+            latch.retained_position(at + Duration::from_secs(3), true, 0.5),
+            Some(13_500)
+        );
+        assert_eq!(
+            latch.retained_position(at + Duration::from_secs(4), true, 0.5),
+            Some(14_000)
+        );
+        // Firefox's missing timeline lasts longer than five seconds. Keep
+        // projecting the known recording rather than clearing it at six seconds.
+        assert_eq!(
+            latch.retained_position(at + Duration::from_secs(5), true, 0.5),
+            Some(14_500)
+        );
+        assert_eq!(
+            latch.retained_position(at + Duration::from_secs(35), true, 0.5),
+            Some(29_500)
+        );
+    }
+
+    #[test]
+    fn missing_timeline_clamps_and_ignores_invalid_rate() {
+        let at = Instant::now();
+        let mut latch = LatchedTimeline {
+            duration_ms: 12_000,
+            last_position_ms: 10_000,
+            updated_at: Some(at),
+            projected_at: Some(at),
+            playing: true,
+            playback_rate: f64::NAN,
+            ..Default::default()
+        };
+        assert_eq!(
+            latch.retained_position(at + Duration::from_secs(1), true, 16.0),
+            Some(11_000)
+        );
+        assert_eq!(
+            latch.retained_position(at + Duration::from_secs(2), true, 16.0),
+            Some(12_000)
+        );
+    }
+
+    #[test]
     fn base64_pads_and_matches_known_vectors() {
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");
@@ -1176,8 +1309,14 @@ mod tests {
         let two_seconds_ago = DateTime {
             UniversalTime: now - 20_000_000,
         };
-        assert_eq!(advance_position(30_000, two_seconds_ago, true, 1.0, now), 32_000);
-        assert_eq!(advance_position(30_000, two_seconds_ago, true, 1.5, now), 33_000);
+        assert_eq!(
+            advance_position(30_000, two_seconds_ago, true, 1.0, now),
+            32_000
+        );
+        assert_eq!(
+            advance_position(30_000, two_seconds_ago, true, 1.5, now),
+            33_000
+        );
         assert_eq!(
             advance_position(30_000, two_seconds_ago, false, 1.0, now),
             30_000
@@ -1187,7 +1326,10 @@ mod tests {
         let in_the_future = DateTime {
             UniversalTime: now + 5_000_000,
         };
-        assert_eq!(advance_position(30_000, in_the_future, true, 1.0, now), 30_000);
+        assert_eq!(
+            advance_position(30_000, in_the_future, true, 1.0, now),
+            30_000
+        );
 
         // Coming back from sleep must not land the bar past the track.
         let yesterday = DateTime {
@@ -1257,6 +1399,20 @@ mod tests {
         moved.position_ms = 2_200;
         emitted.remember(&payload, 1);
         assert!(!emitted.matches(&moved, 1));
+
+        // Timeline recovery and publication changes matter even within the
+        // same second, otherwise a new song can keep a stopped UI clock.
+        let mut recovered = payload.clone();
+        recovered.has_timeline = false;
+        emitted.remember(&recovered, 1);
+        assert!(!emitted.matches(&payload, 1));
+        emitted.remember(&payload, 1);
+        recovered = payload.clone();
+        recovered.timeline_updated_ms = Some(1_700_000_000_001);
+        assert!(!emitted.matches(&recovered, 1));
+        recovered = payload.clone();
+        recovered.playback_rate = 1.5;
+        assert!(!emitted.matches(&recovered, 1));
     }
 
     #[test]
@@ -1266,6 +1422,23 @@ mod tests {
         assert!(!include_art(false, 3, 3));
         // The first poll that finds no art sends no art either.
         assert!(!include_art(false, 0, 0));
+    }
+
+    #[test]
+    fn metadata_refresh_updates_artwork_only_when_bytes_change() {
+        let mut art = Artwork::default();
+        art.adopt("data:image/png;base64,first".into());
+        let published = art.generation;
+        art.adopt("data:image/png;base64,first".into());
+        assert!(!include_art(false, art.generation, published));
+        art.adopt("data:image/png;base64,replacement".into());
+        assert_eq!(
+            art.data.as_deref(),
+            Some("data:image/png;base64,replacement")
+        );
+        assert!(include_art(false, art.generation, published));
+        // Reading during an explicit snapshot need not create a new generation.
+        assert!(include_art(true, art.generation, art.generation));
     }
 
     #[test]
@@ -1315,6 +1488,64 @@ mod tests {
                 );
             }
             None => println!("no current session"),
+        }
+        unsafe { RoUninitialize() };
+    }
+
+    #[test]
+    #[ignore = "manual passive 30-second Windows timeline recording (no playback commands)"]
+    fn media_transition_probe() {
+        unsafe { RoInitialize(RO_INIT_MULTITHREADED).unwrap() };
+        let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+            .and_then(|op| op.get())
+            .expect("media session manager");
+        let started = Instant::now();
+        let mut latched = LatchedTimeline::default();
+        let mut last_playing = None;
+        for _ in 0..120 {
+            if let Some(session) = pick_session(&manager) {
+                if let Ok(props) = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()) {
+                    let raw = session.GetTimelineProperties().map(|timeline| {
+                        (
+                            timeline.StartTime().map(|v| v.Duration),
+                            timeline.EndTime().map(|v| v.Duration),
+                            timeline.Position().map(|v| v.Duration),
+                            timeline.LastUpdatedTime().map(|v| v.UniversalTime),
+                        )
+                    });
+                    let reading = read_session(
+                        &session,
+                        &props,
+                        now_filetime_ticks(),
+                        now_epoch_ms(),
+                        &mut latched,
+                        last_playing,
+                    );
+                    let p = reading.payload;
+                    last_playing = Some(p.playing);
+                    println!(
+                        "t={}ms title={:?} source={:?} playing={} rate={} raw={:?} resolved={}/{}ms timeline={} latch_age={:?}",
+                        started.elapsed().as_millis(),
+                        p.title,
+                        p.source,
+                        p.playing,
+                        p.playback_rate,
+                        raw,
+                        p.position_ms,
+                        p.duration_ms,
+                        p.has_timeline,
+                        latched.updated_at.map(|at| at.elapsed().as_millis())
+                    );
+                } else {
+                    println!(
+                        "t={}ms properties unavailable",
+                        started.elapsed().as_millis()
+                    );
+                }
+            } else {
+                println!("t={}ms no session", started.elapsed().as_millis());
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
         unsafe { RoUninitialize() };
     }

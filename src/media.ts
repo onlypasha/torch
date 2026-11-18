@@ -87,8 +87,8 @@ export function seekRatio(clientX: number, left: number, width: number): number 
 }
 
 /**
- * Merges previous and next state, preserving thumbnail, duration, and position
- * if Windows reports a momentary dropout for the same song.
+ * Retains artwork for the same song. Native owns timeline retention;
+ * its availability and transport capabilities reach the UI unchanged.
  */
 export function mergeMediaState(
   previous: MediaState,
@@ -112,20 +112,6 @@ export function mergeMediaState(
     merged.thumbnail = previous.thumbnail;
   }
 
-  // If incoming timeline dropped to zero but previous had valid timeline, preserve previous
-  if (merged.durationMs <= 0 && previous.durationMs > 0) {
-    merged.durationMs = previous.durationMs;
-    merged.hasTimeline = previous.hasTimeline;
-    merged.canSeek = previous.canSeek;
-    if (merged.positionMs <= 0 && previous.positionMs > 0) {
-      merged.positionMs = previous.positionMs;
-      // The retained position was measured with the old sample, so keep its
-      // clock too; a fresh `sampledAtMs` would age the wrong number.
-      merged.sampledAtMs = previous.sampledAtMs;
-      merged.timelineUpdatedMs = previous.timelineUpdatedMs;
-    }
-  }
-
   return merged;
 }
 
@@ -133,12 +119,11 @@ export function mergeMediaState(
  * The one clock the progress bar and the lyrics both follow.
  *
  * The native worker projects Windows' timeline through its own
- * `LastUpdatedTime`, so every sample already describes "now". The source is
- * therefore adopted as-is on each update - exactly what the WPF original does
- * in `ApplyMedia` - instead of being smoothed or held back. The sole exception
- * is a zeroed timeline for the same playing track, which background web
- * players sometimes publish while their audio keeps going; accepting it would
- * rewind the bar and the words to the start.
+ * `LastUpdatedTime`, so each position already describes the native sample time.
+ * Only IPC flight time is added here. Changed source positions and fresh
+ * publications win immediately; identical stale samples and bogus zeroes for
+ * the same playing track must not rewind the clock. A missing native timeline
+ * stops it instead of extending native's retention policy.
  */
 export type PlayheadAnchor = {
   baseMs: number;
@@ -153,6 +138,8 @@ export type PlayheadAnchor = {
    * news - a seek, a repeat, a fresh sample - and outranks the zero guard.
    */
   sampleStampMs: number | null;
+  /** Incoming position before IPC projection; optional for existing anchors. */
+  sourcePositionMs?: number;
 };
 
 /**
@@ -184,8 +171,24 @@ export function nextPlayheadAnchor(
   const sameTrack = previous.trackKey === trackKey && previous.durationMs > 0;
   const playbackRate = media.playbackRate && media.playbackRate > 0 ? media.playbackRate : 1;
   const stamp = media.timelineUpdatedMs ?? null;
+
+  // A missing timeline is authoritative when native cannot retain it. Neither
+  // stale-sample guards nor IPC/local projection may keep the old clock alive.
+  if (!media.hasTimeline || media.durationMs <= 0) {
+    return {
+      baseMs: 0,
+      at: now,
+      playing: false,
+      durationMs: media.durationMs,
+      trackKey,
+      playbackRate,
+      sampleStampMs: stamp,
+      sourcePositionMs: media.positionMs,
+    };
+  }
+
   const newerPublication =
-    stamp !== null && previous.sampleStampMs !== null && stamp > previous.sampleStampMs;
+    stamp !== null && (previous.sampleStampMs === null || stamp > previous.sampleStampMs);
 
   // Background web players sometimes publish a zeroed timeline while their
   // audio keeps going. Only an *unchanged* publication can be that bogus zero:
@@ -195,17 +198,56 @@ export function nextPlayheadAnchor(
     previous.playing &&
     media.playing &&
     media.positionMs === 0 &&
-    previous.baseMs > 0 &&
+    playheadAt(previous, now) > 0 &&
     !newerPublication;
 
+  if (staleZero) {
+    return {
+      baseMs: previous.baseMs,
+      at: previous.at,
+      playing: media.playing,
+      durationMs: media.durationMs,
+      trackKey,
+      playbackRate,
+      sampleStampMs: previous.sampleStampMs,
+      sourcePositionMs: previous.sourcePositionMs ?? previous.baseMs,
+    };
+  }
+
+  const projectedSample = projectSample(media, receivedAtMs);
+
+  // Repeated source positions with the same publication are stale regardless of
+  // drift size. Compare the raw input, not the IPC-projected base: native already
+  // projects LastUpdatedTime, and changed positions (including small seeks) win.
+  if (
+    sameTrack &&
+    previous.playing &&
+    media.playing &&
+    !newerPublication &&
+    stamp !== null &&
+    stamp === previous.sampleStampMs &&
+    media.positionMs === (previous.sourcePositionMs ?? previous.baseMs)
+  ) {
+    const currentLocalPlayhead = playheadAt(previous, now);
+    const backwardDrift = currentLocalPlayhead - projectedSample;
+    if (backwardDrift > 0) {
+      return {
+        ...previous,
+        durationMs: media.durationMs,
+        playbackRate,
+      };
+    }
+  }
+
   return {
-    baseMs: staleZero ? previous.baseMs : projectSample(media, receivedAtMs),
-    at: staleZero ? previous.at : now,
+    baseMs: projectedSample,
+    at: now,
     playing: media.playing,
     durationMs: media.durationMs,
     trackKey,
     playbackRate,
-    sampleStampMs: staleZero ? previous.sampleStampMs : stamp,
+    sampleStampMs: stamp,
+    sourcePositionMs: media.positionMs,
   };
 }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "framer-motion";
 import { brightnessLabel, volumeCommand, volumeLabel, volumePercent } from "./quicksettings";
@@ -122,11 +122,18 @@ function CloseIcon() {
 }
 
 export function QuickSettingsWidget() {
+  const fieldId = useId();
   const [vol, setVol] = useState<VolumeState>({ level: 0.5, muted: false });
   const [bright, setBright] = useState(50);
   const [brightSupported, setBrightSupported] = useState(true);
   const [dnd, setDnd] = useState(false);
   const [powerMenu, setPowerMenu] = useState(false);
+  useEffect(() => {
+    if (!powerMenu) return;
+    const escape = (event: KeyboardEvent) => { if (event.key === "Escape") setPowerMenu(false); };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, [powerMenu]);
   // A refused write must not look like a successful one: the value goes red and
   // the slider is re-read from Windows instead of keeping the optimistic level.
   const [volumeFailed, setVolumeFailed] = useState(false);
@@ -330,15 +337,9 @@ export function QuickSettingsWidget() {
           >
             {/* Slider Volume */}
             <div className="notch-qs-row">
-              <button
-                type="button"
-                className="notch-qs-icon-btn"
-                onClick={toggleMute}
-                aria-label={vol.muted ? "Bunyikan audio" : "Senyapkan audio"}
-              >
-                <SpeakerIcon muted={vol.muted || vol.level === 0} />
-              </button>
+              <label htmlFor={`${fieldId}-volume`} className="notch-qs-field-label">Volume</label>
               <input
+                id={`${fieldId}-volume`}
                 type="range"
                 className="notch-qs-slider"
                 min={0}
@@ -358,8 +359,9 @@ export function QuickSettingsWidget() {
 
             {/* Slider Kecerahan */}
             <div className="notch-qs-row">
-              <span className="notch-qs-icon" aria-hidden="true"><SunIcon /></span>
+              <label htmlFor={`${fieldId}-brightness`} className="notch-qs-field-label"><span aria-hidden="true"><SunIcon /></span>Kecerahan</label>
               <input
+                id={`${fieldId}-brightness`}
                 type="range"
                 className="notch-qs-slider"
                 min={0}
@@ -384,6 +386,10 @@ export function QuickSettingsWidget() {
 
             {/* Tombol Aksi */}
             <div className="notch-qs-actions">
+              <button type="button" className="notch-qs-btn notch-qs-icon-btn" onClick={toggleMute}
+                aria-label={vol.muted ? "Bunyikan audio" : "Senyapkan audio"} aria-pressed={vol.muted}>
+                <SpeakerIcon muted={vol.muted || vol.level === 0} />
+              </button>
               <button
                 type="button"
                 className={`notch-qs-btn${dnd ? " active" : ""}`}
@@ -421,10 +427,10 @@ export function QuickSettingsWidget() {
 }
 
 // ---------------------------------------------------------------------------
-// System Monitor (Tiga Cincin)
+// System Monitor
 // ---------------------------------------------------------------------------
 
-function RingGauge({
+function MetricLane({
   percent,
   label,
   valueText,
@@ -435,47 +441,20 @@ function RingGauge({
   valueText: string;
   subText?: string;
 }) {
-  const radius = 22;
-  const stroke = 3.5;
-  const circ = 2 * Math.PI * radius;
   const clamped = Math.max(0, Math.min(100, percent));
-  const offset = circ - (clamped / 100) * circ;
 
   return (
-    <div className="notch-sysmon-ring-item">
-      <div className="notch-sysmon-svg-wrap">
-        <svg width="56" height="56" viewBox="0 0 56 56" className="notch-sysmon-svg">
-          <circle
-            cx="28"
-            cy="28"
-            r={radius}
-            fill="none"
-            stroke="rgba(255,255,255,0.12)"
-            strokeWidth={stroke}
-          />
-          <circle
-            cx="28"
-            cy="28"
-            r={radius}
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={stroke}
-            strokeDasharray={circ}
-            strokeDashoffset={offset}
-            strokeLinecap="round"
-            transform="rotate(-90 28 28)"
-            className={`notch-sysmon-fill${clamped > 85 ? " high" : ""}`}
-          />
-        </svg>
-        <span className="notch-sysmon-center-pct">{valueText}</span>
+    <div className="notch-metric-lane">
+      <div className="notch-metric-reading"><span>{label}</span><span>{subText && <small>{subText}</small>}<strong>{valueText}</strong></span></div>
+      <div className="notch-metric-track" aria-hidden="true">
+        <span className={clamped > 85 ? "high" : undefined} style={{ width: `${clamped}%` }} />
       </div>
-      <span className="notch-sysmon-label">{label}</span>
-      {subText && <span className="notch-sysmon-sub">{subText}</span>}
     </div>
   );
 }
 
 export function SystemMonitorWidget() {
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [stats, setStats] = useState<SysStats>({
     cpuPercent: 0,
     memPercent: 0,
@@ -492,9 +471,9 @@ export function SystemMonitorWidget() {
     const fetchStats = () => {
       void invoke<SysStats>("sysinfo_stats")
         .then((res) => {
-          if (!unmounted) setStats(res);
+          if (!unmounted) { setStats(res); setStatus("ready"); }
         })
-        .catch(() => {});
+        .catch(() => { if (!unmounted) setStatus("error"); });
     };
 
     fetchStats();
@@ -507,25 +486,26 @@ export function SystemMonitorWidget() {
 
   return (
     <div className="notch-sysmon-widget">
-      <div className="notch-sysmon-rings">
-        <RingGauge
+      {status !== "ready" ? <p className="notch-widget-notice" role="status">{status === "loading" ? "Membaca penggunaan sistem…" : "Data sistem belum tersedia. Mencoba lagi…"}</p> :
+      <div className="notch-system-readings">
+        <MetricLane
           percent={stats.cpuPercent}
           label="CPU"
           valueText={`${Math.round(stats.cpuPercent)}%`}
         />
-        <RingGauge
+        <MetricLane
           percent={stats.memPercent}
           label="RAM"
           valueText={`${Math.round(stats.memPercent)}%`}
           subText={`${stats.memUsedGb.toFixed(1)}G`}
         />
-        <RingGauge
+        <MetricLane
           percent={stats.diskPercent}
           label={`Disk (${stats.diskLabel})`}
           valueText={`${Math.round(stats.diskPercent)}%`}
           subText={`${Math.round(stats.diskUsedGb)}G`}
         />
-      </div>
+      </div>}
     </div>
   );
 }

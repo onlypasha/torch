@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { runtimeConfig } from "./config";
 import type { MediaState } from "./media";
 
 /**
@@ -11,6 +12,7 @@ export function useMediaPlaying(): boolean {
   const [playing, setPlaying] = useState(false);
 
   useEffect(() => {
+    if (!runtimeConfig.features.media) return;
     let disposed = false;
     let stop: (() => void) | undefined;
     listen<MediaState>("media-state", (event) => {

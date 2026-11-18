@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="id"><head><meta charset="UTF-8"/><title>Pengujian cuaca NotchApp</title></head><body><div id="root"></div><script type="module">
+import "./mock-native.js";
+import { runtimeConfig } from "../src/config.ts";
+const mode = new URLSearchParams(location.search).get("mode") ?? "ready";
+const city = { name: "Kota uji, Indonesia", latitude: -6.2, longitude: 106.8 };
+window.__configMock = { ...runtimeConfig, weatherLocation: mode === "unset" ? null : city, weatherFollowWindows: true, ...(mode === "disabled" ? { widgets: ["quicksettings", "calendar"] } : {}) };
+window.__weatherFail = mode === "error";
+window.__windowsDenied = false;
+window.__weatherMock = async (command, args) => {
+  if (command === "weather_search") return args.query === "xx" ? [] : [city];
+  if (command === "weather_windows_location") { if (window.__windowsDenied) throw new Error("Akses lokasi ditolak oleh Windows."); return { ...city, name: "Lokasi Windows" }; }
+  if (command !== "weather_get") return null;
+  if (mode === "loading") await new Promise(r => setTimeout(r, 2000));
+  if (window.__weatherFail) throw new Error("Jaringan tidak tersedia.");
+  const at = Math.floor(Date.now() / 1000) - (mode === "stale" ? 3600 : 0);
+  return { timezone: "Asia/Jakarta", current: { time: at, temperature_2m: 26.3, weather_code: 63, is_day: 0 }, hourly: { time: [at+3600,at+7200,at+10800,at+14400,at+18000], temperature_2m: [26,25,24,24,23] } };
+};
+await import("./weather-ui-probe.js");
+await import("../src/main.tsx");
+</script></body></html>

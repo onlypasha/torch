@@ -1,0 +1,11 @@
+.notification-avatar { position: relative; display: grid; flex: none; place-items: center; width: 46px; height: 46px; border-radius: 10px; background: #222936; color: #bdcbe2; }
+.notification-avatar-logo { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: inherit; }
+.notification-avatar[data-conversation="true"] { border-radius: 50%; background: transparent; }
+.notification-avatar-initials { display: grid; place-items: center; width: 100%; height: 100%; border-radius: 50%; background: #2b4243; color: #e0eeeb; font-size: 17px; line-height: 1; font-weight: 600; }
+.notification-avatar-photo { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: 50%; background: #2b4243; }
+.notification-avatar-badge { position: absolute; right: -2px; bottom: -1px; display: grid; place-items: center; width: 17px; height: 17px; border: 2px solid #000; border-radius: 50%; overflow: hidden; background: #25a86a; color: #fff; }
+.notification-avatar-badge > img, .notification-avatar-badge > svg { width: 100%; height: 100%; object-fit: contain; }
+.notification-avatar[data-compact="true"] { width: 19px; height: 19px; border-radius: 5px; }
+.notification-avatar[data-compact="true"] .notification-avatar-initials { font-size: 8px; }
+.notification-avatar[data-compact="true"] .notification-avatar-badge { width: 9px; height: 9px; right: -2px; bottom: -1px; border-width: 1px; }
+@media (max-width: 540px) { .notification-avatar:not([data-compact="true"]) { width: 40px; height: 40px; } }

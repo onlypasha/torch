@@ -1,0 +1,20 @@
+.notch-calendar { --calendar-accent: #537cce; display: flex; flex-direction: column; width: 100%; height: 122px; min-width: 0; gap: 4px; }
+.calendar-heading { display: flex; align-items: flex-start; gap: 8px; height: 52px; flex: none; }
+.calendar-month { appearance: none; flex: 0 0 39px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 4px 0; border: 0; border-radius: 5px; background: transparent; color: #f4f4f5; cursor: pointer; font: inherit; text-align: left; }
+.calendar-month > span:first-child { font-size: 15px; line-height: 19px; font-weight: 600; }
+.calendar-month > span:last-child { font-size: 14px; line-height: 18px; font-weight: 300; color: #a6a6ae; }
+.calendar-wheel-frame { flex: 1; min-width: 0; height: 52px; mask-image: linear-gradient(to right, transparent, #000 15px, #000 calc(100% - 15px), transparent); }
+.notch-calendar-dates { display: flex; height: 52px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; scroll-snap-type: x mandatory; overscroll-behavior-x: contain; }
+.notch-calendar-dates::-webkit-scrollbar { display: none; }
+.calendar-wheel-spacer { flex: 0 0 calc(50% - 14px); }
+.calendar-date-button { appearance: none; display: flex; flex: 0 0 28px; flex-direction: column; align-items: center; gap: 7px; height: 51px; padding: 4px; border: 0; border-radius: 8px; background: transparent; color: #a6a6ae; cursor: pointer; font: inherit; scroll-snap-align: center; }
+.calendar-date-button[aria-pressed="true"] { background: #537cce40; color: #fff; }
+.calendar-date-button:hover:not([aria-pressed="true"]) { background: #ffffff0a; }
+.calendar-weekday { font-size: 10px; line-height: 12px; }
+.calendar-date-number { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; font-size: 13px; line-height: 20px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.calendar-date-button[data-today="true"] .calendar-date-number { background: var(--calendar-accent); color: #fff; }
+.calendar-month:focus-visible, .calendar-date-button:focus-visible { outline: 1px solid #b9d2ff; outline-offset: -1px; }
+.calendar-agenda-empty { display: flex; flex: 1; min-height: 0; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
+.calendar-agenda-empty > svg { color: #a6a6ae; margin-bottom: 1px; }
+.calendar-agenda-empty > span { font-size: 11px; line-height: 14px; color: #ededf1; }
+.calendar-agenda-empty > small { font-size: 10px; line-height: 12px; color: #9999a4; }

@@ -1,10 +1,13 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import App from "./App";
+import { invoke } from "@tauri-apps/api/core";
+import { setRuntimeConfig } from "./config";
+import type { AppConfig } from "./config";
 import "./App.css";
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+const root = ReactDOM.createRoot(document.getElementById("root")!);
+const View = React.lazy(() => location.search.includes("settings") ? import("./Settings") : import("./App"));
+void invoke<AppConfig>("config_get").then((config) => {
+  setRuntimeConfig(config);
+  root.render(<React.StrictMode><React.Suspense fallback={null}><View /></React.Suspense></React.StrictMode>);
+}).catch(() => root.render(<p style={{color:"white",padding:24}}>Pengaturan tidak dapat dimuat. Jalankan ulang NotchApp.</p>));

@@ -31,7 +31,17 @@ import {
   weekOf,
   weekdayLong,
   WidgetWheelNavigator,
+  nookPanelWidth,
 } from "../src/nook";
+
+test("Nook width follows enabled columns including Media-disabled and empty configurations", () => {
+  expect(nookPanelWidth(true, 6, 0)).toBe(640);
+  expect(nookPanelWidth(true, 5, 1)).toBe(752);
+  expect(nookPanelWidth(false, 6, 0)).toBe(276);
+  expect(nookPanelWidth(false, 5, 1)).toBe(388);
+  expect(nookPanelWidth(true, 0, 0)).toBe(376);
+  expect(nookPanelWidth(false, 0, 0)).toBe(276);
+});
 
 test("a touchpad swipe advances immediately and consumes a long decaying tail", () => {
   const wheel = new WidgetWheelNavigator();
@@ -137,7 +147,7 @@ test("keepArtwork holds the cover while the track is unchanged", () => {
   expect(keepArtwork(null, sameTrack)).toEqual(sameTrack);
 });
 
-test("mergeMediaState latches transient zero timeline dropouts for the same song", () => {
+test("mergeMediaState retains artwork but lets the native five-second timeline latch expire", () => {
   const full = {
     title: "Malam",
     artist: "Band",
@@ -156,7 +166,15 @@ test("mergeMediaState latches transient zero timeline dropouts for the same song
     repeatSupported: true,
     source: "Spotify.exe",
     thumbnail: "data:art",
+    sampledAtMs: 1_000,
+    timelineUpdatedMs: 500,
   };
+  // Native owns transient retention: before its TTL expires it still sends a
+  // valid, projected timeline. The frontend must accept that sample unchanged.
+  const latched = { ...full, positionMs: 49_000, sampledAtMs: 5_000, thumbnail: undefined };
+  const retained = mergeMediaState(full, latched);
+  expect(retained).toEqual({ ...latched, thumbnail: "data:art" });
+
   const dropped = {
     ...full,
     positionMs: 0,
@@ -164,14 +182,22 @@ test("mergeMediaState latches transient zero timeline dropouts for the same song
     hasTimeline: false,
     canSeek: false,
     thumbnail: undefined,
+    sampledAtMs: 7_000,
+    timelineUpdatedMs: undefined,
   };
 
-  const merged = mergeMediaState(full, dropped);
-  expect(merged?.durationMs).toBe(180_000);
-  expect(merged?.positionMs).toBe(45_000);
-  expect(merged?.hasTimeline).toBe(true);
-  expect(merged?.canSeek).toBe(true);
-  expect(merged?.thumbnail).toBe("data:art");
+  // Once native reports expiry, repeated polls must not resurrect the timeline,
+  // capabilities, position or old measurement timestamps. Artwork alone lives on.
+  let merged = retained;
+  for (const sampledAtMs of [7_000, 8_000, 20_000]) {
+    const expired = { ...dropped, sampledAtMs };
+    merged = mergeMediaState(merged, expired);
+    expect(merged).toEqual({ ...expired, thumbnail: "data:art" });
+    expect(merged?.durationMs).toBe(0);
+    expect(merged?.positionMs).toBe(0);
+    expect(merged?.hasTimeline).toBe(false);
+    expect(merged?.canSeek).toBe(false);
+  }
 
   // Track change should not latch old duration
   const newTrack = {

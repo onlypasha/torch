@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="id"><head><meta charset="UTF-8"/><title>Konfigurasi NotchApp</title></head>
+<body><div id="root"></div><script type="module">
+import "./mock-native.js";
+import { emit } from "@tauri-apps/api/event";
+window.openNotch = () => emit("notch-press", null);
+if (location.search.includes("disabled")) window.__configMock = { features: {media:false,tray:false,sharing:false,notifications:false,activity:false}, widgets:[] };
+await import("../src/main.tsx");
+</script></body></html>

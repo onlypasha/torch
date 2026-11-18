@@ -1,27 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { runtimeConfig } from "./config";
 import type { CSSProperties } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import type { PanInfo, Transition } from "framer-motion";
-import { mediaCaption, mediaPercent, mediaTime, seekRatio, seekTarget, REPEAT_LABEL } from "./media";
+import { mediaCaption, mediaPercent, mediaTime, seekRatio, seekTarget, trackIdentity, REPEAT_LABEL } from "./media";
 import { LYRIC_FAILED, LYRIC_LOADING, LYRIC_UNAVAILABLE } from "./lyrics";
 import {
-  calendarTitle,
   compactMonth,
-  POMODORO_STATUS,
   pomodoroClock,
   pomodoroFraction,
   STACK_POSITION,
   stackOffset,
   stackSlot,
-  weekOf,
   weekdayLong,
   WIDGET_LABEL,
-  WEATHER,
   WidgetWheelNavigator,
 } from "./nook";
 import type { PinVerdict, WidgetId } from "./nook";
-import type { NookModel } from "./useNook";
+import type { NookModel, SeekGesture } from "./useNook";
 import { QuickSettingsWidget, SystemMonitorWidget } from "./QuickSettingsWidgets";
+import { CalendarWidget } from "./CalendarWidget";
+import { WeatherWidget } from "./WeatherWidget";
+import "./NookWidgets.css";
 
 /**
  * The Nook tab: fixed media panel, the rotating widget stack and (when any
@@ -31,11 +31,10 @@ import { QuickSettingsWidget, SystemMonitorWidget } from "./QuickSettingsWidgets
  * adding the pinned column beside them, so the stack keeps its full 252px.
  */
 
-const STACK_SPRING: Transition = { type: "spring", stiffness: 420, damping: 34 };
+const STACK_SPRING: Transition = { type: "spring", stiffness: 400, damping: 40 };
 const REORDER_SPRING: Transition = { type: "spring", stiffness: 500, damping: 36 };
 const LYRIC_TRANSITION: Transition = { duration: 0.18, ease: "easeOut" };
-const RING_SPRING: Transition = { duration: 0.4, ease: "easeOut" };
-const PIN_IN: Transition = { type: "spring", stiffness: 420, damping: 32, delay: 0.1 };
+const PIN_IN: Transition = { type: "spring", stiffness: 420, damping: 42 };
 const PIN_OUT: Transition = { duration: 0.15 };
 
 const MENU_WIDTH = 180;
@@ -122,12 +121,37 @@ function Marquee({ text, className }: { text: string; className?: string }) {
 function SeekBar({ nook }: { nook: NookModel }) {
   const { media, positionMs } = nook;
   const track = useRef<HTMLDivElement>(null);
-  const dragging = useRef(false);
+  const dragging = useRef<{ pointerId: number; gesture: SeekGesture } | null>(null);
   const [hover, setHover] = useState<number | null>(null);
 
   const duration = media?.durationMs ?? 0;
   const canSeek = media?.canSeek === true && duration > 0;
   const percent = mediaPercent(positionMs, duration);
+  const trackKey = media ? trackIdentity(media) : "";
+
+  const releaseCapture = (pointerId: number) => {
+    try {
+      if (track.current?.hasPointerCapture(pointerId)) track.current.releasePointerCapture(pointerId);
+    } catch {
+      // The browser may already have released this pointer.
+    }
+  };
+
+  const cancelDrag = useCallback(() => {
+    const drag = dragging.current;
+    if (!drag) return;
+    dragging.current = null;
+    nook.cancelSeek();
+    releaseCapture(drag.pointerId);
+    setHover(null);
+  }, [nook.cancelSeek]);
+
+  useEffect(() => () => cancelDrag(), [trackKey, duration, canSeek, cancelDrag]);
+
+  useEffect(() => {
+    window.addEventListener("blur", cancelDrag);
+    return () => window.removeEventListener("blur", cancelDrag);
+  }, [cancelDrag]);
 
   const ratioAt = (clientX: number) => {
     const rect = track.current?.getBoundingClientRect();
@@ -135,18 +159,17 @@ function SeekBar({ nook }: { nook: NookModel }) {
     return seekRatio(clientX, rect.left, rect.width);
   };
 
-  const finish = (clientX: number) => {
-    if (!dragging.current) return;
-    dragging.current = false;
-    nook.commitSeek(ratioAt(clientX));
+  const finish = (clientX: number, pointerId: number) => {
+    const drag = dragging.current;
+    if (!drag || drag.pointerId !== pointerId) return;
+    dragging.current = null;
+    if (canSeek && drag.gesture.trackKey === trackKey && drag.gesture.durationMs === duration) {
+      nook.commitSeek(ratioAt(clientX), drag.gesture);
+    } else {
+      nook.cancelSeek();
+    }
+    releaseCapture(pointerId);
     setHover(null);
-  };
-
-  const cancelSeek = () => {
-    if (!dragging.current) return;
-    dragging.current = false;
-    setHover(null);
-    nook.commitSeek(positionMs / (duration || 1));
   };
 
   const step = (deltaMs: number) => {
@@ -170,8 +193,10 @@ function SeekBar({ nook }: { nook: NookModel }) {
         aria-valuenow={Math.round(positionMs / 1000)}
         aria-valuetext={mediaTime(positionMs)}
         onPointerDown={(event) => {
-          if (!canSeek || event.button !== 0) return;
-          dragging.current = true;
+          if (!canSeek || event.button !== 0 || dragging.current) return;
+          const gesture = nook.beginSeek();
+          if (!gesture) return;
+          dragging.current = { pointerId: event.pointerId, gesture };
           // A capture on a pointer the browser no longer tracks throws; the
           // drag still works without it, so this must never break the handler.
           try {
@@ -179,16 +204,21 @@ function SeekBar({ nook }: { nook: NookModel }) {
           } catch {
             /* not capturable in this environment */
           }
-          nook.beginSeek();
-          nook.previewSeek(ratioAt(event.clientX));
+          nook.previewSeek(ratioAt(event.clientX), gesture);
         }}
         onPointerMove={(event) => {
           const ratio = ratioAt(event.clientX);
-          if (dragging.current) nook.previewSeek(ratio);
+          const drag = dragging.current;
+          if (drag?.pointerId === event.pointerId) nook.previewSeek(ratio, drag.gesture);
           else if (canSeek) setHover(ratio);
         }}
-        onPointerUp={(event) => finish(event.clientX)}
-        onPointerCancel={() => cancelSeek()}
+        onPointerUp={(event) => finish(event.clientX, event.pointerId)}
+        onPointerCancel={(event) => {
+          if (dragging.current?.pointerId === event.pointerId) cancelDrag();
+        }}
+        onLostPointerCapture={(event) => {
+          if (dragging.current?.pointerId === event.pointerId) cancelDrag();
+        }}
         onPointerLeave={() => setHover(null)}
         onKeyDown={(event) => {
           if (!canSeek) return;
@@ -234,9 +264,11 @@ function MediaPanel({ nook }: { nook: NookModel }) {
   // current line; this one is the always-visible karaoke strip.
   const lyric = !media
     ? ""
-    : nook.lyrics.status === "ready" || nook.lyrics.status === "plain"
-      ? nook.lyricRow.current || LYRIC_UNAVAILABLE
-      : lyricNotice(nook);
+    : nook.lyrics.status === "ready"
+      ? nook.lyricRow.current
+      : nook.lyrics.status === "plain"
+        ? nook.lyrics.plain.replace(/\s*\n\s*/g, " ").trim() || LYRIC_UNAVAILABLE
+        : lyricNotice(nook);
 
   return (
     <section
@@ -306,7 +338,7 @@ function MediaPanel({ nook }: { nook: NookModel }) {
                 exit={{ opacity: 0, y: -4 }}
                 transition={{ duration: 0.16, ease: "easeOut" }}
               >
-                {lyric}
+                <Marquee text={lyric} />
               </motion.span>
             )}
           </AnimatePresence>
@@ -383,63 +415,14 @@ function MediaPanel({ nook }: { nook: NookModel }) {
 // Widget bodies
 // ---------------------------------------------------------------------------
 
-function CalendarWidget({ compact }: { compact?: boolean }) {
-  const today = new Date();
-  if (compact) {
-    return (
-      <div className="notch-calendar-compact">
-        <span className="notch-calendar-big">{today.getDate()}</span>
-        <span className="notch-calendar-short">{compactMonth(today)}</span>
-        <span className="notch-calendar-weekday">{weekdayLong(today)}</span>
-      </div>
-    );
-  }
-  return (
-    <div className="notch-calendar">
-      <span className="notch-calendar-title">{calendarTitle(today)}</span>
-      <div className="notch-calendar-week">
-        {weekOf(today).map((day) => (
-          <span
-            key={day.key}
-            className="notch-calendar-cell"
-            data-today={day.today ? "true" : "false"}
-            aria-current={day.today ? "date" : undefined}
-          >
-            <span className="notch-calendar-day">{day.weekday}</span>
-            <span className="notch-calendar-date">{day.day}</span>
-          </span>
-        ))}
-      </div>
-      <div className="notch-calendar-event">
-        <span className="notch-calendar-dot" aria-hidden="true" />
-        <span className="notch-calendar-event-text">Tidak ada acara hari ini</span>
-      </div>
-    </div>
-  );
-}
-
 function PomodoroStack({ nook }: { nook: NookModel }) {
+  const reducedMotion = useReducedMotion();
   const fraction = pomodoroFraction(nook.pomodoro.remaining, nook.pomodoro.mode.seconds);
   const phase = nook.pomodoroPhase;
   return (
     <div className="notch-pomodoro">
-      <div className="notch-pomodoro-ring">
-        <svg width="84" height="84" viewBox="0 0 84 84" aria-hidden="true" className="notch-ring">
-          <circle cx="42" cy="42" r="39.5" className="notch-ring-track" fill="none" strokeWidth={5} />
-          <motion.circle
-            cx="42"
-            cy="42"
-            r="39.5"
-            className="notch-ring-fill"
-            fill="none"
-            strokeWidth={5}
-            strokeLinecap="round"
-            transform="rotate(-90 42 42)"
-            initial={false}
-            animate={{ pathLength: fraction }}
-            transition={RING_SPRING}
-          />
-        </svg>
+      <div className="notch-pomodoro-head">
+        <span className="notch-pomodoro-mode-label">{nook.pomodoro.mode.label}</span>
         <button type="button" className="notch-pomodoro-mode" onClick={nook.cyclePomodoroMode}
           aria-label={`Ganti mode Pomodoro, saat ini ${nook.pomodoro.mode.label}, ${nook.pomodoro.mode.seconds / 60} menit`}
           title="Ganti mode: fokus, istirahat singkat, istirahat panjang">
@@ -447,13 +430,12 @@ function PomodoroStack({ nook }: { nook: NookModel }) {
         </button>
       </div>
       <div className="notch-pomodoro-side">
-        <span className="notch-pomodoro-mode-label">{nook.pomodoro.mode.label}</span>
         <span className="notch-pomodoro-time" data-phase={phase}>{pomodoroClock(nook.pomodoro.remaining)}</span>
         <div className="notch-pomodoro-actions">
           <motion.button
             type="button"
             className="notch-pill-light"
-            whileTap={{ scale: 0.94 }}
+            whileTap={{ scale: reducedMotion ? 1 : 0.97 }}
             onClick={nook.togglePomodoro}
           >
             {phase === "running" ? "Jeda" : phase === "finished" ? "Ulangi" : "Mulai"}
@@ -461,12 +443,17 @@ function PomodoroStack({ nook }: { nook: NookModel }) {
           <motion.button
             type="button"
             className="notch-pill-ghost"
-            whileTap={{ scale: 0.94 }}
+            aria-label="Reset Pomodoro"
+            title="Reset Pomodoro"
+            whileTap={{ scale: reducedMotion ? 1 : 0.97 }}
             onClick={nook.resetPomodoro}
           >
-            Reset
+            <span aria-hidden="true">↺</span>
           </motion.button>
         </div>
+      </div>
+      <div className="notch-pomodoro-track" role="progressbar" aria-label="Waktu tersisa" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(fraction * 100)}>
+        <span style={{ width: `${fraction * 100}%` }} />
       </div>
     </div>
   );
@@ -480,6 +467,7 @@ function lyricNotice(nook: NookModel): string {
 }
 
 function LyricRows({ nook }: { nook: NookModel }) {
+  const reducedMotion = useReducedMotion();
   if (nook.lyrics.status === "plain") {
     return (
       <div className="notch-lyrics notch-lyrics-plain" data-status="plain">
@@ -523,9 +511,9 @@ function LyricRows({ nook }: { nook: NookModel }) {
                 data-role={row.role}
                 data-current={row.current ? "true" : "false"}
                 title={row.text}
-                initial={{ opacity: 0, y: 5 }}
+                initial={{ opacity: 0, y: reducedMotion ? 0 : 5 }}
                 animate={{ opacity: row.current ? 1 : 0.8, y: 0 }}
-                exit={{ opacity: 0, y: -5 }}
+                exit={{ opacity: 0, y: reducedMotion ? 0 : -5 }}
                 transition={LYRIC_TRANSITION}
               >
                 {row.text}
@@ -538,43 +526,16 @@ function LyricRows({ nook }: { nook: NookModel }) {
   );
 }
 
-function WeatherWidget({ compact }: { compact?: boolean }) {
-  if (compact) {
-    return (
-      <div className="notch-weather-compact">
-        <span className="notch-weather-temp-small">{WEATHER.temperature}°</span>
-        <span className="notch-weather-condition-small">{WEATHER.condition}</span>
-      </div>
-    );
-  }
-  return (
-    <div className="notch-weather">
-      <div className="notch-weather-now">
-        <span className="notch-weather-temp">{WEATHER.temperature}°</span>
-        <span className="notch-weather-condition">{WEATHER.condition}</span>
-      </div>
-      <div className="notch-weather-hours">
-        {WEATHER.hourly.map((hour) => (
-          <span key={hour.label} className="notch-weather-hour">
-            <span className="notch-weather-hour-label">{hour.label}</span>
-            <span className="notch-weather-hour-temp">{hour.temperature}°</span>
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 function WidgetBody({ widget, nook }: { widget: WidgetId; nook: NookModel }) {
   return (
     <div className="notch-widget" data-widget={widget}>
-      <span className="notch-widget-label">{WIDGET_LABEL[widget]}</span>
+      {widget !== "calendar" && widget !== "quicksettings" && widget !== "pomodoro" && widget !== "weather" && <span className="notch-widget-label">{WIDGET_LABEL[widget]}</span>}
       {widget === "quicksettings" && <QuickSettingsWidget />}
       {widget === "sysmon" && <SystemMonitorWidget />}
       {widget === "calendar" && <CalendarWidget />}
       {widget === "pomodoro" && <PomodoroStack nook={nook} />}
       {widget === "lyric" && <LyricRows nook={nook} />}
-      {widget === "weather" && <WeatherWidget />}
+      {widget === "weather" && <WeatherWidget weather={nook.weather} />}
     </div>
   );
 }
@@ -591,6 +552,7 @@ function WidgetStack({
   onMenu: (widget: WidgetId, target: HTMLElement) => void;
 }) {
   const wheelNavigator = useRef(new WidgetWheelNavigator());
+  const reducedMotion = useReducedMotion();
   const stack = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -598,6 +560,7 @@ function WidgetStack({
     if (!host) return;
     const onWheel = (event: WheelEvent) => {
       if (event.ctrlKey || !Number.isFinite(event.deltaY) || event.deltaY === 0 || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+      if (event.target instanceof Element && event.target.closest(".notch-calendar-dates")) return;
       // WPF lets a nested ScrollViewer consume input until its directional
       // edge. Only then does wheel input advance the widget carousel.
       let element = event.target instanceof Element ? event.target : null;
@@ -622,6 +585,7 @@ function WidgetStack({
   }, [nook.step]);
 
   const onKeyDown = (event: React.KeyboardEvent) => {
+    if (event.target instanceof HTMLInputElement && event.target.type === "range") return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
       stack.current?.focus({ preventScroll: true });
@@ -665,8 +629,8 @@ function WidgetStack({
             aria-hidden={!active}
             style={{ zIndex: active ? 10 : slot === "next" ? 5 : 1 }}
             initial={false}
-            animate={STACK_POSITION[slot]}
-            transition={STACK_SPRING}
+            animate={reducedMotion ? { y: 0, scale: 1, opacity: active ? 1 : 0 } : STACK_POSITION[slot]}
+            transition={reducedMotion ? { duration: 0.12 } : STACK_SPRING}
             drag={active ? "y" : false}
             dragElastic={0.25}
             dragConstraints={{ top: 0, bottom: 0 }}
@@ -713,24 +677,21 @@ function PinBadge() {
  * column (`PINNABLE_WIDGETS`); Pomodoro renders its own button, so this covers
  * the two plain bodies and returns nothing for anything else.
  */
-function PinnedBody({ widget }: { widget: WidgetId }) {
+function PinnedBody({ widget, nook }: { widget: WidgetId; nook: NookModel }) {
   const today = new Date();
   if (widget === "calendar") {
     return (
       <div className="notch-pin-calendar">
         <span className="notch-pin-big">{today.getDate()}</span>
-        <span className="notch-pin-month">{compactMonth(today)}</span>
-        <span className="notch-pin-weekday">{weekdayLong(today)}</span>
+        <div className="notch-pin-calendar-meta">
+          <span className="notch-pin-month">{compactMonth(today)}</span>
+          <span className="notch-pin-weekday">{weekdayLong(today)}</span>
+        </div>
       </div>
     );
   }
   if (widget === "weather") {
-    return (
-      <div className="notch-pin-weather">
-        <span className="notch-pin-weather-temp">{WEATHER.temperature}°</span>
-        <span className="notch-pin-weather-condition">{WEATHER.condition}</span>
-      </div>
-    );
+    return <WeatherWidget weather={nook.weather} compact />;
   }
   return null;
 }
@@ -743,6 +704,7 @@ function PinnedColumn({
   onMenu: (widget: WidgetId, target: HTMLElement) => void;
 }) {
   const dragged = useRef(false);
+  const reducedMotion = useReducedMotion();
   const suppressClick = useRef(0);
 
   const togglePinnedPomodoro = () => {
@@ -766,11 +728,16 @@ function PinnedColumn({
             dragElastic: 0.25,
             dragConstraints: { top: 0, bottom: 0 },
             dragSnapToOrigin: true,
-            whileDrag: { scale: 1.04, boxShadow: "0 10px 24px rgba(0,0,0,0.5)", zIndex: 20 },
-            transition: REORDER_SPRING,
-            initial: { opacity: 0, x: 24, scale: 0.9 },
-            animate: { opacity: 1, x: 0, scale: 1, transition: PIN_IN },
-            exit: { opacity: 0, x: 24, scale: 0.9, transition: PIN_OUT },
+            whileDrag: { scale: reducedMotion ? 1 : 1.04, boxShadow: "0 10px 24px rgba(0,0,0,0.5)", zIndex: 20 },
+            transition: reducedMotion ? { duration: 0.12 } : REORDER_SPRING,
+            initial: { opacity: 0, x: reducedMotion ? 0 : 24, scale: reducedMotion ? 1 : 0.9 },
+            animate: { opacity: 1, x: 0, scale: 1, transition: reducedMotion ? { duration: 0.12 } : PIN_IN },
+            exit: { opacity: 0, x: reducedMotion ? 0 : 24, scale: reducedMotion ? 1 : 0.9, transition: PIN_OUT },
+            onKeyDown: (event: React.KeyboardEvent) => {
+              if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                event.preventDefault(); event.stopPropagation(); onMenu(widget, event.currentTarget as HTMLElement);
+              }
+            },
             onDragStart: () => { dragged.current = true; },
             onDragEnd: (_: MouseEvent | TouchEvent | PointerEvent, info: PanInfo) => {
               dragged.current = false;
@@ -793,7 +760,7 @@ function PinnedColumn({
                 type="button"
                 aria-pressed={nook.pomodoro.running}
                 aria-label="Pomodoro"
-                whileTap={{ scale: 0.97 }}
+                whileTap={{ scale: reducedMotion ? 1 : 0.97 }}
                 onClick={togglePinnedPomodoro}
                 data-phase={nook.pomodoroPhase}
               >
@@ -804,21 +771,19 @@ function PinnedColumn({
                   style={{ "--fill": pomodoroFraction(nook.pomodoro.remaining, nook.pomodoro.mode.seconds) } as CSSProperties}
                 />
                 <PinBadge />
-                <span className="notch-pin-label">Pomodoro</span>
                 <span className="notch-pin-time">{pomodoroClock(nook.pomodoro.remaining)}</span>
-                <span className="notch-pin-status" title={nook.pomodoro.mode.label}>{nook.pomodoro.running ? nook.pomodoro.mode.label : POMODORO_STATUS[nook.pomodoroPhase]}</span>
               </motion.button>
             );
           }
 
           return (
-            <motion.div {...common} key={widget} tabIndex={-1}>
+            <motion.div {...common} key={widget} tabIndex={0} role="group" aria-label={`${WIDGET_LABEL[widget]} disematkan`}>
               <PinBadge />
               {/* The date needs no label and the label would crowd a two-pin card. */}
               {widget !== "calendar" && (
-                <span className="notch-pin-label">{WIDGET_LABEL[widget]}</span>
+                <span className="notch-pin-label" title={widget === "weather" ? nook.weather.location?.name : undefined}>{WIDGET_LABEL[widget]}</span>
               )}
-              <PinnedBody widget={widget} />
+              <PinnedBody widget={widget} nook={nook} />
             </motion.div>
           );
         })}
@@ -886,8 +851,9 @@ export function Nook({ nook }: { nook: NookModel }) {
       className="notch-nook"
       onWheelCapture={anchor ? closeMenu : undefined}
     >
-      <MediaPanel nook={nook} />
-      <WidgetStack nook={nook} onMenu={openMenu} />
+      {runtimeConfig.features.media && <MediaPanel nook={nook} />}
+      {nook.stack.length > 0 && <WidgetStack nook={nook} onMenu={openMenu} />}
+      {!runtimeConfig.features.media && nook.stack.length === 0 && <p className="nook-disabled">Pilih fitur dan widget melalui klik kanan → Konfigurasi NotchApp.</p>}
       {nook.pinned.length > 0 && <PinnedColumn nook={nook} onMenu={openMenu} />}
 
       <AnimatePresence>
